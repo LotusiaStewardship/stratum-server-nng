@@ -1,0 +1,30 @@
+[package]
+name = "stratum-server-nng"
+version = "0.1.0"
+edition = "2021"
+description = "Production-grade Stratum V1 pool server for Lotus using NNG endpoints"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+bitcoinsuite-bitcoind-nng = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-nng" }
+bitcoinsuite-core = { path = "../bitcoinsuite/bitcoinsuite-core" }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rand = "0.8"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3"
