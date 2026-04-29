@@ -1,6 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use bitcoinsuite_bitcoind_nng::{PubInterface, RpcInterface};
+use bitcoinsuite_bitcoind_nng::{
+    MiningTemplate, PubInterface, RpcInterface, SubmitMinedBlockResult,
+    ValidateMinedBlockProposalResult,
+};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
@@ -14,13 +17,13 @@ pub enum NodeEvent {
 /// implementation and ease testing/fault injection.
 #[async_trait]
 pub trait NodeMiningAdapter: Send + Sync {
-    async fn get_mining_template_raw(&self) -> Result<Vec<u8>>;
-    async fn submit_mined_block(&self, block: Vec<u8>) -> Result<String>;
-    async fn validate_proposal(&self, block: Vec<u8>) -> Result<String>;
+    async fn get_mining_template(&self, coinbase_script: Option<Vec<u8>>)
+        -> Result<MiningTemplate>;
+    async fn submit_mined_block(&self, block: Vec<u8>) -> Result<SubmitMinedBlockResult>;
+    async fn validate_proposal(&self, block: Vec<u8>) -> Result<ValidateMinedBlockProposalResult>;
 }
 
 pub struct BitcoindNngAdapter {
-    #[allow(dead_code)]
     rpc: RpcInterface,
 }
 
@@ -80,18 +83,26 @@ impl BitcoindNngAdapter {
 
 #[async_trait]
 impl NodeMiningAdapter for BitcoindNngAdapter {
-    async fn get_mining_template_raw(&self) -> Result<Vec<u8>> {
-        // TODO(typed-schema): construct GetMiningTemplateRequest once crate
-        // has generated types for latest lotusd mining RPC schema. The raw
-        // call path is available via RpcInterface::call_raw.
-        Ok(vec![])
+    async fn get_mining_template(
+        &self,
+        coinbase_script: Option<Vec<u8>>,
+    ) -> Result<MiningTemplate> {
+        let template = self
+            .rpc
+            .get_mining_template(coinbase_script.as_deref(), 4, 4, true)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(template)
     }
 
-    async fn submit_mined_block(&self, _block: Vec<u8>) -> Result<String> {
-        Ok("unwired".to_string())
+    async fn submit_mined_block(&self, block: Vec<u8>) -> Result<SubmitMinedBlockResult> {
+        self.rpc
+            .submit_mined_block(&block)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
-    async fn validate_proposal(&self, _block: Vec<u8>) -> Result<String> {
-        Ok("unwired".to_string())
+    async fn validate_proposal(&self, block: Vec<u8>) -> Result<ValidateMinedBlockProposalResult> {
+        self.rpc
+            .validate_mined_block_proposal(&block)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 }

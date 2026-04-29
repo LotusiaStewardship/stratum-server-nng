@@ -1,14 +1,16 @@
 use crate::accounting::AccountingDb;
 use crate::config::Config;
-use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent};
+use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent, NodeMiningAdapter};
 use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
 use crate::stratum::validation::{
-    prevalidate_submit_shape, validate_submit_meets_difficulty, NativeSubmit,
+    build_candidate_block, prevalidate_submit_shape, validate_submit_meets_difficulty, NativeSubmit,
 };
 use crate::stratum::vardiff::VarDiff;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use bitcoinsuite_bitcoind_nng::{MiningSubmitResult, MiningTemplate};
+use bitcoinsuite_core::Hashed;
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -20,6 +22,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
+
+#[derive(Default)]
+pub struct RuntimeStats {
+    pub idle_disconnects: AtomicU64,
+    pub rate_limit_disconnects: AtomicU64,
+}
+
+impl RuntimeStats {
+    pub fn snapshot(&self) -> RuntimeStatsSnapshot {
+        RuntimeStatsSnapshot {
+            idle_disconnects: self.idle_disconnects.load(Ordering::Relaxed),
+            rate_limit_disconnects: self.rate_limit_disconnects.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuntimeStatsSnapshot {
+    pub idle_disconnects: u64,
+    pub rate_limit_disconnects: u64,
+}
 
 #[derive(Clone)]
 pub struct StratumRuntime {
@@ -76,68 +99,66 @@ impl StratumRuntime {
     }
 }
 
-pub async fn run_stratum_server(cfg: Config, db: AccountingDb) -> Result<()> {
+pub async fn run_stratum_server(
+    cfg: Config,
+    db: AccountingDb,
+    stats: Arc<RuntimeStats>,
+) -> Result<()> {
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
 
+    let adapter: Arc<dyn NodeMiningAdapter> =
+        Arc::new(BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?);
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
-    seed_initial_job(&runtime);
+    refresh_job_from_node(&runtime, adapter.clone(), true, "startup").await?;
 
     let runtime_bg = runtime.clone();
+    let adapter_bg = adapter.clone();
     let refresh_secs = cfg.job_refresh_secs;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
-            let epoch = runtime_bg.next_template_epoch();
-            info!(template_epoch = epoch, "periodic job refresh tick");
-            runtime_bg.publish_job(make_job(epoch, true));
+            if let Err(err) =
+                refresh_job_from_node(&runtime_bg, adapter_bg.clone(), true, "periodic").await
+            {
+                warn!(error = %err, "periodic template refresh failed");
+            }
         }
     });
 
     let runtime_nng = runtime.clone();
-    let nng_rpc_url = cfg.nng_rpc_url.clone();
     let nng_pub_url = cfg.nng_pub_url.clone();
+    let rpc_adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
+    let adapter_events = adapter.clone();
     tokio::spawn(async move {
-        let adapter = match BitcoindNngAdapter::connect(&nng_rpc_url) {
-            Ok(a) => a,
-            Err(err) => {
-                warn!(error = %err, nng_rpc = %nng_rpc_url, "failed to connect NNG adapter, continuing with periodic-only job refresh");
-                return;
-            }
-        };
-
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
+        let adapter_events_inner = adapter_events.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                let epoch = runtime_events.next_template_epoch();
-                match event {
-                    NodeEvent::UpdateBlkTip => {
-                        info!(
-                            template_epoch = epoch,
-                            "NNG event: updateblktip; refreshing job"
-                        );
-                        runtime_events.publish_job(make_job(epoch, true));
-                    }
-                    NodeEvent::MempoolRefresh => {
-                        info!(
-                            template_epoch = epoch,
-                            "NNG event: mempool refresh; refreshing job"
-                        );
-                        runtime_events.publish_job(make_job(epoch, false));
-                    }
-                    NodeEvent::MiningWorkChanged => {
-                        info!(
-                            template_epoch = epoch,
-                            "NNG event: miningwrkchg; refreshing job"
-                        );
-                        runtime_events.publish_job(make_job(epoch, true));
-                    }
+                let clean = matches!(
+                    event,
+                    NodeEvent::UpdateBlkTip | NodeEvent::MiningWorkChanged
+                );
+                let reason = match event {
+                    NodeEvent::UpdateBlkTip => "updateblktip",
+                    NodeEvent::MempoolRefresh => "mempool",
+                    NodeEvent::MiningWorkChanged => "miningwrkchg",
+                };
+                if let Err(err) = refresh_job_from_node(
+                    &runtime_events,
+                    adapter_events_inner.clone(),
+                    clean,
+                    reason,
+                )
+                .await
+                {
+                    warn!(error = %err, reason, "template refresh failed after event");
                 }
             }
         });
 
-        if let Err(err) = adapter
+        if let Err(err) = rpc_adapter
             .run_pub_loop(&nng_pub_url, move |ev| {
                 if tx.send(ev).is_err() {
                     warn!("NNG event queue dropped; stratum event consumer not running");
@@ -155,8 +176,10 @@ pub async fn run_stratum_server(cfg: Config, db: AccountingDb) -> Result<()> {
         let db = db.clone();
         let runtime = runtime.clone();
         let cfg = cfg.clone();
+        let adapter = adapter.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_conn(socket, db, runtime, cfg).await {
+            if let Err(err) = handle_conn(socket, db, runtime, cfg, adapter, stats).await {
                 warn!(error = %err, peer = %peer_addr, "stratum connection closed with error");
             } else {
                 info!(peer = %peer_addr, "stratum connection closed");
@@ -165,26 +188,47 @@ pub async fn run_stratum_server(cfg: Config, db: AccountingDb) -> Result<()> {
     }
 }
 
-fn seed_initial_job(runtime: &StratumRuntime) {
+async fn refresh_job_from_node(
+    runtime: &StratumRuntime,
+    adapter: Arc<dyn NodeMiningAdapter>,
+    clean_jobs: bool,
+    reason: &str,
+) -> Result<()> {
+    let template = adapter.get_mining_template(None).await?;
     let epoch = runtime.next_template_epoch();
-    info!(template_epoch = epoch, "seeding initial job");
-    runtime.publish_job(make_job(epoch, true));
+    let job = make_job_from_template(template, epoch, clean_jobs)?;
+    info!(
+        template_epoch = epoch,
+        template_id = job.template_id,
+        reason,
+        clean_jobs,
+        "refreshed mining template from lotusd"
+    );
+    runtime.publish_job(job);
+    Ok(())
 }
 
-fn make_job(template_epoch: u64, clean_jobs: bool) -> MiningJob {
-    MiningJob {
-        job_id: format!("job-{template_epoch}"),
-        template_id: template_epoch,
-        prevhash: "00".repeat(32),
-        coinbase1: "01000000".to_string(),
-        coinbase2: "ffffffff".to_string(),
-        merkle_branches: vec![],
-        version: "20000000".to_string(),
-        nbits: "1d00ffff".to_string(),
-        ntime: "000000000000".to_string(),
+fn make_job_from_template(
+    template: MiningTemplate,
+    template_epoch: u64,
+    clean_jobs: bool,
+) -> Result<MiningJob> {
+    let version = format!("{:08x}", template.version);
+    Ok(MiningJob {
+        job_id: format!("job-{}-{}", template.template_id, template_epoch),
+        template_id: template.template_id,
+        prevhash: template.prev_hash_stratum,
+        coinbase1: template.coinbase1,
+        coinbase2: template.coinbase2,
+        merkle_branches: template.merkle_branches,
+        version,
+        nbits: template.nbits_stratum,
+        ntime: template.ntime_stratum,
         clean_jobs,
         template_epoch,
-    }
+        template_header: template.header,
+        template_block: template.block,
+    })
 }
 
 async fn send_json_line(
@@ -231,6 +275,8 @@ async fn handle_conn(
     db: AccountingDb,
     runtime: StratumRuntime,
     cfg: Config,
+    adapter: Arc<dyn NodeMiningAdapter>,
+    stats: Arc<RuntimeStats>,
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
@@ -256,7 +302,6 @@ async fn handle_conn(
         send_set_difficulty(&mut write_half, vardiff.current).await?;
         send_notify(&mut write_half, &job).await?;
         job_difficulty.insert(job.job_id.clone(), vardiff.current);
-        info!(session_id = %session_id, job_id = %job.job_id, difficulty = vardiff.current, "seeded session with latest job");
     }
 
     let mut recent_ids: VecDeque<String> = VecDeque::new();
@@ -275,14 +320,6 @@ async fn handle_conn(
             if job.clean_jobs {
                 job_difficulty.retain(|job_id, _| session.active_jobs.contains(job_id));
             }
-            info!(
-                session_id = %session_id,
-                job_id = %job.job_id,
-                template_epoch = job.template_epoch,
-                clean_jobs = job.clean_jobs,
-                difficulty = vardiff.current,
-                "forwarded new mining job to miner"
-            );
         }
 
         if req_window_start.elapsed().as_secs() >= 1 {
@@ -299,23 +336,21 @@ async fn handle_conn(
         {
             Ok(v) => v?,
             Err(_) => {
-                info!(session_id = %session_id, "disconnecting idle miner session");
+                stats.idle_disconnects.fetch_add(1, Ordering::Relaxed);
+                let snap = stats.snapshot();
+                info!(session_id = %session_id, idle_disconnects = snap.idle_disconnects, rate_limit_disconnects = snap.rate_limit_disconnects, "disconnecting idle miner session");
                 break;
             }
         };
         if n == 0 {
-            debug!(session_id = %session_id, "peer closed connection");
             break;
         }
 
         req_count += 1;
         if req_count > cfg.per_conn_req_per_sec {
-            warn!(
-                session_id = %session_id,
-                req_count,
-                req_limit = cfg.per_conn_req_per_sec,
-                "rate limit exceeded; disconnecting session"
-            );
+            stats.rate_limit_disconnects.fetch_add(1, Ordering::Relaxed);
+            let snap = stats.snapshot();
+            warn!(session_id = %session_id, idle_disconnects = snap.idle_disconnects, rate_limit_disconnects = snap.rate_limit_disconnects, req_count, req_limit = cfg.per_conn_req_per_sec, "rate limit exceeded; disconnecting session");
             break;
         }
 
@@ -329,11 +364,8 @@ async fn handle_conn(
             }
         };
 
-        debug!(session_id = %session_id, method = ?req.method, id = %req.id, "received stratum request");
-
         let id_key = req.id.to_string();
         if recent_set.contains(&id_key) {
-            warn!(session_id = %session_id, id = %id_key, "duplicate request id rejected");
             let err = StratumResponse::err(req.id.clone(), 22, "duplicate-request-id");
             send_json_line(&mut write_half, &err).await?;
             continue;
@@ -347,6 +379,7 @@ async fn handle_conn(
         }
 
         let method = req.method.clone();
+        let req_id = req.id.clone();
         let params = req.params.clone();
         if let Some(resp) = handle_request(&mut session, req) {
             if matches!(method, Method::Submit) && resp.error.is_null() {
@@ -384,9 +417,7 @@ async fn handle_conn(
                     nonce_hex_8b: nonce.to_string(),
                 };
                 if prevalidate_submit_shape(&submit).is_err() {
-                    warn!(session_id = %session_id, worker, job_id, "share prevalidation failed");
-                    let err =
-                        StratumResponse::err(serde_json::Value::Null, 20, "invalid-submit-shape");
+                    let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
@@ -396,73 +427,91 @@ async fn handle_conn(
                     db.upsert_worker(&worker.payout_address, worker.worker_suffix.as_deref())?;
                 let job = runtime
                     .find_job(job_id)
-                    .unwrap_or_else(|| make_job(0, false));
+                    .ok_or_else(|| anyhow!("missing job for submit"))?;
                 let share_difficulty = job_difficulty
                     .get(job_id)
                     .copied()
                     .unwrap_or(vardiff.current);
-                if let Err(err) = validate_submit_meets_difficulty(
+                if let Err(_) = validate_submit_meets_difficulty(
                     &job,
                     &session.extranonce1,
                     &submit,
                     share_difficulty,
                 ) {
-                    warn!(
-                        session_id = %session_id,
-                        worker_id = worker_row.id,
-                        job_id = %job.job_id,
-                        difficulty = share_difficulty,
-                        error = %err,
-                        "low difficulty share rejected"
-                    );
-                    let err =
-                        StratumResponse::err(serde_json::Value::Null, 23, "low-difficulty-share");
+                    let err = StratumResponse::err(req_id.clone(), 23, "low-difficulty-share");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
+
+                let candidate_block =
+                    match build_candidate_block(&job, &session.extranonce1, &submit) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
+                            send_json_line(&mut write_half, &err).await?;
+                            continue;
+                        }
+                    };
+
+                let proposal = match adapter.validate_proposal(candidate_block.clone()).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let err = StratumResponse::err(req_id.clone(), 20, "proposal-rpc-failed");
+                        send_json_line(&mut write_half, &err).await?;
+                        continue;
+                    }
+                };
+                if !proposal.valid {
+                    warn!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, reject_reason = %proposal.reject_reason, "proposal validation rejected share");
+                    let err = StratumResponse::err(req_id.clone(), 20, "proposal-invalid");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
+                }
+
+                let submit_result = match adapter.submit_mined_block(candidate_block).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let err = StratumResponse::err(req_id.clone(), 20, "submit-rpc-failed");
+                        send_json_line(&mut write_half, &err).await?;
+                        continue;
+                    }
+                };
+
+                let share_accepted = matches!(
+                    submit_result.result,
+                    MiningSubmitResult::Accepted
+                        | MiningSubmitResult::Duplicate
+                        | MiningSubmitResult::DuplicateInvalid
+                        | MiningSubmitResult::DuplicateInconclusive
+                );
 
                 let dedupe_key = format!(
                     "{}:{}:{}:{}:{}:{}",
                     worker_row.id, job.template_id, job.template_epoch, extranonce2, ntime, nonce
                 );
-                let inserted = db.insert_share_idempotent(
+                let _ = db.insert_share_idempotent(
                     worker_row.id,
                     job.template_id,
                     share_difficulty,
-                    true,
+                    share_accepted,
                     false,
                     &dedupe_key,
                 )?;
 
-                if inserted {
-                    info!(
-                        session_id = %session_id,
-                        worker_id = worker_row.id,
-                        payout_address = %worker_row.payout_address,
-                        job_id = %job.job_id,
-                        template_id = job.template_id,
-                        difficulty = share_difficulty,
-                        "accepted share persisted"
-                    );
-                } else {
-                    warn!(
-                        session_id = %session_id,
-                        worker_id = worker_row.id,
-                        job_id = %job.job_id,
-                        "duplicate share detected"
-                    );
+                if !share_accepted {
+                    warn!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, result = ?submit_result.result, reject_reason = %submit_result.reject_reason, "share rejected by lotusd submit path");
+                    let err = StratumResponse::err(req_id.clone(), 20, "block-submit-rejected");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
                 }
+
+                info!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, result = ?submit_result.result, accepted = submit_result.accepted, block_hash = %submit_result.block_hash.to_hex_be(), "share accepted via proposal+submit flow");
 
                 let now = chrono::Utc::now().timestamp();
                 vardiff.record_share(now);
                 let old_diff = vardiff.current;
                 if let Some(new_diff) = vardiff.maybe_retarget(now) {
-                    info!(
-                        session_id = %session_id,
-                        old_diff,
-                        new_diff,
-                        "vardiff retarget"
-                    );
+                    info!(session_id = %session_id, old_diff, new_diff, "vardiff retarget");
                     send_set_difficulty(&mut write_half, new_diff).await?;
                     pending_difficulty = Some(new_diff);
                 }
@@ -471,6 +520,5 @@ async fn handle_conn(
         }
     }
 
-    info!(session_id = %session_id, "stratum session ended");
     Ok(())
 }

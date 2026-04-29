@@ -13,6 +13,8 @@ pub struct MiningJob {
     pub ntime: String,
     pub clean_jobs: bool,
     pub template_epoch: u64,
+    pub template_header: Vec<u8>,
+    pub template_block: Vec<u8>,
 }
 
 impl MiningJob {

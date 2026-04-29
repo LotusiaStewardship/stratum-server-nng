@@ -84,6 +84,57 @@ pub fn validate_submit_meets_difficulty(
     sub: &NativeSubmit,
     difficulty: f64,
 ) -> anyhow::Result<()> {
+    let header = build_header_bytes(job, extranonce1, sub)?;
+    let hash = sha256d(&header);
+    let mut hash_be = hash;
+    hash_be.reverse();
+    let hash_u256 = U256::from_big_endian(&hash_be);
+    let share_target = target_for_share_difficulty(difficulty)?;
+    if hash_u256 > share_target {
+        anyhow::bail!("low difficulty share")
+    }
+    Ok(())
+}
+
+pub fn build_candidate_block(
+    job: &crate::stratum::job::MiningJob,
+    extranonce1: &str,
+    sub: &NativeSubmit,
+) -> anyhow::Result<Vec<u8>> {
+    let coinbase = hex::decode(format!(
+        "{}{}{}{}",
+        job.coinbase1, extranonce1, sub.extranonce2, job.coinbase2
+    ))?;
+    let header = build_header_bytes(job, extranonce1, sub)?;
+
+    let mut offset = job.template_header.len();
+    if job.template_block.len() <= offset {
+        anyhow::bail!("template block too small")
+    }
+
+    let (tx_count_len, _) = read_varint(&job.template_block[offset..])?;
+    offset += tx_count_len;
+    let (cb_len_len, cb_len) = read_varint(&job.template_block[offset..])?;
+    let cb_start = offset + cb_len_len;
+    let cb_end = cb_start + cb_len as usize;
+    if cb_end > job.template_block.len() {
+        anyhow::bail!("template coinbase out of range")
+    }
+
+    let mut out = Vec::with_capacity(job.template_block.len() + coinbase.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&job.template_block[job.template_header.len()..offset]);
+    write_varint(&mut out, coinbase.len() as u64);
+    out.extend_from_slice(&coinbase);
+    out.extend_from_slice(&job.template_block[cb_end..]);
+    Ok(out)
+}
+
+fn build_header_bytes(
+    job: &crate::stratum::job::MiningJob,
+    extranonce1: &str,
+    sub: &NativeSubmit,
+) -> anyhow::Result<Vec<u8>> {
     let coinbase = hex::decode(format!(
         "{}{}{}{}",
         job.coinbase1, extranonce1, sub.extranonce2, job.coinbase2
@@ -104,16 +155,57 @@ pub fn validate_submit_meets_difficulty(
     header.extend_from_slice(&hex::decode(&sub.ntime_hex_6b)?);
     header.extend_from_slice(&hex::decode(&job.nbits)?);
     header.extend_from_slice(&hex::decode(&sub.nonce_hex_8b)?);
+    Ok(header)
+}
 
-    let hash = sha256d(&header);
-    let mut hash_be = hash;
-    hash_be.reverse();
-    let hash_u256 = U256::from_big_endian(&hash_be);
-    let share_target = target_for_share_difficulty(difficulty)?;
-    if hash_u256 > share_target {
-        anyhow::bail!("low difficulty share")
+fn read_varint(bytes: &[u8]) -> anyhow::Result<(usize, u64)> {
+    if bytes.is_empty() {
+        anyhow::bail!("missing varint")
     }
-    Ok(())
+    match bytes[0] {
+        n @ 0x00..=0xfc => Ok((1, n as u64)),
+        0xfd => {
+            if bytes.len() < 3 {
+                anyhow::bail!("short varint")
+            }
+            Ok((3, u16::from_le_bytes([bytes[1], bytes[2]]) as u64))
+        }
+        0xfe => {
+            if bytes.len() < 5 {
+                anyhow::bail!("short varint")
+            }
+            Ok((
+                5,
+                u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64,
+            ))
+        }
+        0xff => {
+            if bytes.len() < 9 {
+                anyhow::bail!("short varint")
+            }
+            Ok((
+                9,
+                u64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ]),
+            ))
+        }
+    }
+}
+
+fn write_varint(out: &mut Vec<u8>, n: u64) {
+    if n <= 0xfc {
+        out.push(n as u8);
+    } else if u16::try_from(n).is_ok() {
+        out.push(0xfd);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if u32::try_from(n).is_ok() {
+        out.push(0xfe);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&n.to_le_bytes());
+    }
 }
 
 fn target_for_share_difficulty(difficulty: f64) -> anyhow::Result<U256> {

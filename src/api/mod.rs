@@ -1,4 +1,5 @@
 use crate::accounting::AccountingDb;
+use crate::stratum::server::RuntimeStats;
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -14,12 +15,15 @@ use tokio::net::TcpListener;
 struct ApiState {
     token: String,
     db: AccountingDb,
+    stats: std::sync::Arc<RuntimeStats>,
 }
 
 #[derive(Serialize)]
 struct StatusResp<'a> {
     status: &'a str,
     payout_method: Option<String>,
+    idle_disconnects: u64,
+    rate_limit_disconnects: u64,
 }
 
 fn check_auth(headers: &HeaderMap, token: &str) -> bool {
@@ -49,9 +53,17 @@ async fn status(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoR
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let payout_method = state.db.active_payout_method().ok().flatten();
+    let snap = state.stats.snapshot();
+    tracing::info!(
+        idle_disconnects = snap.idle_disconnects,
+        rate_limit_disconnects = snap.rate_limit_disconnects,
+        "operator status requested"
+    );
     Json(StatusResp {
         status: "ok",
         payout_method,
+        idle_disconnects: snap.idle_disconnects,
+        rate_limit_disconnects: snap.rate_limit_disconnects,
     })
     .into_response()
 }
@@ -96,8 +108,13 @@ async fn payouts(State(state): State<ApiState>, headers: HeaderMap) -> impl Into
     }
 }
 
-pub async fn start_operator_api(bind: String, token: String, db: AccountingDb) -> Result<()> {
-    let state = ApiState { token, db };
+pub async fn start_operator_api(
+    bind: String,
+    token: String,
+    db: AccountingDb,
+    stats: std::sync::Arc<RuntimeStats>,
+) -> Result<()> {
+    let state = ApiState { token, db, stats };
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))

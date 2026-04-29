@@ -21,8 +21,9 @@ At a high level, the process runs three concurrent loops:
 
 3. **Job refresh loop**
    - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`)
-   - generates new jobs and fans them out to connected miners
-   - also performs periodic refresh ticks for safety/compatibility
+   - fetches consensus-derived templates via `GetMiningTemplateRequest`
+   - maps template fields to Stratum jobs and fans them out to connected miners
+   - also performs periodic template refresh ticks
 
 All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
 
@@ -34,7 +35,8 @@ All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
 
 - Every generated job gets a monotonic `template_epoch`.
 - `template_epoch` is used to reason about work freshness and staleness.
-- Job IDs are currently derived as `job-<template_epoch>`.
+- Job IDs are derived as `job-<template_id>-<template_epoch>`.
+- `template_id` comes from lotusd `GetMiningTemplateResponse`.
 
 ### Worker identity format
 
@@ -55,9 +57,12 @@ The left side is payout identity, optional suffix is a worker label.
 On `mining.submit`:
 1. request shape checks (hex lengths etc.)
 2. worker authorization + active job ownership checks
-3. share dedupe key generation
-4. idempotent write to `shares`
-5. vardiff update and optional retarget (`mining.set_difficulty`)
+3. pool-side difficulty precheck
+4. candidate block reconstruction from template + submit tuple
+5. lotusd proposal validation (`ValidateMinedBlockProposalRequest`)
+6. lotusd candidate submit (`SubmitMinedBlockRequest`)
+7. response classification and idempotent share write
+8. vardiff update and optional retarget (`mining.set_difficulty`)
 
 ---
 
@@ -178,7 +183,7 @@ Authorization: Bearer <api-token>
 ```
 
 Routes:
-- `GET /status`
+- `GET /status` (includes runtime idle/rate-limit disconnect counters)
 - `GET /workers`
 - `GET /rounds`
 - `GET /shares`
@@ -266,7 +271,7 @@ Expected mining-capable surfaces include:
 - `GetMiningStatusRequest`
 - `miningwrkchg`
 
-Compatibility note: current integration uses forward-compatible raw RPC/pub bridge functions in `bitcoinsuite-bitcoind-nng` while typed schema mapping evolves.
+Current integration uses typed mining RPCs in `bitcoinsuite-bitcoind-nng` (flatbuffers v25 generation) and direct template-to-job mapping in server runtime.
 
 ---
 
