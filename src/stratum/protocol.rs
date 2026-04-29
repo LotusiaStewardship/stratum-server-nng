@@ -1,30 +1,130 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-/// Minimal JSON-RPC-ish Stratum V1 request shape.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum Method {
+    Subscribe,
+    Authorize,
+    Notify,
+    SetDifficulty,
+    Submit,
+    Ping,
+    ExtranonceSubscribe,
+    SetExtranonce,
+    SuggestDifficulty,
+    Unknown(String),
+}
+
+impl Method {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "mining.subscribe" => Self::Subscribe,
+            "mining.authorize" => Self::Authorize,
+            "mining.notify" => Self::Notify,
+            "mining.set_difficulty" => Self::SetDifficulty,
+            "mining.submit" => Self::Submit,
+            "mining.ping" => Self::Ping,
+            "mining.extranonce.subscribe" => Self::ExtranonceSubscribe,
+            "mining.set_extranonce" => Self::SetExtranonce,
+            "mining.suggest_difficulty" => Self::SuggestDifficulty,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StratumRequest {
     pub id: Value,
-    pub method: String,
+    pub method: Method,
     #[serde(default)]
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StratumResponse {
     pub id: Value,
     pub result: Value,
     pub error: Value,
 }
 
-/// Optional/future methods scaffolding:
-/// - mining.extranonce.subscribe
-/// - mining.set_extranonce
-/// - mining.suggest_difficulty
-/// These are intentionally represented but not wired in this phase.
+impl StratumResponse {
+    pub fn ok(id: Value, result: Value) -> Self {
+        Self {
+            id,
+            result,
+            error: Value::Null,
+        }
+    }
+
+    pub fn err(id: Value, code: i64, message: &str) -> Self {
+        Self {
+            id,
+            result: Value::Null,
+            error: serde_json::json!([code, message, Value::Null]),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum StratumError {
+    #[error("line too long")]
+    LineTooLong,
+    #[error("invalid json: {0}")]
+    InvalidJson(String),
+    #[error("invalid request shape")]
+    InvalidRequestShape,
+}
+
+/// Decode one JSON line with strict maximum length and request shape checks.
+pub fn decode_request_line(line: &str, max_len: usize) -> Result<StratumRequest, StratumError> {
+    if line.len() > max_len {
+        return Err(StratumError::LineTooLong);
+    }
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| StratumError::InvalidJson(e.to_string()))?;
+    let id = value
+        .get("id")
+        .cloned()
+        .ok_or(StratumError::InvalidRequestShape)?;
+    let method = value
+        .get("method")
+        .and_then(|v| v.as_str())
+        .ok_or(StratumError::InvalidRequestShape)?;
+    let params = value.get("params").cloned().unwrap_or(Value::Array(vec![]));
+    if !params.is_array() {
+        return Err(StratumError::InvalidRequestShape);
+    }
+    Ok(StratumRequest {
+        id,
+        method: Method::parse(method),
+        params,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservedMethod {
     ExtranonceSubscribe,
     SetExtranonce,
     SuggestDifficulty,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_ok() {
+        let req = decode_request_line(r#"{"id":1,"method":"mining.subscribe","params":[]}"#, 1024)
+            .unwrap();
+        assert_eq!(req.method, Method::Subscribe);
+    }
+
+    #[test]
+    fn test_decode_line_too_long() {
+        let line = "x".repeat(20);
+        assert!(matches!(
+            decode_request_line(&line, 8),
+            Err(StratumError::LineTooLong)
+        ));
+    }
 }

@@ -40,3 +40,20 @@ pub struct Share {
     pub dedupe_key: String,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Round {
+    pub id: i64,
+    pub start_template_id: u64,
+    pub end_template_id: Option<u64>,
+    pub found_block_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutBatch {
+    pub id: i64,
+    pub method: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}

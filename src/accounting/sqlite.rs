@@ -1,14 +1,9 @@
-use crate::accounting::{PayoutMethod, Share, Worker};
+use crate::accounting::{PayoutBatch, PayoutMethod, Round, Share, Worker};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::{Arc, Mutex};
 
-/// Thread-safe SQLite wrapper for authoritative pool accounting state.
-///
-/// Notes:
-/// - Uses WAL mode for durability/performance balance.
-/// - Exposes idempotent insert semantics for share dedupe.
 #[derive(Clone)]
 pub struct AccountingDb {
     conn: Arc<Mutex<Connection>>,
@@ -24,51 +19,95 @@ impl AccountingDb {
         })
     }
 
+    /// Initialize schema and run simple forward-only migrations.
     pub fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        conn.execute_batch(
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let tx = conn.transaction()?;
+        tx.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS workers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                payout_address TEXT NOT NULL,
-                worker_suffix TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(payout_address, worker_suffix)
-            );
-
-            CREATE TABLE IF NOT EXISTS shares (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                worker_id INTEGER NOT NULL,
-                template_id INTEGER NOT NULL,
-                difficulty REAL NOT NULL,
-                accepted INTEGER NOT NULL,
-                stale INTEGER NOT NULL,
-                dedupe_key TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(worker_id) REFERENCES workers(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_template_id INTEGER NOT NULL,
-                end_template_id INTEGER,
-                found_block_hash TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS payout_batches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                method TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
             "#,
         )?;
+
+        let has_v1: Option<i64> = tx
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_v1.is_none() {
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payout_address TEXT NOT NULL,
+                    worker_suffix TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(payout_address, worker_suffix)
+                );
+
+                CREATE TABLE IF NOT EXISTS shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    worker_id INTEGER NOT NULL,
+                    template_id INTEGER NOT NULL,
+                    difficulty REAL NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    stale INTEGER NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(worker_id) REFERENCES workers(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS rounds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_template_id INTEGER NOT NULL,
+                    end_template_id INTEGER,
+                    found_block_hash TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS found_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    round_id INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL UNIQUE,
+                    height INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(round_id) REFERENCES rounds(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS payout_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS payout_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payout_batch_id INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    amount_sat INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(payout_batch_id) REFERENCES payout_batches(id)
+                );
+                "#,
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -95,12 +134,11 @@ impl AccountingDb {
             params![payout_address, worker_suffix, now.to_rfc3339()],
         )?;
 
-        let (id, created_at): (i64, String) = conn
-            .query_row(
-                "SELECT id, created_at FROM workers WHERE payout_address=?1 AND worker_suffix IS ?2",
-                params![payout_address, worker_suffix],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+        let (id, created_at): (i64, String) = conn.query_row(
+            "SELECT id, created_at FROM workers WHERE payout_address=?1 AND worker_suffix IS ?2",
+            params![payout_address, worker_suffix],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
 
         Ok(Worker {
             id,
@@ -110,8 +148,33 @@ impl AccountingDb {
         })
     }
 
+    pub fn list_workers(&self, limit: u32) -> Result<Vec<Worker>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, payout_address, worker_suffix, created_at FROM workers ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, payout_address, worker_suffix, created_at) = row?;
+            out.push(Worker {
+                id,
+                payout_address,
+                worker_suffix,
+                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            });
+        }
+        Ok(out)
+    }
+
     /// Insert share if it hasn't been seen before.
-    /// Returns `Ok(true)` if inserted, `Ok(false)` if duplicate (idempotent).
     pub fn insert_share_idempotent(
         &self,
         worker_id: i64,
@@ -170,6 +233,61 @@ impl AccountingDb {
                 accepted: accepted != 0,
                 stale: stale != 0,
                 dedupe_key,
+                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_rounds(&self, limit: u32) -> Result<Vec<Round>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, start_template_id, end_template_id, found_block_hash, created_at
+             FROM rounds ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, start_template_id, end_template_id, found_block_hash, created_at) = row?;
+            out.push(Round {
+                id,
+                start_template_id: start_template_id as u64,
+                end_template_id: end_template_id.map(|v| v as u64),
+                found_block_hash,
+                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent_payout_batches(&self, limit: u32) -> Result<Vec<PayoutBatch>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, method, status, created_at FROM payout_batches ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, method, status, created_at) = row?;
+            out.push(PayoutBatch {
+                id,
+                method,
+                status,
                 created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
             });
         }

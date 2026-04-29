@@ -32,6 +32,18 @@ fn check_auth(headers: &HeaderMap, token: &str) -> bool {
     value == format!("Bearer {token}")
 }
 
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+async fn readyz(State(state): State<ApiState>) -> impl IntoResponse {
+    if state.db.active_payout_method().is_ok() {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "db_unavailable")
+    }
+}
+
 async fn status(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     if !check_auth(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -44,11 +56,41 @@ async fn status(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoR
     .into_response()
 }
 
+async fn workers(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    match state.db.list_workers(100) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn rounds(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    match state.db.list_recent_rounds(100) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn recent_shares(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     if !check_auth(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    match state.db.list_recent_shares(50) {
+    match state.db.list_recent_shares(100) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn payouts(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    match state.db.list_recent_payout_batches(100) {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -57,8 +99,13 @@ async fn recent_shares(State(state): State<ApiState>, headers: HeaderMap) -> imp
 pub async fn start_operator_api(bind: String, token: String, db: AccountingDb) -> Result<()> {
     let state = ApiState { token, db };
     let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/status", get(status))
+        .route("/workers", get(workers))
+        .route("/rounds", get(rounds))
         .route("/shares", get(recent_shares))
+        .route("/payouts", get(payouts))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;

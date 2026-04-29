@@ -1,48 +1,278 @@
 # stratum-server-nng
 
-Rust Stratum V1 pooled mining server for Lotus, using `lotusd` NNG endpoints as the sole node integration surface.
+Rust Stratum V1 pooled mining server for Lotus.
 
-## Scope implemented in this iteration
+This service uses **lotusd NNG RPC + NNG Pub/Sub** as its node-control plane, and stores pool accounting state in SQLite.
 
-- Foundation for production runtime (Tokio + structured logging)
-- Native Stratum V1 protocol model and session state
-- **Phase S3**: share pre-validation + vardiff model
-- **Phase S4**: durable accounting core with SQLite3
-- Token-authenticated operator API scaffold
-- Optional payout signer integration scaffold
+---
 
-## Explicitly enforced
+## 1) What this server does at runtime
 
-- Worker authorization format: `<lotus_address>[.<worker>]`
-- PPLNS-ready accounting schema with strategy abstraction for future payout methods
+At a high level, the process runs three concurrent loops:
 
-## Node integration
+1. **Stratum TCP loop** (`--stratum-bind`)
+   - accepts miner sockets
+   - handles `subscribe/authorize/submit/ping`
+   - pushes `mining.notify` and `mining.set_difficulty`
 
-Uses `bitcoinsuite-bitcoind-nng` and expects new mining RPC + pub message support:
+2. **Operator API loop** (`--api-bind`)
+   - exposes health + admin read endpoints
+   - token-auth protected (except `/healthz` and `/readyz`)
 
-- GetMiningTemplateRequest
-- SubmitMinedBlockRequest
-- ValidateMinedBlockProposalRequest
-- GetMiningStatusRequest
-- miningworkchg topic
+3. **Job refresh loop**
+   - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`)
+   - generates new jobs and fans them out to connected miners
+   - also performs periodic refresh ticks for safety/compatibility
 
-## Future-scaffolded but intentionally not wired yet
+All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
 
-- `mining.extranonce.subscribe`
-- `mining.set_extranonce`
-- `mining.suggest_difficulty`
+---
 
-These are represented in protocol enums/handlers as reserved TODOs and documented for later implementation review.
+## 2) Runtime model (important concepts)
 
-## Security baseline
+### Job + template epoch
 
-- Operator API requires bearer token auth
-- Key material is isolated behind optional signer trait (can remain disabled)
-- Input validation for Stratum fields and worker naming rules
+- Every generated job gets a monotonic `template_epoch`.
+- `template_epoch` is used to reason about work freshness and staleness.
+- Job IDs are currently derived as `job-<template_epoch>`.
 
-## Running (development)
+### Worker identity format
+
+Workers are strictly parsed as:
+
+```text
+<lotus_address>[.<worker>]
+```
+
+Examples:
+- `lotus_abc`
+- `lotus_abc.rig01`
+
+The left side is payout identity, optional suffix is a worker label.
+
+### Share lifecycle
+
+On `mining.submit`:
+1. request shape checks (hex lengths etc.)
+2. worker authorization + active job ownership checks
+3. share dedupe key generation
+4. idempotent write to `shares`
+5. vardiff update and optional retarget (`mining.set_difficulty`)
+
+---
+
+## 3) CLI runtime parameters
+
+All settings are CLI flags.
+
+### Logging and diagnostics
+
+- `--debug` (default: `false`)
+  - Enables verbose request/event debug logs.
+  - Normal mode still emits operationally useful logs.
+
+### Network/service binds
+
+- `--stratum-bind` (default: `0.0.0.0:3334`)
+- `--api-bind` (default: `127.0.0.1:18080`)
+
+### Auth
+
+- `--api-token` (**required**)
+  - Bearer token for operator endpoints.
+
+### Storage + lotusd connectivity
+
+- `--sqlite-path` (default: `./stratum-accounting.sqlite3`)
+- `--nng-rpc-url` (default: `ipc://datadir/nngrpc.pipe`)
+- `--nng-pub-url` (default: `ipc://datadir/nngpub.pipe`)
+
+Both `ipc://` and `tcp://` NNG URLs are supported.
+
+### Difficulty / vardiff
+
+- `--initial-difficulty` (default: `1.0`)
+- `--min-difficulty` (default: `0.0000001`)
+- `--max-difficulty` (default: `1e12`)
+- `--vardiff-target-secs` (default: `15.0`)
+- `--vardiff-retarget-secs` (default: `90.0`)
+
+### Protocol hardening
+
+- `--max-request-line-bytes` (default: `8192`)
+- `--per-conn-req-per-sec` (default: `128`)
+- `--conn-idle-timeout-secs` (default: `180`)
+- `--max-jobs-cache` (default: `512`)
+- `--job-refresh-secs` (default: `15`)
+
+---
+
+## 4) Launch examples
+
+### Local development / regtest
+
+```bash
+cargo run -- \
+  --api-token devtoken \
+  --stratum-bind 127.0.0.1:3334 \
+  --api-bind 127.0.0.1:18080 \
+  --sqlite-path ./stratum-accounting.sqlite3 \
+  --nng-rpc-url ipc://datadir/nngrpc.pipe \
+  --nng-pub-url ipc://datadir/nngpub.pipe
+```
+
+### Verbose debug run
+
+```bash
+cargo run -- \
+  --debug \
+  --api-token devtoken \
+  --nng-rpc-url ipc:///path/to/nngrpc.pipe \
+  --nng-pub-url ipc:///path/to/nngpub.pipe
+```
+
+### Production-style run (release)
+
+```bash
+cargo run --release -- \
+  --api-token 'replace-with-long-random-token' \
+  --stratum-bind 0.0.0.0:3334 \
+  --api-bind 127.0.0.1:18080 \
+  --sqlite-path /var/lib/stratum-server-nng/accounting.sqlite3 \
+  --nng-rpc-url tcp://127.0.0.1:4555 \
+  --nng-pub-url tcp://127.0.0.1:4556
+```
+
+---
+
+## 5) Stratum protocol support
+
+### Implemented methods
+
+- `mining.subscribe`
+- `mining.authorize`
+- `mining.submit`
+- `mining.ping`
+
+### Optional/scaffold behavior
+
+- `mining.extranonce.subscribe`: accepted/acknowledged
+- `mining.set_extranonce`: parsed but currently rejected as unsupported
+- `mining.suggest_difficulty`: parsed but currently rejected as unsupported
+
+---
+
+## 6) Operator API
+
+### Health endpoints
+
+- `GET /healthz`
+- `GET /readyz`
+
+### Authenticated endpoints
+
+Require:
+
+```http
+Authorization: Bearer <api-token>
+```
+
+Routes:
+- `GET /status`
+- `GET /workers`
+- `GET /rounds`
+- `GET /shares`
+- `GET /payouts`
+
+Example:
+
+```bash
+curl -H 'Authorization: Bearer devtoken' http://127.0.0.1:18080/status
+```
+
+---
+
+## 7) Log guide for operators
+
+## Normal INFO logs you should expect
+
+- startup and config load
+- NNG adapter connection + subscriptions
+- inbound NNG events (`updateblktip`, `mempool refresh`, `miningwrkchg`)
+- job refresh tick and job publication
+- connection accept/close
+- accepted shares persisted
+- vardiff retarget changes
+- rate-limit or idle disconnect events
+
+## DEBUG logs (`--debug`) include
+
+- per-request method/id traces
+- per-message NNG payload traces
+- detailed notify/set_difficulty send traces
+- cache depth and job publish diagnostics
+
+## Example: healthy new-block flow
+
+1. `NNG pub message received topic="updateblktip" ...` (debug)
+2. `NNG event: updateblktip; refreshing job template_epoch=...` (info)
+3. `published mining job job_id=... template_epoch=...` (debug)
+4. `forwarded new mining job to miner ...` (info)
+
+If step (2) appears but step (4) does not, there may be no active miner sessions.
+
+---
+
+## 8) Troubleshooting checklist
+
+### No NNG events appear
+
+- verify lotusd launched with matching `-nngpub` endpoint
+- verify topic enablement includes `miningwrkchg` / `updateblktip`
+- verify IPC path permissions (`ls -l` on pipe directory)
+- run with `--debug` and check for `NNG pub subscriptions active` log
+
+### Miners connect but do not receive new jobs
+
+- verify `mining.subscribe` and `mining.authorize` success from miner logs
+- check for `forwarded new mining job to miner` lines
+- check for session disconnects due to idle/rate limits
+
+### Shares rejected or duplicated
+
+- inspect `invalid-submit-shape`, `unauthorized-worker`, `stale-job`
+- verify miner worker string format `<lotus_address>[.<worker>]`
+- inspect duplicate share warnings in logs
+
+---
+
+## 9) Security baseline
+
+- Operator API is bearer-token protected.
+- Keep API bound to localhost or secured ingress.
+- Prefer NNG IPC endpoints on same host where possible.
+- Keep signing keys outside the core process unless explicitly enabling signer integrations.
+
+---
+
+## 10) Node integration expectations
+
+This server is designed around lotusd NNG mining-capable interfaces and topics.
+
+Expected mining-capable surfaces include:
+- `GetMiningTemplateRequest`
+- `SubmitMinedBlockRequest`
+- `ValidateMinedBlockProposalRequest`
+- `GetMiningStatusRequest`
+- `miningwrkchg`
+
+Compatibility note: current integration uses forward-compatible raw RPC/pub bridge functions in `bitcoinsuite-bitcoind-nng` while typed schema mapping evolves.
+
+---
+
+## 11) Development quickstart
 
 ```bash
 cargo test
-cargo run -- --help
+cargo run -- --api-token devtoken --debug
 ```
