@@ -40,11 +40,19 @@ impl RuntimeStats {
         RuntimeStatsSnapshot {
             idle_disconnects: self.idle_disconnects.load(Ordering::Relaxed),
             rate_limit_disconnects: self.rate_limit_disconnects.load(Ordering::Relaxed),
-            template_payout_mismatch_total: self.template_payout_mismatch_total.load(Ordering::Relaxed),
-            candidate_payout_mismatch_total: self.candidate_payout_mismatch_total.load(Ordering::Relaxed),
+            template_payout_mismatch_total: self
+                .template_payout_mismatch_total
+                .load(Ordering::Relaxed),
+            candidate_payout_mismatch_total: self
+                .candidate_payout_mismatch_total
+                .load(Ordering::Relaxed),
             found_block_persist_ok_total: self.found_block_persist_ok_total.load(Ordering::Relaxed),
-            found_block_persist_error_total: self.found_block_persist_error_total.load(Ordering::Relaxed),
-            found_block_observed_not_persisted_total: self.found_block_observed_not_persisted_total.load(Ordering::Relaxed),
+            found_block_persist_error_total: self
+                .found_block_persist_error_total
+                .load(Ordering::Relaxed),
+            found_block_observed_not_persisted_total: self
+                .found_block_observed_not_persisted_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -128,7 +136,15 @@ pub async fn run_stratum_server(
     let pool_scripts = cfg.resolve_pool_scripts()?;
     info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
-    refresh_job_from_node(&runtime, adapter.clone(), &pool_scripts, stats.clone(), true, "startup").await?;
+    refresh_job_from_node(
+        &runtime,
+        adapter.clone(),
+        &pool_scripts,
+        stats.clone(),
+        true,
+        "startup",
+    )
+    .await?;
 
     let runtime_bg = runtime.clone();
     let adapter_bg = adapter.clone();
@@ -138,8 +154,15 @@ pub async fn run_stratum_server(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
-            if let Err(err) =
-                refresh_job_from_node(&runtime_bg, adapter_bg.clone(), &pool_scripts_bg, stats_bg.clone(), true, "periodic").await
+            if let Err(err) = refresh_job_from_node(
+                &runtime_bg,
+                adapter_bg.clone(),
+                &pool_scripts_bg,
+                stats_bg.clone(),
+                true,
+                "periodic",
+            )
+            .await
             {
                 warn!(error = %err, "periodic template refresh failed");
             }
@@ -161,7 +184,9 @@ pub async fn run_stratum_server(
             while let Some(event) = rx.recv().await {
                 let clean = matches!(
                     event,
-                    NodeEvent::UpdateBlkTip | NodeEvent::MiningWorkChanged | NodeEvent::BlockDisconnected
+                    NodeEvent::UpdateBlkTip
+                        | NodeEvent::MiningWorkChanged
+                        | NodeEvent::BlockDisconnected
                 );
                 let reason = match event {
                     NodeEvent::UpdateBlkTip => "updateblktip",
@@ -172,10 +197,15 @@ pub async fn run_stratum_server(
                 if matches!(event, NodeEvent::BlockDisconnected) {
                     match db_events.mark_pending_blocks_orphaned() {
                         Ok(orphaned) if orphaned > 0 => {
-                            warn!(orphaned, "marked pending found blocks orphaned due to blkdisconctd");
+                            warn!(
+                                orphaned,
+                                "marked pending found blocks orphaned due to blkdisconctd"
+                            );
                         }
                         Ok(_) => {}
-                        Err(err) => error!(error = %err, "failed applying blkdisconctd orphan update"),
+                        Err(err) => {
+                            error!(error = %err, "failed applying blkdisconctd orphan update")
+                        }
                     }
                 }
                 if let Err(err) = refresh_job_from_node(
@@ -215,7 +245,9 @@ pub async fn run_stratum_server(
         let stats = stats.clone();
         let pool_scripts = pool_scripts.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_conn(socket, db, runtime, cfg, pool_scripts, adapter, stats).await {
+            if let Err(err) =
+                handle_conn(socket, db, runtime, cfg, pool_scripts, adapter, stats).await
+            {
                 warn!(error = %err, peer = %peer_addr, "stratum connection closed with error");
             } else {
                 info!(peer = %peer_addr, "stratum connection closed");
@@ -235,12 +267,14 @@ async fn refresh_job_from_node(
     let template = adapter
         .get_mining_template(Some(pool_scripts.payout_script.clone()))
         .await?;
-    ensure_block_coinbase_payout_script(&template.block, &pool_scripts.payout_script).map_err(|e| {
-        stats
-            .template_payout_mismatch_total
-            .fetch_add(1, Ordering::Relaxed);
-        anyhow!("template payout script mismatch: {e}")
-    })?;
+    ensure_block_coinbase_payout_script(&template.block, &pool_scripts.payout_script).map_err(
+        |e| {
+            stats
+                .template_payout_mismatch_total
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow!("template payout script mismatch: {e}")
+        },
+    )?;
     let epoch = runtime.next_template_epoch();
     let job = make_job_from_template(template, epoch, clean_jobs)?;
     info!(
@@ -275,6 +309,7 @@ fn make_job_from_template(
         template_epoch,
         template_header: template.header,
         template_block: template.block,
+        block_height: template.height as i64,
     })
 }
 
@@ -409,6 +444,7 @@ mod tests {
             template_epoch: 1,
             template_header: vec![0u8; 159],
             template_block: vec![0u8; 200],
+            block_height: 0,
         };
         assert!(make_precomputed_header_160(&job).is_err());
         job.template_header = vec![7u8; 160];
@@ -434,6 +470,7 @@ mod tests {
             template_epoch: 1,
             template_header: vec![0u8; 160],
             template_block: vec![1u8; 300],
+            block_height: 0,
         };
         let hdr = [9u8; 160];
         let block = build_candidate_block_from_header(&job, &hdr).unwrap();
@@ -738,7 +775,10 @@ async fn handle_conn(
                     }
                 };
 
-                if let Err(err) = ensure_block_coinbase_payout_script(&candidate_block, &pool_scripts.payout_script) {
+                if let Err(err) = ensure_block_coinbase_payout_script(
+                    &candidate_block,
+                    &pool_scripts.payout_script,
+                ) {
                     stats
                         .candidate_payout_mismatch_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -813,10 +853,14 @@ async fn handle_conn(
                 }
 
                 share_stats.accepted += 1;
-                if matches!(submit_result.result, MiningSubmitResult::Accepted | MiningSubmitResult::Duplicate) {
+                if matches!(
+                    submit_result.result,
+                    MiningSubmitResult::Accepted | MiningSubmitResult::Duplicate
+                ) {
                     let persist = db.record_found_block(
                         &submit_result.block_hash.to_hex_be(),
                         job.template_id,
+                        job.block_height,
                         worker_row.id,
                         &submit.worker_name,
                         &worker_row.payout_address,
@@ -824,10 +868,14 @@ async fn handle_conn(
                     );
                     match persist {
                         Ok(_) => {
-                            stats.found_block_persist_ok_total.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .found_block_persist_ok_total
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                         Err(err) => {
-                            stats.found_block_persist_error_total.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .found_block_persist_error_total
+                                .fetch_add(1, Ordering::Relaxed);
                             error!(session_id = %session_id, block_hash = %submit_result.block_hash.to_hex_be(), error = %err, "node accepted solved block but DB persist failed");
                         }
                     }

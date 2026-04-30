@@ -1,7 +1,16 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tracing::{error, info, warn};
 
-use bitcoinsuite_core::Hashed;
+use bitcoinsuite_bitcoind::rpc_client::{BitcoindRpcClient, BitcoindRpcClientConf};
+use bitcoinsuite_core::{
+    ecc::{Ecc, SecKey},
+    BitcoinCode, Bytes, Hashed, LotusAddress, OutPoint, P2PKHSignatory, Script, SequenceNo,
+    SigHashType, SignData, SignField, Tx, TxBuilder, TxBuilderInput, TxBuilderOutput, TxInput,
+    TxOutput, UnhashedTx,
+};
+use bitcoinsuite_ecc_secp256k1::EccSecp256k1;
+
+use crate::nng::adapter::{BitcoindNngAdapter, NodeMiningAdapter};
 
 use crate::{
     accounting::AccountingDb,
@@ -18,12 +27,40 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
         return Ok(());
     }
 
+    let payout_script = cfg.resolve_pool_scripts()?.payout_script;
+    let signing_key = cfg
+        .pool
+        .signing
+        .private_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing signing key"))?;
+    let seckey = parse_hex_seckey(signing_key)?;
+
+    let adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
+    let bitcoind = BitcoindRpcClient::new(BitcoindRpcClientConf {
+        url: cfg.bitcoind_rpc.url.clone(),
+        rpc_user: cfg.bitcoind_rpc.rpc_user.clone(),
+        rpc_pass: cfg.bitcoind_rpc.rpc_pass.clone(),
+    });
     let interval = std::time::Duration::from_secs(cfg.pool.pplns.payout_interval_secs.max(30));
     loop {
         tokio::time::sleep(interval).await;
 
-        if let Err(err) = db.advance_found_block_confirmations(cfg.pool.pplns.min_confirmations.max(COINBASE_MATURITY_BLOCKS)) {
-            error!(error = %err, "failed advancing found block confirmations");
+        let tip_height = match adapter.get_mining_template(None).await {
+            Ok(t) => t.height as i64,
+            Err(err) => {
+                error!(error = %err, "failed loading tip height for payout maturity sync");
+                continue;
+            }
+        };
+        if let Err(err) = db.sync_found_block_confirmations(
+            tip_height,
+            cfg.pool
+                .pplns
+                .min_confirmations
+                .max(COINBASE_MATURITY_BLOCKS),
+        ) {
+            error!(error = %err, "failed syncing found block confirmations");
             continue;
         }
 
@@ -31,40 +68,221 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             continue;
         };
 
-        let shares = db
-            .list_weighted_shares_for_pplns(20_000)?
-            .into_iter()
-            .map(|(payout_address, work_units)| WeightedShare {
-                payout_address,
-                work_units,
+        let target_work_units = cfg.pool.pplns.n_multiplier.max(1.0);
+        let window_shares =
+            db.list_weighted_shares_for_pplns_window(found_block_id, target_work_units, 200_000)?;
+        let shares = window_shares
+            .iter()
+            .map(|s| WeightedShare {
+                payout_address: s.payout_address.clone(),
+                work_units: s.work_units,
             })
             .collect::<Vec<_>>();
 
         let fee_address = cfg.pool.fee.fee_address.as_deref();
-        let plan = build_pplns_payout_plan(
+        let mut plan = build_pplns_payout_plan(
             DEFAULT_GROSS_REWARD_SAT,
-            if cfg.pool.fee.enabled { cfg.pool.fee.fee_bps } else { 0 },
+            if cfg.pool.fee.enabled {
+                cfg.pool.fee.fee_bps
+            } else {
+                0
+            },
             fee_address,
             &shares,
             cfg.pool.pplns.min_payout_sat,
         );
 
+        let block = match adapter.get_block_by_hash(&block_hash).await {
+            Ok(b) => b,
+            Err(err) => {
+                error!(error = %err, block_hash, "failed loading found block for payout tx construction");
+                continue;
+            }
+        };
+        let Some(coinbase) = block.txs.first() else {
+            error!(block_hash, "found block missing coinbase tx");
+            continue;
+        };
+        let mut coinbase_raw = Bytes::from_slice(&coinbase.tx.raw);
+        let parsed_coinbase = match Tx::deser(&mut coinbase_raw) {
+            Ok(tx) => tx,
+            Err(err) => {
+                error!(error = %err, block_hash, "failed decoding coinbase tx");
+                continue;
+            }
+        };
+        let Some(payout_output) = parsed_coinbase.outputs().get(1) else {
+            error!(block_hash, "coinbase tx missing payout output vout[1]");
+            continue;
+        };
+        if payout_output.script.bytecode().as_ref() != payout_script.as_slice() {
+            error!(
+                block_hash,
+                "coinbase payout script mismatch for matured found block"
+            );
+            continue;
+        }
+        plan.gross_reward_sat = payout_output.value;
+        plan.fee_sat = crate::payout::compute_fee(
+            plan.gross_reward_sat,
+            if cfg.pool.fee.enabled {
+                cfg.pool.fee.fee_bps
+            } else {
+                0
+            },
+        );
+        plan.net_reward_sat = plan.gross_reward_sat - plan.fee_sat;
+
         let retry_key = format!("{}:{}", block_hash, plan.outputs.len());
         let batch_id = db.create_payout_batch(
+            found_block_id,
             &retry_key,
             plan.gross_reward_sat,
             plan.fee_sat,
             plan.net_reward_sat,
             &plan.outputs,
+            &window_shares,
         )?;
 
-        db.update_payout_batch_state(batch_id, "signed", Some("internal:simulated"), None, None)?;
-        // first-draft submit path: mark as submitted + confirmed deterministically
-        let simulated_txid = hex::encode(bitcoinsuite_core::Sha256::digest(retry_key.into_bytes().into()).as_ref());
-        db.update_payout_batch_state(batch_id, "submitted", None, Some(&simulated_txid), None)?;
-        db.update_payout_batch_state(batch_id, "confirmed", None, Some(&simulated_txid), None)?;
-        db.mark_found_block_paid(found_block_id)?;
+        let signed_tx = match build_and_sign_payout_tx(
+            &plan.outputs,
+            &payout_script,
+            &seckey,
+            coinbase.tx.txid.clone(),
+            payout_output.value,
+        ) {
+            Ok(tx) => tx,
+            Err(err) => {
+                db.update_payout_batch_state(
+                    batch_id,
+                    "failed",
+                    None,
+                    None,
+                    Some(&err.to_string()),
+                )?;
+                error!(error = %err, batch_id, found_block_id, block_hash, "failed signing payout tx");
+                continue;
+            }
+        };
 
-        info!(batch_id, found_block_id, block_hash, outputs = plan.outputs.len(), txid = %simulated_txid, "payout batch lifecycle completed");
+        let raw_tx = signed_tx.ser();
+        let local_txid = signed_tx.hashed().hash().to_hex_be();
+        db.update_payout_batch_state(
+            batch_id,
+            "signed",
+            Some(&format!("rawtx:{}", &local_txid)),
+            None,
+            None,
+        )?;
+
+        let submitted_txid = match bitcoind.cmd_json("sendrawtransaction", &[raw_tx.hex().into()]).await {
+            Ok(txid_json) => txid_json
+                .as_str()
+                .ok_or_else(|| anyhow!("sendrawtransaction returned non-string txid"))?
+                .to_string(),
+            Err(err) => {
+                db.update_payout_batch_state(
+                    batch_id,
+                    "failed",
+                    None,
+                    None,
+                    Some(&err.to_string()),
+                )?;
+                error!(error = %err, batch_id, found_block_id, block_hash, "failed submitting payout tx via JSON-RPC");
+                continue;
+            }
+        };
+        db.update_payout_batch_state(batch_id, "submitted", None, Some(&submitted_txid), None)?;
+        db.mark_found_block_payout_submitted(found_block_id)?;
+
+        info!(
+            batch_id,
+            found_block_id,
+            block_hash,
+            outputs = plan.outputs.len(),
+            tip_height,
+            txid = %submitted_txid,
+            "payout batch signed and submitted"
+        );
     }
 }
+
+fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
+    let key = private_key.trim();
+    if key.len() != 64 {
+        anyhow::bail!("internal signing currently requires 32-byte hex private key")
+    }
+    let key = hex::decode(key)?;
+    let arr: [u8; 32] = key
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid private key length"))?;
+    Ok(SecKey::new_unchecked(arr))
+}
+
+fn build_and_sign_payout_tx(
+    outputs: &[(String, i64)],
+    payout_script_bytes: &[u8],
+    seckey: &SecKey,
+    prev_txid: bitcoinsuite_core::Sha256d,
+    prev_value: i64,
+) -> Result<UnhashedTx> {
+    let ecc = EccSecp256k1::default();
+    let pubkey = ecc.derive_pubkey(seckey);
+    let payout_script = Script::from_slice(payout_script_bytes);
+    if !matches!(
+        payout_script.parse_variant(),
+        bitcoinsuite_core::ScriptVariant::P2PKH(_)
+    ) {
+        anyhow::bail!("internal signing currently supports only P2PKH payout script")
+    }
+
+    let mut tx_builder = TxBuilder {
+        version: 2,
+        inputs: vec![TxBuilderInput::new(
+            TxInput {
+                prev_out: OutPoint {
+                    txid: prev_txid,
+                    out_idx: 1,
+                },
+                script: Script::default(),
+                sequence: SequenceNo::from_u32(0xffff_fffe),
+                sign_data: Some(SignData::new(vec![
+                    SignField::OutputScript(payout_script),
+                    SignField::Value(prev_value),
+                ])),
+            },
+            Box::new(P2PKHSignatory {
+                seckey: seckey.clone(),
+                pubkey,
+                sig_hash_type: SigHashType::ALL_BIP143,
+            }),
+        )],
+        outputs: outputs
+            .iter()
+            .map(|(address, amount)| {
+                let addr: LotusAddress = address.parse()?;
+                Ok(TxBuilderOutput::Fixed(TxOutput {
+                    value: *amount,
+                    script: addr.script().clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        lock_time: 0,
+    };
+
+    let total_out: i64 = outputs.iter().map(|(_, amount)| *amount).sum();
+    if total_out > prev_value {
+        anyhow::bail!("payout outputs exceed available coinbase payout value")
+    }
+    if total_out < prev_value {
+        // Keep change deterministic by returning leftovers to pool payout script.
+        tx_builder.outputs.push(TxBuilderOutput::Fixed(TxOutput {
+            value: prev_value - total_out,
+            script: Script::from_slice(payout_script_bytes),
+        }));
+    }
+
+    Ok(tx_builder.sign(&ecc, 0, 0)?)
+}
+

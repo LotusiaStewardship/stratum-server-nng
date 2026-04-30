@@ -38,7 +38,9 @@ pub fn build_pplns_payout_plan(
 
     let mut work_by_address: HashMap<String, f64> = HashMap::new();
     for s in shares {
-        *work_by_address.entry(s.payout_address.clone()).or_insert(0.0) += s.work_units;
+        *work_by_address
+            .entry(s.payout_address.clone())
+            .or_insert(0.0) += s.work_units;
     }
 
     let total_work: f64 = work_by_address.values().sum();
@@ -103,8 +105,14 @@ mod tests {
     #[test]
     fn pplns_is_deterministic() {
         let shares = vec![
-            WeightedShare { payout_address: "a".into(), work_units: 10.0 },
-            WeightedShare { payout_address: "b".into(), work_units: 10.0 },
+            WeightedShare {
+                payout_address: "a".into(),
+                work_units: 10.0,
+            },
+            WeightedShare {
+                payout_address: "b".into(),
+                work_units: 10.0,
+            },
         ];
         let p1 = build_pplns_payout_plan(1000, 0, None, &shares, 0);
         let p2 = build_pplns_payout_plan(1000, 0, None, &shares, 0);
@@ -114,7 +122,10 @@ mod tests {
 
     #[test]
     fn fee_is_accounted() {
-        let shares = vec![WeightedShare { payout_address: "a".into(), work_units: 1.0 }];
+        let shares = vec![WeightedShare {
+            payout_address: "a".into(),
+            work_units: 1.0,
+        }];
         let p = build_pplns_payout_plan(1000, 100, Some("fee"), &shares, 0);
         assert_eq!(p.fee_sat, 10);
         assert_eq!(p.net_reward_sat, 990);
@@ -123,12 +134,24 @@ mod tests {
     #[test]
     fn remainder_distribution_is_deterministic() {
         let shares = vec![
-            WeightedShare { payout_address: "b".into(), work_units: 1.0 },
-            WeightedShare { payout_address: "a".into(), work_units: 1.0 },
-            WeightedShare { payout_address: "c".into(), work_units: 1.0 },
+            WeightedShare {
+                payout_address: "b".into(),
+                work_units: 1.0,
+            },
+            WeightedShare {
+                payout_address: "a".into(),
+                work_units: 1.0,
+            },
+            WeightedShare {
+                payout_address: "c".into(),
+                work_units: 1.0,
+            },
         ];
         let p = build_pplns_payout_plan(10, 0, None, &shares, 0);
         assert_eq!(p.outputs.iter().map(|(_, v)| *v).sum::<i64>(), 10);
-        assert_eq!(p.outputs, vec![("a".into(), 4), ("b".into(), 3), ("c".into(), 3)]);
+        assert_eq!(
+            p.outputs,
+            vec![("a".into(), 4), ("b".into(), 3), ("c".into(), 3)]
+        );
     }
 }

@@ -16,6 +16,7 @@ pub struct MiningJob {
     pub template_epoch: u64,
     pub template_header: Vec<u8>,
     pub template_block: Vec<u8>,
+    pub block_height: i64,
 }
 
 impl MiningJob {

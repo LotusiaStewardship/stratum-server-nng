@@ -35,7 +35,10 @@ mod tests {
     #[test]
     fn test_parse_worker() {
         let w = parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01").unwrap();
-        assert_eq!(w.payout_address, "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi");
+        assert_eq!(
+            w.payout_address,
+            "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+        );
         assert_eq!(w.worker_suffix.as_deref(), Some("rig01"));
         assert!(parse_worker_name("bad.worker").is_err());
         assert!(parse_worker_name("lotusabc.r1").is_err());

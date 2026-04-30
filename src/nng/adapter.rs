@@ -1,10 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bitcoinsuite_bitcoind_nng::{
-    MiningTemplate, PubInterface, RpcInterface, SubmitMinedBlockResult,
-    ValidateMinedBlockProposalResult,
+    Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
+    SubmitMinedBlockResult, ValidateMinedBlockProposalResult,
 };
 use tracing::{debug, info, warn};
+
+use bitcoinsuite_core::{Hashed, Sha256d};
 
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
@@ -20,6 +22,7 @@ pub enum NodeEvent {
 pub trait NodeMiningAdapter: Send + Sync {
     async fn get_mining_template(&self, coinbase_script: Option<Vec<u8>>)
         -> Result<MiningTemplate>;
+    async fn get_block_by_hash(&self, block_hash_hex_be: &str) -> Result<Block>;
     async fn submit_mined_block(&self, block: Vec<u8>) -> Result<SubmitMinedBlockResult>;
     async fn validate_proposal(&self, block: Vec<u8>) -> Result<ValidateMinedBlockProposalResult>;
 }
@@ -97,6 +100,13 @@ impl NodeMiningAdapter for BitcoindNngAdapter {
             .get_mining_template(coinbase_script.as_deref(), 4, 4, true)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(template)
+    }
+
+    async fn get_block_by_hash(&self, block_hash_hex_be: &str) -> Result<Block> {
+        let hash = Sha256d::from_hex_be(block_hash_hex_be)?;
+        self.rpc
+            .get_block(BlockIdentifier::Hash(hash))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     async fn submit_mined_block(&self, block: Vec<u8>) -> Result<SubmitMinedBlockResult> {

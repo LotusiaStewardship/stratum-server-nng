@@ -55,5 +55,6 @@ pub struct PayoutBatch {
     pub id: i64,
     pub method: String,
     pub status: String,
+    pub submitted_txid: Option<String>,
     pub created_at: DateTime<Utc>,
 }

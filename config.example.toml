@@ -115,9 +115,17 @@ min_confirmations = 100
 mode = "internal"
 
 # Private key material for internal signing.
-# Accepted formats in the current implementation:
+# Accepted formats for scheduler signing path:
 # - 32-byte hex
-# - WIF-like base58 string
+# - WIF / base58check-encoded secret key
 #
 # Never log this value. Prefer loading from a secure file or secret store.
 private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+# lotusd JSON-RPC endpoint used for raw transaction broadcast.
+# This matches Chronik's broadcast mechanics: raw tx -> JSON-RPC sendrawtransaction.
+[bitcoind_rpc]
+url = "http://127.0.0.1:10604"
+rpc_user = "lotus"
+rpc_pass = "supersecurepassword"

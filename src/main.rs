@@ -53,12 +53,13 @@ async fn main() -> Result<()> {
     let reconcile_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if let Ok(missing) = reconcile_db.reconcile_missing_found_blocks() {
+            if let Ok(missing_rows) = reconcile_db.reconcile_missing_found_blocks_detail() {
+                let missing = missing_rows.len() as u64;
                 reconcile_stats
                     .found_block_observed_not_persisted_total
                     .store(missing, std::sync::atomic::Ordering::Relaxed);
-                if missing > 0 {
-                    tracing::error!(missing, "accepted submit events missing found_block persistence");
+                if let Some(first) = missing_rows.first() {
+                    tracing::error!(missing, block_hash = %first.block_hash, "accepted submit events missing found_block persistence");
                 }
             }
         }
@@ -71,11 +72,13 @@ async fn main() -> Result<()> {
         tokio::spawn(
             async move { start_operator_api(api_bind, api_token, api_db, api_stats).await },
         );
-    let scheduler_task = tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
+    let scheduler_task =
+        tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
     let stratum_task =
         tokio::spawn(async move { run_stratum_server(cfg, db, stratum_stats).await });
 
-    let (api_res, stratum_res, _reconcile_res, scheduler_res) = tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task);
+    let (api_res, stratum_res, _reconcile_res, scheduler_res) =
+        tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task);
     scheduler_res??;
     api_res??;
     stratum_res??;

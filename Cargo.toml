@@ -1,6 +1,7 @@
 [package]
 name = "stratum-server-nng"
 version = "0.1.0"
+authors = ["Lotusia Stewardship <stewardship@lotusia.org>"]
 edition = "2021"
 description = "Production-grade Stratum V1 pool server for Lotus using NNG endpoints"
 license = "MIT"
@@ -9,8 +10,10 @@ license = "MIT"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["macros"] }
+bitcoinsuite-bitcoind = { path = "../bitcoinsuite/bitcoinsuite-bitcoind" }
 bitcoinsuite-bitcoind-nng = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-nng" }
 bitcoinsuite-core = { path = "../bitcoinsuite/bitcoinsuite-core" }
+bitcoinsuite-ecc-secp256k1 = { path = "../bitcoinsuite/bitcoinsuite-ecc-secp256k1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"

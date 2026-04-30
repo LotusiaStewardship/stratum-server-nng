@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use bitcoinsuite_core::{Hashed, LotusAddress, Sha256, Script};
+use bitcoinsuite_core::{ecc::SecKey, Hashed, LotusAddress, Script, Sha256};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -21,6 +21,7 @@ pub struct Config {
     pub sqlite_path: String,
     pub nng_rpc_url: String,
     pub nng_pub_url: String,
+    pub bitcoind_rpc: BitcoindRpcConfig,
     pub initial_difficulty: f64,
     pub vardiff_target_secs: f64,
     pub vardiff_retarget_secs: f64,
@@ -68,6 +69,13 @@ pub struct PplnsConfig {
 pub struct SigningConfig {
     pub mode: String,
     pub private_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BitcoindRpcConfig {
+    pub url: String,
+    pub rpc_user: String,
+    pub rpc_pass: String,
 }
 
 #[derive(Debug, Clone)]
@@ -121,12 +129,9 @@ impl Config {
             anyhow::bail!("fee_bps must be <= 10000")
         }
         if self.pool.signing.mode == "internal" {
-            let key = self
-                .pool
-                .signing
-                .private_key
-                .as_deref()
-                .ok_or_else(|| anyhow!("pool.signing.private_key required for internal signer mode"))?;
+            let key = self.pool.signing.private_key.as_deref().ok_or_else(|| {
+                anyhow!("pool.signing.private_key required for internal signer mode")
+            })?;
             validate_private_key_format(key)?;
         }
 
@@ -139,18 +144,9 @@ impl Config {
 }
 
 fn validate_private_key_format(key: &str) -> Result<()> {
-    let trimmed = key.trim();
-    if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
-        return Ok(());
-    }
-    if (trimmed.len() == 51 || trimmed.len() == 52)
-        && trimmed
-            .chars()
-            .all(|c| "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c))
-    {
-        return Ok(());
-    }
-    anyhow::bail!("unsupported private key format: expected 32-byte hex or WIF")
+    SecKey::from_hex_or_wif(key)
+        .map(|_| ())
+        .map_err(|e| anyhow!("unsupported private key format: {e}"))
 }
 
 fn resolve_script(script_hex: Option<&str>, address: Option<&str>) -> Result<Vec<u8>> {
@@ -162,7 +158,9 @@ fn resolve_script(script_hex: Option<&str>, address: Option<&str>) -> Result<Vec
         return Ok(script.bytecode().as_ref().to_vec());
     }
     if let Some(addr) = address {
-        let lotus: LotusAddress = addr.parse().map_err(|e| anyhow!("invalid payout address: {e}"))?;
+        let lotus: LotusAddress = addr
+            .parse()
+            .map_err(|e| anyhow!("invalid payout address: {e}"))?;
         return Ok(lotus.script().bytecode().to_vec());
     }
     anyhow::bail!("must configure either script hex or address")
