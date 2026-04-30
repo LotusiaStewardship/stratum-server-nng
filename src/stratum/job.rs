@@ -11,6 +11,7 @@ pub struct MiningJob {
     pub version: String,
     pub nbits: String,
     pub ntime: String,
+    pub network_target_hex: String,
     pub clean_jobs: bool,
     pub template_epoch: u64,
     pub template_header: Vec<u8>,

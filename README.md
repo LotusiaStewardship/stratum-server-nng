@@ -13,7 +13,7 @@ At a high level, the process runs three concurrent loops:
 1. **Stratum TCP loop** (`--stratum-bind`)
    - accepts miner sockets
    - handles `subscribe/authorize/submit/ping`
-   - pushes `mining.notify` and `mining.set_difficulty`
+   - pushes `lotus.precomputed_work` and `mining.set_difficulty`
 
 2. **Operator API loop** (`--api-bind`)
    - exposes health + admin read endpoints
@@ -22,7 +22,7 @@ At a high level, the process runs three concurrent loops:
 3. **Job refresh loop**
    - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`)
    - fetches consensus-derived templates via `GetMiningTemplateRequest`
-   - maps template fields to Stratum jobs and fans them out to connected miners
+   - builds per-session **precomputed Lotus work objects** and fans them out to connected miners
    - also performs periodic template refresh ticks
 
 All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
@@ -154,10 +154,31 @@ cargo run --release -- \
 
 ### Implemented methods
 
+Client -> server:
 - `mining.subscribe`
 - `mining.authorize`
 - `mining.submit`
 - `mining.ping`
+
+Server -> client:
+- `mining.set_difficulty`
+- `lotus.precomputed_work` (required Lotus mining work notification)
+
+`lotus.precomputed_work` params are:
+1. `job_id`
+2. `header_160_hex`
+3. `share_target_hex` (32-byte hex, big-endian)
+4. `extranonce2_hex`
+5. `ntime_hex_6b`
+6. `clean_jobs`
+
+Validation contract:
+- `job_id` non-empty string
+- `header_160_hex` length `320` hex chars
+- `share_target_hex` length `64` hex chars
+- `extranonce2_hex` length `8` hex chars
+- `ntime_hex_6b` length `12` hex chars
+- `clean_jobs` boolean
 
 ### Optional/scaffold behavior
 
@@ -214,7 +235,7 @@ curl -H 'Authorization: Bearer devtoken' http://127.0.0.1:18080/status
 
 - per-request method/id traces
 - per-message NNG payload traces
-- detailed notify/set_difficulty send traces
+- detailed precomputed_work/set_difficulty send traces
 - cache depth and job publish diagnostics
 
 ## Example: healthy new-block flow
@@ -240,7 +261,7 @@ If step (2) appears but step (4) does not, there may be no active miner sessions
 ### Miners connect but do not receive new jobs
 
 - verify `mining.subscribe` and `mining.authorize` success from miner logs
-- check for `forwarded new mining job to miner` lines
+- check for `sent lotus.precomputed_work` lines
 - check for session disconnects due to idle/rate limits
 
 ### Shares rejected or duplicated

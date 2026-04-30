@@ -23,12 +23,19 @@ This pass re-checks implementation against `lotusd/doc/nng-stratum/03-stratum-se
 ## S2 NNG adapter and job lifecycle
 - NNG adapter abstraction present.
 - Pub loop support added for template-affecting topics via raw pub receive.
+- `GetMiningTemplateRequest` now used on startup, periodic refresh, and work-change events.
+- Placeholder jobs removed; job materialization now uses lotusd template fields.
 - Bounded in-memory job cache implemented with clean-job invalidation behavior.
-- Notify fanout to workers implemented with broadcast channel.
+- Per-session `lotus.precomputed_work` fanout to workers implemented with broadcast channel.
 
 ## S3 Share validation and vardiff
 - Submit shape prevalidation implemented.
 - Worker authorization format enforcement implemented.
+- Candidate block reconstruction from submit tuple + node template implemented.
+- `ValidateMinedBlockProposalRequest` + `SubmitMinedBlockRequest` path implemented.
+- Submit classification wired:
+  - accepted/duplicate classes => share accepted
+  - rejected/invalid classes => share rejected
 - Duplicate share prevention implemented via accounting dedupe key.
 - Stale checks implemented using active job set and bounded job cache.
 - Per-connection vardiff model implemented with min/max clamping and retarget notifications.
@@ -52,7 +59,8 @@ This pass re-checks implementation against `lotusd/doc/nng-stratum/03-stratum-se
   - `/payouts`
   - `/healthz`
   - `/readyz`
-- Structured logging enabled at runtime.
+- `/status` includes runtime idle and rate-limit disconnect counters.
+- Structured logging enabled at runtime, including runtime counter snapshots on disconnect and status requests.
 
 ## S7 Production hardening
 - Per-connection request throttling implemented.

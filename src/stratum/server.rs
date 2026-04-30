@@ -5,7 +5,8 @@ use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
 use crate::stratum::validation::{
-    build_candidate_block, prevalidate_submit_shape, validate_submit_meets_difficulty, NativeSubmit,
+    prevalidate_submit_shape, share_target_hex_for_difficulty, validate_header_meets_difficulty,
+    validate_header_meets_target_hex, NativeSubmit,
 };
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
@@ -224,6 +225,7 @@ fn make_job_from_template(
         version,
         nbits: template.nbits_stratum,
         ntime: template.ntime_stratum,
+        network_target_hex: template.target.to_hex_be(),
         clean_jobs,
         template_epoch,
         template_header: template.header,
@@ -241,17 +243,70 @@ async fn send_json_line(
     Ok(())
 }
 
-async fn send_notify(writer: &mut tokio::net::tcp::OwnedWriteHalf, job: &MiningJob) -> Result<()> {
+#[derive(Debug, Clone)]
+struct AssignedJob {
+    share_difficulty: f64,
+    extranonce2: String,
+    ntime_hex_6b: String,
+    header_160: [u8; 160],
+}
+
+#[derive(Debug, Default)]
+struct SessionShareStats {
+    accepted: u64,
+    rejected: u64,
+    errored: u64,
+}
+
+async fn send_precomputed_work(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    job: &MiningJob,
+    header_160_hex: &str,
+    share_target_hex: &str,
+    extranonce2: &str,
+    ntime_hex_6b: &str,
+) -> Result<()> {
     let v = serde_json::json!({
         "id": serde_json::Value::Null,
-        "method": "mining.notify",
-        "params": job.notify_params(),
+        "method": "lotus.precomputed_work",
+        "params": [
+            job.job_id,
+            header_160_hex,
+            share_target_hex,
+            extranonce2,
+            ntime_hex_6b,
+            job.clean_jobs,
+        ],
     });
     let mut data = serde_json::to_vec(&v)?;
     data.push(b'\n');
     writer.write_all(&data).await?;
-    debug!(job_id = %job.job_id, template_epoch = job.template_epoch, "sent mining.notify");
+    debug!(job_id = %job.job_id, template_epoch = job.template_epoch, "sent lotus.precomputed_work");
     Ok(())
+}
+
+fn make_precomputed_header_160(job: &MiningJob) -> Result<[u8; 160]> {
+    if job.template_header.len() != 160 {
+        anyhow::bail!("template_header must be 160 bytes for precomputed work")
+    }
+    let ntime = hex::decode(&job.ntime)?;
+    if ntime.len() != 6 {
+        anyhow::bail!("job ntime must be 6 bytes")
+    }
+    let mut header = [0u8; 160];
+    header.copy_from_slice(&job.template_header);
+    // Miner mutates this 8-byte nonce field while hashing.
+    header[44..52].copy_from_slice(&0u64.to_le_bytes());
+    Ok(header)
+}
+
+fn build_candidate_block_from_header(job: &MiningJob, header_160: &[u8; 160]) -> Result<Vec<u8>> {
+    if job.template_block.len() < 160 {
+        anyhow::bail!("template_block too small for header replacement")
+    }
+    let mut block = job.template_block.clone();
+    block[0..160].copy_from_slice(header_160);
+    Ok(block)
 }
 
 async fn send_set_difficulty(
@@ -268,6 +323,60 @@ async fn send_set_difficulty(
     writer.write_all(&data).await?;
     debug!(difficulty = diff, "sent mining.set_difficulty");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_precomputed_header_requires_160() {
+        let mut job = MiningJob {
+            job_id: "j".into(),
+            template_id: 1,
+            prevhash: String::new(),
+            coinbase1: String::new(),
+            coinbase2: String::new(),
+            merkle_branches: vec![],
+            version: String::new(),
+            nbits: String::new(),
+            ntime: "000000000000".into(),
+            network_target_hex: "00".repeat(32),
+            clean_jobs: true,
+            template_epoch: 1,
+            template_header: vec![0u8; 159],
+            template_block: vec![0u8; 200],
+        };
+        assert!(make_precomputed_header_160(&job).is_err());
+        job.template_header = vec![7u8; 160];
+        let h = make_precomputed_header_160(&job).unwrap();
+        assert_eq!(h.len(), 160);
+        assert_eq!(&h[44..52], &[0u8; 8]);
+    }
+
+    #[test]
+    fn test_build_candidate_block_replaces_header() {
+        let job = MiningJob {
+            job_id: "j".into(),
+            template_id: 1,
+            prevhash: String::new(),
+            coinbase1: String::new(),
+            coinbase2: String::new(),
+            merkle_branches: vec![],
+            version: String::new(),
+            nbits: String::new(),
+            ntime: "000000000000".into(),
+            network_target_hex: "00".repeat(32),
+            clean_jobs: true,
+            template_epoch: 1,
+            template_header: vec![0u8; 160],
+            template_block: vec![1u8; 300],
+        };
+        let hdr = [9u8; 160];
+        let block = build_candidate_block_from_header(&job, &hdr).unwrap();
+        assert_eq!(&block[..160], &hdr);
+        assert_eq!(block.len(), 300);
+    }
 }
 
 async fn handle_conn(
@@ -295,13 +404,36 @@ async fn handle_conn(
     let mut pub_rx = runtime.subscribe();
 
     let mut pending_difficulty: Option<f64> = None;
-    let mut job_difficulty: HashMap<String, f64> = HashMap::new();
+    let mut assigned_jobs: HashMap<String, AssignedJob> = HashMap::new();
+    let mut share_stats = SessionShareStats::default();
 
     if let Some(job) = runtime.latest_job() {
         apply_notify(&mut session, &job);
         send_set_difficulty(&mut write_half, vardiff.current).await?;
-        send_notify(&mut write_half, &job).await?;
-        job_difficulty.insert(job.job_id.clone(), vardiff.current);
+        let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
+        let ntime_hex_6b = job.ntime.clone();
+        let header_160 = make_precomputed_header_160(&job)?;
+        let header_160_hex = hex::encode(header_160);
+        let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
+        send_precomputed_work(
+            &mut write_half,
+            &job,
+            &header_160_hex,
+            &share_target_hex,
+            &extranonce2,
+            &ntime_hex_6b,
+        )
+        .await?;
+        info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned initial precomputed work");
+        assigned_jobs.insert(
+            job.job_id.clone(),
+            AssignedJob {
+                share_difficulty: vardiff.current,
+                extranonce2,
+                ntime_hex_6b,
+                header_160,
+            },
+        );
     }
 
     let mut recent_ids: VecDeque<String> = VecDeque::new();
@@ -315,10 +447,32 @@ async fn handle_conn(
                 vardiff.current = next_diff;
             }
             apply_notify(&mut session, &job);
-            send_notify(&mut write_half, &job).await?;
-            job_difficulty.insert(job.job_id.clone(), vardiff.current);
+            let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
+            let ntime_hex_6b = job.ntime.clone();
+            let header_160 = make_precomputed_header_160(&job)?;
+            let header_160_hex = hex::encode(header_160);
+            let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
+            send_precomputed_work(
+                &mut write_half,
+                &job,
+                &header_160_hex,
+                &share_target_hex,
+                &extranonce2,
+                &ntime_hex_6b,
+            )
+            .await?;
+            info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned precomputed work");
+            assigned_jobs.insert(
+                job.job_id.clone(),
+                AssignedJob {
+                    share_difficulty: vardiff.current,
+                    extranonce2,
+                    ntime_hex_6b,
+                    header_160,
+                },
+            );
             if job.clean_jobs {
-                job_difficulty.retain(|job_id, _| session.active_jobs.contains(job_id));
+                assigned_jobs.retain(|job_id, _| session.active_jobs.contains(job_id));
             }
         }
 
@@ -364,8 +518,11 @@ async fn handle_conn(
             }
         };
 
+        debug!(session_id = %session_id, method = ?req.method, req_id = %req.id, params = %req.params, "received stratum request");
+
         let id_key = req.id.to_string();
         if recent_set.contains(&id_key) {
+            warn!(session_id = %session_id, req_id = %req.id, "duplicate request id from miner");
             let err = StratumResponse::err(req.id.clone(), 22, "duplicate-request-id");
             send_json_line(&mut write_half, &err).await?;
             continue;
@@ -382,6 +539,7 @@ async fn handle_conn(
         let req_id = req.id.clone();
         let params = req.params.clone();
         if let Some(resp) = handle_request(&mut session, req) {
+            debug!(session_id = %session_id, method = ?method, req_id = %req_id, response_error = %resp.error, response_result = %resp.result, "sending stratum response");
             if matches!(method, Method::Submit) && resp.error.is_null() {
                 let worker = params
                     .as_array()
@@ -417,6 +575,8 @@ async fn handle_conn(
                     nonce_hex_8b: nonce.to_string(),
                 };
                 if prevalidate_submit_shape(&submit).is_err() {
+                    share_stats.errored += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, extranonce2 = %submit.extranonce2, ntime = %submit.ntime_hex_6b, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-submit-shape");
                     let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
@@ -428,41 +588,105 @@ async fn handle_conn(
                 let job = runtime
                     .find_job(job_id)
                     .ok_or_else(|| anyhow!("missing job for submit"))?;
-                let share_difficulty = job_difficulty
-                    .get(job_id)
-                    .copied()
-                    .unwrap_or(vardiff.current);
-                if let Err(_) = validate_submit_meets_difficulty(
-                    &job,
-                    &session.extranonce1,
-                    &submit,
-                    share_difficulty,
-                ) {
+                let Some(assigned) = assigned_jobs.get(job_id).cloned() else {
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: stale-job (no assigned context)");
+                    let err = StratumResponse::err(req_id.clone(), 21, "stale-job");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
+                };
+                if submit.extranonce2 != assigned.extranonce2
+                    || submit.ntime_hex_6b != assigned.ntime_hex_6b
+                {
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_extranonce2 = %submit.extranonce2, assigned_extranonce2 = %assigned.extranonce2, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: precomputed-mismatch");
+                    let err = StratumResponse::err(req_id.clone(), 20, "precomputed-mismatch");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
+                }
+                let share_difficulty = assigned.share_difficulty;
+                let nonce_bytes = match hex::decode(&submit.nonce_hex_8b) {
+                    Ok(v) if v.len() == 8 => v,
+                    _ => {
+                        share_stats.errored += 1;
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-submit-shape (nonce)");
+                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
+                        send_json_line(&mut write_half, &err).await?;
+                        continue;
+                    }
+                };
+                let mut solved_header = assigned.header_160;
+                solved_header[44..52].copy_from_slice(&nonce_bytes);
+                if let Err(_) = validate_header_meets_difficulty(&solved_header, share_difficulty) {
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, difficulty = share_difficulty, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: low-difficulty-share");
                     let err = StratumResponse::err(req_id.clone(), 23, "low-difficulty-share");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
 
-                let candidate_block =
-                    match build_candidate_block(&job, &session.extranonce1, &submit) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
-                            send_json_line(&mut write_half, &err).await?;
-                            continue;
-                        }
-                    };
+                let meets_network_target =
+                    validate_header_meets_target_hex(&solved_header, &job.network_target_hex)
+                        .is_ok();
+                if !meets_network_target {
+                    let dedupe_key = format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        worker_row.id,
+                        job.template_id,
+                        job.template_epoch,
+                        extranonce2,
+                        ntime,
+                        nonce
+                    );
+                    let _ = db.insert_share_idempotent(
+                        worker_row.id,
+                        job.template_id,
+                        share_difficulty,
+                        true,
+                        false,
+                        &dedupe_key,
+                    )?;
+
+                    share_stats.accepted += 1;
+                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (meets pool difficulty; not submitted to lotusd)");
+
+                    let now = chrono::Utc::now().timestamp();
+                    vardiff.record_share(now);
+                    let old_diff = vardiff.current;
+                    if let Some(new_diff) = vardiff.maybe_retarget(now) {
+                        info!(session_id = %session_id, old_diff, new_diff, "vardiff retarget");
+                        send_set_difficulty(&mut write_half, new_diff).await?;
+                        pending_difficulty = Some(new_diff);
+                    }
+                    send_json_line(&mut write_half, &resp).await?;
+                    continue;
+                }
+
+                let candidate_block = match build_candidate_block_from_header(&job, &solved_header)
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        share_stats.errored += 1;
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-candidate block assembly");
+                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
+                        send_json_line(&mut write_half, &err).await?;
+                        continue;
+                    }
+                };
 
                 let proposal = match adapter.validate_proposal(candidate_block.clone()).await {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(err) => {
+                        share_stats.errored += 1;
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, error = %err, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: proposal-rpc-failed");
                         let err = StratumResponse::err(req_id.clone(), 20, "proposal-rpc-failed");
                         send_json_line(&mut write_half, &err).await?;
                         continue;
                     }
                 };
                 if !proposal.valid {
-                    warn!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, reject_reason = %proposal.reject_reason, "proposal validation rejected share");
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, reject_reason = %proposal.reject_reason, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "proposal validation rejected share");
                     let err = StratumResponse::err(req_id.clone(), 20, "proposal-invalid");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
@@ -470,12 +694,20 @@ async fn handle_conn(
 
                 let submit_result = match adapter.submit_mined_block(candidate_block).await {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(err) => {
+                        share_stats.errored += 1;
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, error = %err, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: submit-rpc-failed");
                         let err = StratumResponse::err(req_id.clone(), 20, "submit-rpc-failed");
                         send_json_line(&mut write_half, &err).await?;
                         continue;
                     }
                 };
+
+                let node_result_is_share_only_high_hash =
+                    matches!(submit_result.result, MiningSubmitResult::Rejected)
+                        && submit_result
+                            .reject_reason
+                            .eq_ignore_ascii_case("high-hash");
 
                 let share_accepted = matches!(
                     submit_result.result,
@@ -483,7 +715,7 @@ async fn handle_conn(
                         | MiningSubmitResult::Duplicate
                         | MiningSubmitResult::DuplicateInvalid
                         | MiningSubmitResult::DuplicateInconclusive
-                );
+                ) || node_result_is_share_only_high_hash;
 
                 let dedupe_key = format!(
                     "{}:{}:{}:{}:{}:{}",
@@ -499,13 +731,19 @@ async fn handle_conn(
                 )?;
 
                 if !share_accepted {
-                    warn!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, result = ?submit_result.result, reject_reason = %submit_result.reject_reason, "share rejected by lotusd submit path");
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, result = ?submit_result.result, reject_reason = %submit_result.reject_reason, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "share rejected by lotusd submit path");
                     let err = StratumResponse::err(req_id.clone(), 20, "block-submit-rejected");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
 
-                info!(session_id = %session_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, result = ?submit_result.result, accepted = submit_result.accepted, block_hash = %submit_result.block_hash.to_hex_be(), "share accepted via proposal+submit flow");
+                share_stats.accepted += 1;
+                if node_result_is_share_only_high_hash {
+                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, reject_reason = %submit_result.reject_reason, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (met pool difficulty; below network target)");
+                } else {
+                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, result = ?submit_result.result, accepted = submit_result.accepted, block_hash = %submit_result.block_hash.to_hex_be(), total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted via proposal+submit flow");
+                }
 
                 let now = chrono::Utc::now().timestamp();
                 vardiff.record_share(now);
@@ -520,5 +758,6 @@ async fn handle_conn(
         }
     }
 
+    info!(session_id = %session_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, authorized_workers = session.authorized_workers.len(), active_jobs = session.active_jobs.len(), assigned_jobs = assigned_jobs.len(), "stratum session ended");
     Ok(())
 }

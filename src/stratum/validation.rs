@@ -130,6 +130,72 @@ pub fn build_candidate_block(
     Ok(out)
 }
 
+pub fn build_precomputed_header(
+    job: &crate::stratum::job::MiningJob,
+    extranonce1: &str,
+    extranonce2: &str,
+    ntime_hex_6b: &str,
+    nonce_hex_8b: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let sub = NativeSubmit {
+        worker_name: String::new(),
+        job_id: job.job_id.clone(),
+        extranonce2: extranonce2.to_string(),
+        ntime_hex_6b: ntime_hex_6b.to_string(),
+        nonce_hex_8b: nonce_hex_8b.to_string(),
+    };
+    build_header_bytes(job, extranonce1, &sub)
+}
+
+pub fn share_target_hex_for_difficulty(difficulty: f64) -> anyhow::Result<String> {
+    let target = target_for_share_difficulty(difficulty)?;
+    let mut out = [0u8; 32];
+    target.to_big_endian(&mut out);
+    Ok(hex::encode(out))
+}
+
+fn lotus_hash_160(header: &[u8; 160]) -> [u8; 32] {
+    let tx_layer_hash = Sha256::digest(&header[52..]);
+    let mut pow_layer = [0u8; 52];
+    pow_layer[..20].copy_from_slice(&header[32..52]);
+    pow_layer[20..].copy_from_slice(&tx_layer_hash[..]);
+    let pow_layer_hash = Sha256::digest(pow_layer);
+    let mut chain_layer = [0u8; 64];
+    chain_layer[..32].copy_from_slice(&header[..32]);
+    chain_layer[32..].copy_from_slice(&pow_layer_hash);
+    Sha256::digest(chain_layer).into()
+}
+
+fn header_lotus_hash_u256_be(header: &[u8]) -> anyhow::Result<U256> {
+    if header.len() != 160 {
+        anyhow::bail!("invalid header length")
+    }
+    let mut header_160 = [0u8; 160];
+    header_160.copy_from_slice(header);
+    let hash = lotus_hash_160(&header_160);
+    let mut hash_be = hash;
+    hash_be.reverse();
+    Ok(U256::from_big_endian(&hash_be))
+}
+
+pub fn validate_header_meets_difficulty(header: &[u8], difficulty: f64) -> anyhow::Result<()> {
+    let hash_u256 = header_lotus_hash_u256_be(header)?;
+    let share_target = target_for_share_difficulty(difficulty)?;
+    if hash_u256 > share_target {
+        anyhow::bail!("low difficulty share")
+    }
+    Ok(())
+}
+
+pub fn validate_header_meets_target_hex(header: &[u8], target_hex_be: &str) -> anyhow::Result<()> {
+    let hash_u256 = header_lotus_hash_u256_be(header)?;
+    let target = u256_from_hex(target_hex_be)?;
+    if hash_u256 > target {
+        anyhow::bail!("high hash")
+    }
+    Ok(())
+}
+
 fn build_header_bytes(
     job: &crate::stratum::job::MiningJob,
     extranonce1: &str,
@@ -248,5 +314,18 @@ mod tests {
             nonce_hex_8b: "0011223344556677".to_string(),
         };
         assert!(prevalidate_submit_shape(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_lotus_hash_160_vector() {
+        let header = hex::decode("0000000000000000000000000000000000000000000000000000000000000000ffff001d00c273600000000041c6ddd303000000010e010000000000000000000000000000000000000000000000000000000000000000000000000000000000934755d60e905ec8778f554164bd9b7f21ab6c15cfed2956123a722a6f6fa62e1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a").unwrap();
+        let mut h160 = [0u8; 160];
+        h160.copy_from_slice(&header);
+        let mut hash = lotus_hash_160(&h160);
+        hash.reverse();
+        assert_eq!(
+            hex::encode(hash),
+            "000000006275dc5039da85620773f3223d629759495f80b49a381d79cae77c11"
+        );
     }
 }

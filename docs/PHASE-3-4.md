@@ -20,8 +20,9 @@ Highlights:
 Highlights:
 - raw pub receive support via `bitcoinsuite-bitcoind-nng::PubInterface::recv_raw`
 - topic normalization for template-affecting events
+- full mining RPC path with `GetMiningTemplateRequest`
 - bounded in-memory job cache with clean-job invalidation
-- notify fanout via broadcast channel
+- precomputed-work fanout via per-session notifications (`lotus.precomputed_work`)
 
 ## S3 share validation + vardiff
 - `stratum/validation.rs`
@@ -31,6 +32,9 @@ Highlights:
 Highlights:
 - strict worker naming/auth format `<lotus_address>[.<worker>]`
 - submit shape validation for nonce/time/extranonce fields
+- candidate block reconstruction from template + submit tuple
+- proposal validation and solved-block submit against lotusd
+- submit-result classification to accept/reject shares deterministically
 - stale-job checks against active job set
 - independent vardiff model with clamp + retarget notifications
 
@@ -56,7 +60,7 @@ Current payout method activation:
 - `api/mod.rs`
 
 Routes:
-- `/status`
+- `/status` (includes idle/rate-limit disconnect counters)
 - `/workers`
 - `/rounds`
 - `/shares`

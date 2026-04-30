@@ -51,7 +51,7 @@ pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option
             let result = json!([
                 [
                     ["mining.set_difficulty", session.session_id],
-                    ["mining.notify", session.session_id]
+                    ["lotus.precomputed_work", session.session_id]
                 ],
                 session.extranonce1,
                 session.extranonce2_size
