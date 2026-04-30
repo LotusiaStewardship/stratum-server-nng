@@ -224,16 +224,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
 }
 
 fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
-    let key = private_key.trim();
-    if key.len() != 64 {
-        anyhow::bail!("internal signing currently requires 32-byte hex private key")
-    }
-    let key = hex::decode(key)?;
-    let arr: [u8; 32] = key
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid private key length"))?;
-    Ok(SecKey::new_unchecked(arr))
+    SecKey::from_hex_or_wif(private_key.trim()).map_err(|e| anyhow::anyhow!("invalid private key: {e}"))
 }
 
 fn build_and_sign_payout_tx(

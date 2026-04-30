@@ -1,5 +1,7 @@
-use bitcoinsuite_core::lotus_txid;
-use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader, Sha256d, Tx};
+use bitcoinsuite_bitcoind_stratum::{
+    build_stratum_header, difficulty_to_target, header_meets_difficulty,
+};
+use bitcoinsuite_core::{BitcoinCode, Bytes, LotusBlock, LotusHeader, Tx};
 use primitive_types::U256;
 
 /// Native submit shape used by share pre-validator.
@@ -32,10 +34,6 @@ pub enum ShareResult {
     LowDiff,
 }
 
-/// Difficulty-1 target from Bitcoin/Lotus SHA-family convention.
-const DIFF1_TARGET_HEX: &str = "00000000ffff0000000000000000000000000000000000000000000000000000";
-const DIFF_SCALE: u128 = 100_000_000;
-
 /// Parse compact submit fields and perform structural checks only.
 ///
 /// Full network-target validation still belongs to lotusd submit path; this
@@ -64,34 +62,38 @@ fn is_hex(s: &str) -> bool {
     s.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Compute SHA256d quickly for helper checks / diagnostics.
-pub fn sha256d(bytes: &[u8]) -> [u8; 32] {
-    let hash = Sha256d::digest(bytes.into());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(hash.as_ref());
-    out
-}
-
-/// Convert difficulty to target ratio against DIFF1.
-///
-/// Used for pool-side low-diff filtering. This implementation returns a
-/// floating ratio suitable for fast comparisons in this phase and can be
-/// replaced with full 256-bit arithmetic if needed.
-pub fn difficulty_ratio_target(difficulty: f64) -> anyhow::Result<f64> {
-    if difficulty <= 0.0 || !difficulty.is_finite() {
-        anyhow::bail!("invalid difficulty")
-    }
-    Ok(1.0 / difficulty)
-}
-
 pub fn validate_submit_meets_difficulty(
     job: &crate::stratum::job::MiningJob,
     extranonce1: &str,
     sub: &NativeSubmit,
     difficulty: f64,
 ) -> anyhow::Result<()> {
-    let header = build_header_bytes(job, extranonce1, sub)?;
-    validate_header_meets_difficulty(&header, difficulty)
+    let header = build_stratum_header(
+        &job.coinbase1,
+        extranonce1,
+        &sub.extranonce2,
+        &job.coinbase2,
+        &job.merkle_branches,
+        &job.prevhash,
+        &job.version,
+        &job.nbits,
+        &sub.ntime_hex_6b,
+        &sub.nonce_hex_8b,
+    )
+    .map_err(|e| anyhow::anyhow!("header build error: {}", e))?;
+
+    // Compute hash of the header
+    let hash = LotusHeader::deser(&mut Bytes::from_slice(&header))
+        .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?
+        .calc_hash();
+    let mut hash_be = [0u8; 32];
+    hash_be.copy_from_slice(hash.as_ref());
+    hash_be.reverse();
+
+    // Check if hash meets difficulty using the primitive
+    header_meets_difficulty(&hash_be, difficulty)
+        .map_err(|e| anyhow::anyhow!("difficulty check error: {}", e))?;
+    Ok(())
 }
 
 pub fn build_candidate_block(
@@ -99,20 +101,37 @@ pub fn build_candidate_block(
     extranonce1: &str,
     sub: &NativeSubmit,
 ) -> anyhow::Result<Vec<u8>> {
-    let coinbase = hex::decode(format!(
+    // Build the header using the shared primitive
+    let header_bytes = build_stratum_header(
+        &job.coinbase1,
+        extranonce1,
+        &sub.extranonce2,
+        &job.coinbase2,
+        &job.merkle_branches,
+        &job.prevhash,
+        &job.version,
+        &job.nbits,
+        &sub.ntime_hex_6b,
+        &sub.nonce_hex_8b,
+    )
+    .map_err(|e| anyhow::anyhow!("header build error: {}", e))?;
+
+    let mut block = LotusBlock::deser(&mut Bytes::from_slice(&job.template_block))
+        .map_err(|e| anyhow::anyhow!("block deser error: {}", e))?;
+
+    let mut header_bytes_for_deser = Bytes::from_slice(&header_bytes);
+    block.header = LotusHeader::deser(&mut header_bytes_for_deser)
+        .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?;
+
+    // Rebuild coinbase with extranonce
+    let coinbase_hex = format!(
         "{}{}{}{}",
         job.coinbase1, extranonce1, sub.extranonce2, job.coinbase2
-    ))?;
-    let header = build_header_bytes(job, extranonce1, sub)?;
-
-    let mut block_bytes = Bytes::from_slice(&job.template_block);
-    let mut block = LotusBlock::deser(&mut block_bytes)?;
-
-    let mut header_bytes = Bytes::from_slice(&header);
-    block.header = LotusHeader::deser(&mut header_bytes)?;
-
-    let mut coinbase_bytes = Bytes::from_slice(&coinbase);
-    let coinbase_tx = Tx::deser(&mut coinbase_bytes)?;
+    );
+    let coinbase_bytes = hex::decode(&coinbase_hex)?;
+    let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
+    let coinbase_tx = Tx::deser(&mut coinbase_buf)?;
+    
     if block.txs.is_empty() {
         anyhow::bail!("template block has no txs")
     }
@@ -122,146 +141,29 @@ pub fn build_candidate_block(
     Ok(block.ser().as_ref().to_vec())
 }
 
-pub fn build_precomputed_header(
-    job: &crate::stratum::job::MiningJob,
-    extranonce1: &str,
-    extranonce2: &str,
-    ntime_hex_6b: &str,
-    nonce_hex_8b: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let sub = NativeSubmit {
-        worker_name: String::new(),
-        job_id: job.job_id.clone(),
-        extranonce2: extranonce2.to_string(),
-        ntime_hex_6b: ntime_hex_6b.to_string(),
-        nonce_hex_8b: nonce_hex_8b.to_string(),
-    };
-    build_header_bytes(job, extranonce1, &sub)
-}
-
 pub fn share_target_hex_for_difficulty(difficulty: f64) -> anyhow::Result<String> {
-    let target = target_for_share_difficulty(difficulty)?;
-    let mut out = [0u8; 32];
-    target.to_big_endian(&mut out);
-    Ok(hex::encode(out))
-}
-
-fn header_lotus_hash_u256_be(header: &[u8]) -> anyhow::Result<U256> {
-    if header.len() != 160 {
-        anyhow::bail!("invalid header length")
-    }
-    let mut header_bytes = Bytes::from_slice(header);
-    let lotus_header = LotusHeader::deser(&mut header_bytes)?;
-    let hash = lotus_header.calc_hash();
-    let mut hash_be = [0u8; 32];
-    hash_be.copy_from_slice(hash.as_ref());
-    hash_be.reverse();
-    Ok(U256::from_big_endian(&hash_be))
-}
-
-pub fn validate_header_meets_difficulty(header: &[u8], difficulty: f64) -> anyhow::Result<()> {
-    let hash_u256 = header_lotus_hash_u256_be(header)?;
-    let share_target = target_for_share_difficulty(difficulty)?;
-    if hash_u256 > share_target {
-        anyhow::bail!("low difficulty share")
-    }
-    Ok(())
+    let target = difficulty_to_target(difficulty)
+        .map_err(|e| anyhow::anyhow!("difficulty conversion error: {}", e))?;
+    Ok(hex::encode(target))
 }
 
 pub fn validate_header_meets_target_hex(header: &[u8], target_hex_be: &str) -> anyhow::Result<()> {
-    let hash_u256 = header_lotus_hash_u256_be(header)?;
-    let target = u256_from_hex(target_hex_be)?;
-    if hash_u256 > target {
+    let target = hex::decode(target_hex_be)?;
+    if target.len() != 32 {
+        anyhow::bail!("invalid target length")
+    }
+    let hash = LotusHeader::deser(&mut Bytes::from_slice(header))
+        .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?
+        .calc_hash();
+    let mut hash_be = [0u8; 32];
+    hash_be.copy_from_slice(hash.as_ref());
+    hash_be.reverse();
+    let hash_u256 = U256::from_big_endian(&hash_be);
+    let target_u256 = U256::from_big_endian(&target);
+    if hash_u256 > target_u256 {
         anyhow::bail!("high hash")
     }
     Ok(())
-}
-
-fn build_header_bytes(
-    job: &crate::stratum::job::MiningJob,
-    extranonce1: &str,
-    sub: &NativeSubmit,
-) -> anyhow::Result<Vec<u8>> {
-    // Decode and deserialize coinbase to Tx
-    let coinbase_hex = format!(
-        "{}{}{}{}",
-        job.coinbase1, extranonce1, sub.extranonce2, job.coinbase2
-    );
-    let coinbase_bytes = hex::decode(&coinbase_hex)?;
-    let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
-    let coinbase_tx = Tx::deser(&mut coinbase_buf)?;
-
-    // Lotus merkle leaf: SHA256d(txid || lotus_txid) using bitcoinsuite primitives
-    let txid = coinbase_tx.hash();
-    let lotus_txid_val = lotus_txid(coinbase_tx.unhashed_tx());
-    let mut merkle_leaf_raw = Vec::with_capacity(64);
-    merkle_leaf_raw.extend_from_slice(txid.as_ref());
-    merkle_leaf_raw.extend_from_slice(lotus_txid_val.as_ref());
-    let merkle_leaf = sha256d(&merkle_leaf_raw);
-    let mut merkle = merkle_leaf.to_vec();
-    for branch_hex in &job.merkle_branches {
-        let branch = hex::decode(branch_hex)?;
-        let mut concat = Vec::with_capacity(64);
-        concat.extend_from_slice(&merkle);
-        concat.extend_from_slice(&branch);
-        merkle = sha256d(&concat).to_vec();
-    }
-
-    let mut header_bytes = Bytes::from_slice(&job.template_header);
-    let mut header = LotusHeader::deser(&mut header_bytes)?;
-
-    let nbits_bytes: [u8; 4] = hex::decode(&job.nbits)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid nbits length"))?;
-    let ntime_bytes: [u8; 6] = hex::decode(&sub.ntime_hex_6b)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid ntime length"))?;
-    let nonce_bytes: [u8; 8] = hex::decode(&sub.nonce_hex_8b)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
-    let merkle_bytes: [u8; 32] = merkle
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid merkle length"))?;
-
-    let mut ntime_le8 = [0u8; 8];
-    ntime_le8[..6].copy_from_slice(&ntime_bytes);
-
-    header.bits = u32::from_le_bytes(nbits_bytes);
-    header.timestamp = i64::from_le_bytes(ntime_le8);
-    header.nonce = u64::from_le_bytes(nonce_bytes);
-    header.merkle_root = Sha256d::new(merkle_bytes);
-
-    Ok(header.ser().as_ref().to_vec())
-}
-
-fn target_for_share_difficulty(difficulty: f64) -> anyhow::Result<U256> {
-    if difficulty <= 0.0 || !difficulty.is_finite() {
-        anyhow::bail!("invalid difficulty")
-    }
-    let scaled = (difficulty * DIFF_SCALE as f64).round();
-    if scaled <= 0.0 || !scaled.is_finite() {
-        anyhow::bail!("invalid difficulty scale")
-    }
-    let scaled_u = U256::from(scaled as u128);
-    let diff1 = u256_from_hex(DIFF1_TARGET_HEX)?;
-    let scaled_diff1 = diff1 * U256::from(DIFF_SCALE);
-    let mut target = scaled_diff1 / scaled_u;
-    if target.is_zero() {
-        target = U256::one();
-    }
-    Ok(target)
-}
-
-fn u256_from_hex(s: &str) -> anyhow::Result<U256> {
-    let raw = hex::decode(s)?;
-    if raw.len() != 32 {
-        anyhow::bail!("expected 32-byte hex")
-    }
-    Ok(U256::from_big_endian(&raw))
 }
 
 #[cfg(test)]

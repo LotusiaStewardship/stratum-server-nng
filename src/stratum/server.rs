@@ -5,8 +5,8 @@ use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
 use crate::stratum::validation::{
-    build_candidate_block, build_precomputed_header, prevalidate_submit_shape,
-    validate_header_meets_target_hex, validate_submit_meets_difficulty, NativeSubmit,
+    build_candidate_block, prevalidate_submit_shape, validate_header_meets_target_hex,
+    validate_submit_meets_difficulty, NativeSubmit,
 };
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
@@ -324,7 +324,6 @@ fn make_job_from_template(
         network_target_hex: template.target.to_hex_be(),
         clean_jobs,
         template_epoch,
-        template_header: template.header,
         template_block: template.block,
         block_height: template.height as i64,
     })
@@ -375,26 +374,17 @@ async fn send_mining_notify(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     job: &MiningJob,
 ) -> Result<()> {
+    // Use standard Stratum V1 notify params (9 elements, no template_header)
+    let params = job.notify_params();
     let v = serde_json::json!({
         "id": serde_json::Value::Null,
         "method": "mining.notify",
-        "params": [
-            job.job_id,
-            job.prevhash,
-            job.coinbase1,
-            job.coinbase2,
-            job.merkle_branches,
-            job.version,
-            job.nbits,
-            job.ntime,
-            job.clean_jobs,
-            hex::encode(&job.template_header),
-        ],
+        "params": params,
     });
     let mut data = serde_json::to_vec(&v)?;
     data.push(b'\n');
     writer.write_all(&data).await?;
-    debug!(job_id = %job.job_id, "sent mining.notify");
+    debug!(job_id = %job.job_id, "sent mining.notify (standard Stratum V1)");
     Ok(())
 }
 
@@ -694,10 +684,15 @@ async fn handle_conn(
                     continue;
                 }
 
-                let solved_header = match build_precomputed_header(
-                    &job,
+                let solved_header = match bitcoinsuite_bitcoind_stratum::build_stratum_header(
+                    &job.coinbase1,
                     &session.extranonce1,
                     &submit.extranonce2,
+                    &job.coinbase2,
+                    &job.merkle_branches,
+                    &job.prevhash,
+                    &job.version,
+                    &job.nbits,
                     &submit.ntime_hex_6b,
                     &submit.nonce_hex_8b,
                 ) {

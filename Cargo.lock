@@ -259,6 +259,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoinsuite-bitcoind-stratum"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitcoinsuite-core",
+ "hex",
+ "primitive-types",
+ "thiserror",
+]
+
+[[package]]
 name = "bitcoinsuite-core"
 version = "0.1.0"
 dependencies = [
@@ -2279,6 +2290,7 @@ dependencies = [
  "axum",
  "bitcoinsuite-bitcoind",
  "bitcoinsuite-bitcoind-nng",
+ "bitcoinsuite-bitcoind-stratum",
  "bitcoinsuite-core",
  "bitcoinsuite-ecc-secp256k1",
  "chrono",

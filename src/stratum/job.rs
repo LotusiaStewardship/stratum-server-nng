@@ -14,12 +14,12 @@ pub struct MiningJob {
     pub network_target_hex: String,
     pub clean_jobs: bool,
     pub template_epoch: u64,
-    pub template_header: Vec<u8>,
     pub template_block: Vec<u8>,
     pub block_height: i64,
 }
 
 impl MiningJob {
+    /// Returns standard Stratum V1 mining.notify params (9 elements)
     pub fn notify_params(&self) -> serde_json::Value {
         json!([
             self.job_id,
