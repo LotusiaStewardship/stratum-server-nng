@@ -146,29 +146,9 @@ pub async fn run_stratum_server(
     )
     .await?;
 
-    let runtime_bg = runtime.clone();
-    let adapter_bg = adapter.clone();
-    let refresh_secs = cfg.job_refresh_secs;
-    let pool_scripts_bg = pool_scripts.clone();
-    let stats_bg = stats.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
-            if let Err(err) = refresh_job_from_node(
-                &runtime_bg,
-                adapter_bg.clone(),
-                &pool_scripts_bg,
-                stats_bg.clone(),
-                true,
-                "periodic",
-            )
-            .await
-            {
-                warn!(error = %err, "periodic template refresh failed");
-            }
-        }
-    });
-
+    // NNG event-driven template refresh: subscribes to node events and refreshes
+    // the mining template when the chain tip changes, mempool updates, or mining
+    // work changes. This replaces the legacy periodic polling approach.
     let runtime_nng = runtime.clone();
     let nng_pub_url = cfg.nng_pub_url.clone();
     let rpc_adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
