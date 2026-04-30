@@ -156,6 +156,8 @@ cargo run --release -- \
 
 ## 5) Stratum protocol support
 
+Profile reference: `docs/lotus-stratum-v1-profile.md`
+
 ### Implemented methods
 
 Client -> server:
@@ -185,6 +187,8 @@ Validation contract:
 - `clean_jobs` boolean
 
 ### Optional/scaffold behavior
+
+- `emit_mining_notify_compat = true` (config) additionally emits legacy `mining.notify` alongside `lotus.precomputed_work` for interoperability testing.
 
 - `mining.extranonce.subscribe`: accepted/acknowledged
 - `mining.set_extranonce`: parsed but currently rejected as unsupported

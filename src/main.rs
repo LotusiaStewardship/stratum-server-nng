@@ -62,7 +62,11 @@ async fn main() -> Result<()> {
                     let repaired = reconcile_db
                         .repair_missing_found_blocks_from_submit_events()
                         .unwrap_or(0);
-                    tracing::error!(missing, repaired, "accepted submit events missing found_block persistence");
+                    tracing::error!(
+                        missing,
+                        repaired,
+                        "accepted submit events missing found_block persistence"
+                    );
                 }
             }
         }

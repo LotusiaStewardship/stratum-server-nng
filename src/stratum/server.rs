@@ -340,6 +340,8 @@ async fn send_json_line(
     Ok(())
 }
 
+const MAX_ASSIGNED_JOBS_PER_SESSION: usize = 128;
+
 #[derive(Debug, Clone)]
 struct AssignedJob {
     share_difficulty: f64,
@@ -420,6 +422,46 @@ async fn send_set_difficulty(
     writer.write_all(&data).await?;
     debug!(difficulty = diff, "sent mining.set_difficulty");
     Ok(())
+}
+
+async fn send_mining_notify_compat(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    job: &MiningJob,
+) -> Result<()> {
+    let v = serde_json::json!({
+        "id": serde_json::Value::Null,
+        "method": "mining.notify",
+        "params": [
+            job.job_id,
+            job.prevhash,
+            job.coinbase1,
+            job.coinbase2,
+            job.merkle_branches,
+            job.version,
+            job.nbits,
+            job.ntime,
+            job.clean_jobs,
+        ],
+    });
+    let mut data = serde_json::to_vec(&v)?;
+    data.push(b'\n');
+    writer.write_all(&data).await?;
+    debug!(job_id = %job.job_id, "sent mining.notify compatibility message");
+    Ok(())
+}
+
+fn prune_assigned_jobs(
+    session: &SessionState,
+    assigned_jobs: &mut HashMap<String, AssignedJob>,
+    assigned_job_order: &mut VecDeque<String>,
+) {
+    assigned_jobs.retain(|job_id, _| session.active_jobs.contains(job_id));
+    assigned_job_order.retain(|job_id| assigned_jobs.contains_key(job_id));
+    while assigned_job_order.len() > MAX_ASSIGNED_JOBS_PER_SESSION {
+        if let Some(evicted_job_id) = assigned_job_order.pop_front() {
+            assigned_jobs.remove(&evicted_job_id);
+        }
+    }
 }
 
 fn ensure_block_coinbase_payout_script(block: &[u8], expected_script: &[u8]) -> Result<()> {
@@ -523,39 +565,9 @@ async fn handle_conn(
 
     let mut pending_difficulty: Option<f64> = None;
     let mut assigned_jobs: HashMap<String, AssignedJob> = HashMap::new();
+    let mut assigned_job_order: VecDeque<String> = VecDeque::new();
     let mut share_stats = SessionShareStats::default();
-
-    if let Some(job) = runtime.latest_job() {
-        apply_notify(&mut session, &job);
-        send_set_difficulty(&mut write_half, vardiff.current).await?;
-        let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
-        let ntime_hex_6b = job.ntime.clone();
-        let header_160 = make_precomputed_header_160(&job)?;
-        let header_160_hex = hex::encode(header_160);
-        let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
-        send_precomputed_work(
-            &mut write_half,
-            &job,
-            &header_160_hex,
-            &share_target_hex,
-            &extranonce2,
-            &ntime_hex_6b,
-        )
-        .await?;
-        info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned initial precomputed work");
-        assigned_jobs.insert(
-            job.job_id.clone(),
-            AssignedJob {
-                share_difficulty: vardiff.current,
-                extranonce2,
-                ntime_hex_6b,
-                header_160,
-            },
-        );
-    }
-
-    let mut recent_ids: VecDeque<String> = VecDeque::new();
-    let mut recent_set: HashSet<String> = HashSet::new();
+    let mut inflight_ids: HashSet<String> = HashSet::new();
     let mut req_count: u32 = 0;
     let mut req_window_start = std::time::Instant::now();
 
@@ -565,32 +577,36 @@ async fn handle_conn(
                 vardiff.current = next_diff;
             }
             apply_notify(&mut session, &job);
-            let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
-            let ntime_hex_6b = job.ntime.clone();
-            let header_160 = make_precomputed_header_160(&job)?;
-            let header_160_hex = hex::encode(header_160);
-            let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
-            send_precomputed_work(
-                &mut write_half,
-                &job,
-                &header_160_hex,
-                &share_target_hex,
-                &extranonce2,
-                &ntime_hex_6b,
-            )
-            .await?;
-            info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned precomputed work");
-            assigned_jobs.insert(
-                job.job_id.clone(),
-                AssignedJob {
-                    share_difficulty: vardiff.current,
-                    extranonce2,
-                    ntime_hex_6b,
-                    header_160,
-                },
-            );
-            if job.clean_jobs {
-                assigned_jobs.retain(|job_id, _| session.active_jobs.contains(job_id));
+            if session.is_subscribed {
+                let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
+                let ntime_hex_6b = job.ntime.clone();
+                let header_160 = make_precomputed_header_160(&job)?;
+                let header_160_hex = hex::encode(header_160);
+                let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
+                send_precomputed_work(
+                    &mut write_half,
+                    &job,
+                    &header_160_hex,
+                    &share_target_hex,
+                    &extranonce2,
+                    &ntime_hex_6b,
+                )
+                .await?;
+                if cfg.emit_mining_notify_compat {
+                    send_mining_notify_compat(&mut write_half, &job).await?;
+                }
+                info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned precomputed work");
+                assigned_jobs.insert(
+                    job.job_id.clone(),
+                    AssignedJob {
+                        share_difficulty: vardiff.current,
+                        extranonce2,
+                        ntime_hex_6b,
+                        header_160,
+                    },
+                );
+                assigned_job_order.push_back(job.job_id.clone());
+                prune_assigned_jobs(&session, &mut assigned_jobs, &mut assigned_job_order);
             }
         }
 
@@ -639,25 +655,54 @@ async fn handle_conn(
         debug!(session_id = %session_id, method = ?req.method, req_id = %req.id, params = %req.params, "received stratum request");
 
         let id_key = req.id.to_string();
-        if recent_set.contains(&id_key) {
-            warn!(session_id = %session_id, req_id = %req.id, "duplicate request id from miner");
+        if !inflight_ids.insert(id_key.clone()) {
+            warn!(session_id = %session_id, req_id = %req.id, "duplicate in-flight request id from miner");
             let err = StratumResponse::err(req.id.clone(), 22, "duplicate-request-id");
             send_json_line(&mut write_half, &err).await?;
             continue;
-        }
-        recent_set.insert(id_key.clone());
-        recent_ids.push_back(id_key);
-        while recent_ids.len() > 2048 {
-            if let Some(old) = recent_ids.pop_front() {
-                recent_set.remove(&old);
-            }
         }
 
         let method = req.method.clone();
         let req_id = req.id.clone();
         let params = req.params.clone();
         if let Some(resp) = handle_request(&mut session, req) {
+            inflight_ids.remove(&id_key);
             debug!(session_id = %session_id, method = ?method, req_id = %req_id, response_error = %resp.error, response_result = %resp.result, "sending stratum response");
+            if matches!(method, Method::Subscribe) && resp.error.is_null() {
+                send_set_difficulty(&mut write_half, vardiff.current).await?;
+                if let Some(job) = runtime.latest_job() {
+                    apply_notify(&mut session, &job);
+                    let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
+                    let ntime_hex_6b = job.ntime.clone();
+                    let header_160 = make_precomputed_header_160(&job)?;
+                    let header_160_hex = hex::encode(header_160);
+                    let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
+                    send_precomputed_work(
+                        &mut write_half,
+                        &job,
+                        &header_160_hex,
+                        &share_target_hex,
+                        &extranonce2,
+                        &ntime_hex_6b,
+                    )
+                    .await?;
+                    if cfg.emit_mining_notify_compat {
+                        send_mining_notify_compat(&mut write_half, &job).await?;
+                    }
+                    assigned_jobs.insert(
+                        job.job_id.clone(),
+                        AssignedJob {
+                            share_difficulty: vardiff.current,
+                            extranonce2,
+                            ntime_hex_6b,
+                            header_160,
+                        },
+                    );
+                    assigned_job_order.push_back(job.job_id.clone());
+                    prune_assigned_jobs(&session, &mut assigned_jobs, &mut assigned_job_order);
+                    info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, clean_jobs = job.clean_jobs, "assigned initial precomputed work after subscribe");
+                }
+            }
             if matches!(method, Method::Authorize) {
                 let worker_name = params
                     .as_array()
@@ -747,7 +792,15 @@ async fn handle_conn(
                         template_epoch: job.template_epoch,
                         job_id: &job.job_id,
                         round_id,
-                        dedupe_key: &format!("{}:{}:{}:{}:{}:{}", worker_row.id, job.template_id, job.template_epoch, extranonce2, ntime, nonce),
+                        dedupe_key: &format!(
+                            "{}:{}:{}:{}:{}:{}",
+                            worker_row.id,
+                            job.template_id,
+                            job.template_epoch,
+                            extranonce2,
+                            ntime,
+                            nonce
+                        ),
                         status: "stale",
                         reject_reason: Some("stale-job"),
                         node_result: None,
@@ -804,7 +857,7 @@ async fn handle_conn(
                         ntime,
                         nonce
                     );
-                    let inserted = db.insert_share_idempotent(
+                    let share_id = db.insert_share_idempotent(
                         worker_row.id,
                         job.template_id,
                         share_difficulty,
@@ -812,11 +865,6 @@ async fn handle_conn(
                         false,
                         &dedupe_key,
                     )?;
-                    let share_id = if inserted {
-                        db.list_recent_shares(1)?.first().map(|s| s.id)
-                    } else {
-                        None
-                    };
                     let _ = db.record_share_outcome(ShareOutcomeInsert {
                         session_id: &session_id,
                         worker_id: worker_row.id,
@@ -923,7 +971,7 @@ async fn handle_conn(
                     "{}:{}:{}:{}:{}:{}",
                     worker_row.id, job.template_id, job.template_epoch, extranonce2, ntime, nonce
                 );
-                let inserted = db.insert_share_idempotent(
+                let share_id = db.insert_share_idempotent(
                     worker_row.id,
                     job.template_id,
                     share_difficulty,
@@ -931,11 +979,6 @@ async fn handle_conn(
                     false,
                     &dedupe_key,
                 )?;
-                let share_id = if inserted {
-                    db.list_recent_shares(1)?.first().map(|s| s.id)
-                } else {
-                    None
-                };
                 let submit_block_hash = submit_result.block_hash.to_hex_be();
                 let _ = db.record_share_outcome(ShareOutcomeInsert {
                     session_id: &session_id,
@@ -947,7 +990,11 @@ async fn handle_conn(
                     job_id: &job.job_id,
                     round_id,
                     dedupe_key: &dedupe_key,
-                    status: if share_accepted { "accepted" } else { "rejected" },
+                    status: if share_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
                     reject_reason: if share_accepted {
                         None
                     } else {
@@ -971,7 +1018,11 @@ async fn handle_conn(
                 share_stats.accepted += 1;
                 let _ = db.record_accounting_event(
                     "submit_result",
-                    Some(if share_accepted { "accepted" } else { "rejected" }),
+                    Some(if share_accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    }),
                     Some(&session_id),
                     Some(worker_row.id),
                     Some(&submit.worker_name),
@@ -981,7 +1032,10 @@ async fn handle_conn(
                     Some(job.template_epoch),
                     Some(&job.job_id),
                     Some(&submit_block_hash),
-                    Some(&format!("{{\"reject_reason\":\"{}\",\"result\":\"{:?}\"}}", submit_result.reject_reason, submit_result.result)),
+                    Some(&format!(
+                        "{{\"reject_reason\":\"{}\",\"result\":\"{:?}\"}}",
+                        submit_result.reject_reason, submit_result.result
+                    )),
                 );
                 if matches!(
                     submit_result.result,
@@ -1027,6 +1081,8 @@ async fn handle_conn(
                 }
             }
             send_json_line(&mut write_half, &resp).await?;
+        } else {
+            inflight_ids.remove(&id_key);
         }
     }
 

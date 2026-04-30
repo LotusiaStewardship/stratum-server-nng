@@ -61,6 +61,7 @@ max_jobs_cache = 512
 
 # Periodic refresh interval for fetching a fresh mining template from lotusd.
 job_refresh_secs = 15
+emit_mining_notify_compat = false
 
 [pool.mining_identity]
 # The payout destination for block subsidies and mining rewards.

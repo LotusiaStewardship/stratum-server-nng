@@ -425,6 +425,7 @@ impl AccountingDb {
     }
 
     /// Insert share if it hasn't been seen before.
+    /// Returns Some(share_id) when inserted, or None if this dedupe_key already existed.
     pub fn insert_share_idempotent(
         &self,
         worker_id: i64,
@@ -433,7 +434,7 @@ impl AccountingDb {
         accepted: bool,
         stale: bool,
         dedupe_key: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<i64>> {
         let now = Utc::now();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let rows = conn.execute(
@@ -449,7 +450,10 @@ impl AccountingDb {
                 now.to_rfc3339()
             ],
         )?;
-        Ok(rows > 0)
+        if rows > 0 {
+            return Ok(Some(conn.last_insert_rowid()));
+        }
+        Ok(None)
     }
 
     pub fn list_recent_shares(&self, limit: u32) -> Result<Vec<Share>> {
@@ -579,7 +583,12 @@ impl AccountingDb {
             params![block_hash, template_id as i64, worker_id, worker_name, payout_address, round_id, now],
         )?;
         drop(conn);
-        self.close_round(round_id, Some(template_id), "round_closed_found_block", Some(block_hash))?;
+        self.close_round(
+            round_id,
+            Some(template_id),
+            "round_closed_found_block",
+            Some(block_hash),
+        )?;
         self.record_accounting_event(
             "found_block_observed",
             Some("accepted"),
@@ -818,7 +827,13 @@ impl AccountingDb {
         let mut rounds = Vec::new();
         {
             let mut stmt = conn.prepare("SELECT DISTINCT round_id, block_hash, template_id FROM found_blocks WHERE chain_state='pending'")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?;
             for row in rows {
                 rounds.push(row?);
             }
@@ -1156,7 +1171,10 @@ impl AccountingDb {
         Ok(())
     }
 
-    pub fn list_submitted_batches_pending_confirmation(&self, limit: u32) -> Result<Vec<(i64, i64, String)>> {
+    pub fn list_submitted_batches_pending_confirmation(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(i64, i64, String)>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, found_block_id, submitted_txid
@@ -1164,7 +1182,9 @@ impl AccountingDb {
              WHERE status='submitted' AND submitted_txid IS NOT NULL
              ORDER BY id ASC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1244,10 +1264,12 @@ mod tests {
         let worker = db.upsert_worker("lotus_abc", Some("rig1")).unwrap();
         assert!(db
             .insert_share_idempotent(worker.id, 1, 1.0, true, false, "k1")
-            .unwrap());
-        assert!(!db
+            .unwrap()
+            .is_some());
+        assert!(db
             .insert_share_idempotent(worker.id, 1, 1.0, true, false, "k1")
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[test]

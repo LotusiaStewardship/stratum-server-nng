@@ -11,6 +11,8 @@ pub struct SessionState {
     pub session_id: String,
     pub extranonce1: String,
     pub extranonce2_size: u8,
+    pub is_subscribed: bool,
+    pub is_authorized: bool,
     pub authorized_workers: HashSet<String>,
     pub worker_difficulty: HashMap<String, f64>,
     pub active_jobs: HashSet<String>,
@@ -22,6 +24,8 @@ impl SessionState {
             session_id,
             extranonce1: "00000000".to_string(),
             extranonce2_size: 4,
+            is_subscribed: false,
+            is_authorized: false,
             authorized_workers: HashSet::new(),
             worker_difficulty: HashMap::new(),
             active_jobs: HashSet::new(),
@@ -48,6 +52,7 @@ pub fn handle_line(
 pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option<StratumResponse> {
     match req.method {
         Method::Subscribe => {
+            session.is_subscribed = true;
             let result = json!([
                 [
                     ["mining.set_difficulty", session.session_id],
@@ -59,6 +64,9 @@ pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option
             Some(StratumResponse::ok(req.id, result))
         }
         Method::Authorize => {
+            if !session.is_subscribed {
+                return Some(StratumResponse::err(req.id, 25, "not-subscribed"));
+            }
             let arr = req.params.as_array().cloned().unwrap_or_default();
             let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
             if parse_worker_name(worker).is_err() {
@@ -69,9 +77,13 @@ pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option
                 .worker_difficulty
                 .entry(worker.to_string())
                 .or_insert(1.0);
+            session.is_authorized = true;
             Some(StratumResponse::ok(req.id, Value::Bool(true)))
         }
         Method::Submit => {
+            if !session.is_subscribed {
+                return Some(StratumResponse::err(req.id, 25, "not-subscribed"));
+            }
             let arr = req.params.as_array().cloned().unwrap_or_default();
             let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
             let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
@@ -119,5 +131,20 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(auth.result, Value::Bool(true));
+        assert!(s.is_subscribed);
+        assert!(s.is_authorized);
+    }
+
+    #[test]
+    fn test_authorize_requires_subscribe() {
+        let mut s = SessionState::new("sess-2".to_string());
+        let auth = handle_line(
+            &mut s,
+            r#"{"id":2,"method":"mining.authorize","params":["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig","x"]}"#,
+            8192,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.error, json!([25, "not-subscribed", Value::Null]));
     }
 }
