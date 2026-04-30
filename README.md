@@ -66,9 +66,22 @@ On `mining.submit`:
 
 ---
 
-## 3) CLI runtime parameters
+## 3) Runtime configuration (config.toml)
 
-All settings are CLI flags.
+Server configuration is file-based. Start with `--config` (default `./config.toml`).
+
+Minimal required safety section:
+
+```toml
+[pool.mining_identity]
+payout_address = "lotus_..." # or payout_script_hex
+```
+
+Startup now hard-fails if payout script is missing or resolves to `OP_RETURN`/nulldata.
+
+CLI flags now only control bootstrap:
+- `--config`
+- `--debug`
 
 ### Logging and diagnostics
 
@@ -83,24 +96,22 @@ All settings are CLI flags.
 
 ### Auth
 
-- `--api-token` (**required**)
-  - Bearer token for operator endpoints.
+- `api_token` is configured in `config.toml` (or env override `STRATUM_API_TOKEN`).
 
 ### Storage + lotusd connectivity
 
-- `--sqlite-path` (default: `./stratum-accounting.sqlite3`)
-- `--nng-rpc-url` (default: `ipc://datadir/nngrpc.pipe`)
-- `--nng-pub-url` (default: `ipc://datadir/nngpub.pipe`)
+Configured in `config.toml`:
+- `sqlite_path`
+- `nng_rpc_url`
+- `nng_pub_url`
 
 Both `ipc://` and `tcp://` NNG URLs are supported.
 
 ### Difficulty / vardiff
 
-- `--initial-difficulty` (default: `1.0`)
-- `--min-difficulty` (default: `0.0000001`)
-- `--max-difficulty` (default: `1e12`)
-- `--vardiff-target-secs` (default: `15.0`)
-- `--vardiff-retarget-secs` (default: `90.0`)
+Configured in `config.toml`:
+- `initial_difficulty`, `min_difficulty`, `max_difficulty`
+- `vardiff_target_secs`, `vardiff_retarget_secs`
 
 ### Protocol hardening
 
@@ -117,23 +128,14 @@ Both `ipc://` and `tcp://` NNG URLs are supported.
 ### Local development / regtest
 
 ```bash
-cargo run -- \
-  --api-token devtoken \
-  --stratum-bind 127.0.0.1:3334 \
-  --api-bind 127.0.0.1:18080 \
-  --sqlite-path ./stratum-accounting.sqlite3 \
-  --nng-rpc-url ipc://datadir/nngrpc.pipe \
-  --nng-pub-url ipc://datadir/nngpub.pipe
+cp config.example.toml config.toml
+cargo run -- --config ./config.toml
 ```
 
 ### Verbose debug run
 
 ```bash
-cargo run -- \
-  --debug \
-  --api-token devtoken \
-  --nng-rpc-url ipc:///path/to/nngrpc.pipe \
-  --nng-pub-url ipc:///path/to/nngpub.pipe
+cargo run -- --config ./config.toml --debug
 ```
 
 ### Production-style run (release)

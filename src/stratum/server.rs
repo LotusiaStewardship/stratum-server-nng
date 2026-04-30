@@ -1,5 +1,5 @@
 use crate::accounting::AccountingDb;
-use crate::config::Config;
+use crate::config::{Config, ResolvedPoolScripts};
 use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent, NodeMiningAdapter};
 use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
@@ -22,12 +22,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Default)]
 pub struct RuntimeStats {
     pub idle_disconnects: AtomicU64,
     pub rate_limit_disconnects: AtomicU64,
+    pub template_payout_mismatch_total: AtomicU64,
+    pub candidate_payout_mismatch_total: AtomicU64,
+    pub found_block_persist_ok_total: AtomicU64,
+    pub found_block_persist_error_total: AtomicU64,
+    pub found_block_observed_not_persisted_total: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -35,6 +40,11 @@ impl RuntimeStats {
         RuntimeStatsSnapshot {
             idle_disconnects: self.idle_disconnects.load(Ordering::Relaxed),
             rate_limit_disconnects: self.rate_limit_disconnects.load(Ordering::Relaxed),
+            template_payout_mismatch_total: self.template_payout_mismatch_total.load(Ordering::Relaxed),
+            candidate_payout_mismatch_total: self.candidate_payout_mismatch_total.load(Ordering::Relaxed),
+            found_block_persist_ok_total: self.found_block_persist_ok_total.load(Ordering::Relaxed),
+            found_block_persist_error_total: self.found_block_persist_error_total.load(Ordering::Relaxed),
+            found_block_observed_not_persisted_total: self.found_block_observed_not_persisted_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -43,6 +53,11 @@ impl RuntimeStats {
 pub struct RuntimeStatsSnapshot {
     pub idle_disconnects: u64,
     pub rate_limit_disconnects: u64,
+    pub template_payout_mismatch_total: u64,
+    pub candidate_payout_mismatch_total: u64,
+    pub found_block_persist_ok_total: u64,
+    pub found_block_persist_error_total: u64,
+    pub found_block_observed_not_persisted_total: u64,
 }
 
 #[derive(Clone)]
@@ -110,17 +125,21 @@ pub async fn run_stratum_server(
 
     let adapter: Arc<dyn NodeMiningAdapter> =
         Arc::new(BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?);
+    let pool_scripts = cfg.resolve_pool_scripts()?;
+    info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
-    refresh_job_from_node(&runtime, adapter.clone(), true, "startup").await?;
+    refresh_job_from_node(&runtime, adapter.clone(), &pool_scripts, stats.clone(), true, "startup").await?;
 
     let runtime_bg = runtime.clone();
     let adapter_bg = adapter.clone();
     let refresh_secs = cfg.job_refresh_secs;
+    let pool_scripts_bg = pool_scripts.clone();
+    let stats_bg = stats.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
             if let Err(err) =
-                refresh_job_from_node(&runtime_bg, adapter_bg.clone(), true, "periodic").await
+                refresh_job_from_node(&runtime_bg, adapter_bg.clone(), &pool_scripts_bg, stats_bg.clone(), true, "periodic").await
             {
                 warn!(error = %err, "periodic template refresh failed");
             }
@@ -131,6 +150,8 @@ pub async fn run_stratum_server(
     let nng_pub_url = cfg.nng_pub_url.clone();
     let rpc_adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
     let adapter_events = adapter.clone();
+    let pool_scripts_events = pool_scripts.clone();
+    let stats_events = stats.clone();
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
@@ -149,6 +170,8 @@ pub async fn run_stratum_server(
                 if let Err(err) = refresh_job_from_node(
                     &runtime_events,
                     adapter_events_inner.clone(),
+                    &pool_scripts_events,
+                    stats_events.clone(),
                     clean,
                     reason,
                 )
@@ -179,8 +202,9 @@ pub async fn run_stratum_server(
         let cfg = cfg.clone();
         let adapter = adapter.clone();
         let stats = stats.clone();
+        let pool_scripts = pool_scripts.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_conn(socket, db, runtime, cfg, adapter, stats).await {
+            if let Err(err) = handle_conn(socket, db, runtime, cfg, pool_scripts, adapter, stats).await {
                 warn!(error = %err, peer = %peer_addr, "stratum connection closed with error");
             } else {
                 info!(peer = %peer_addr, "stratum connection closed");
@@ -192,10 +216,20 @@ pub async fn run_stratum_server(
 async fn refresh_job_from_node(
     runtime: &StratumRuntime,
     adapter: Arc<dyn NodeMiningAdapter>,
+    pool_scripts: &ResolvedPoolScripts,
+    stats: Arc<RuntimeStats>,
     clean_jobs: bool,
     reason: &str,
 ) -> Result<()> {
-    let template = adapter.get_mining_template(None).await?;
+    let template = adapter
+        .get_mining_template(Some(pool_scripts.payout_script.clone()))
+        .await?;
+    ensure_block_coinbase_payout_script(&template.block, &pool_scripts.payout_script).map_err(|e| {
+        stats
+            .template_payout_mismatch_total
+            .fetch_add(1, Ordering::Relaxed);
+        anyhow!("template payout script mismatch: {e}")
+    })?;
     let epoch = runtime.next_template_epoch();
     let job = make_job_from_template(template, epoch, clean_jobs)?;
     info!(
@@ -325,6 +359,79 @@ async fn send_set_difficulty(
     Ok(())
 }
 
+fn ensure_block_coinbase_payout_script(block: &[u8], expected_script: &[u8]) -> Result<()> {
+    let script = extract_coinbase_vout_script(block, 1)?;
+    if script != expected_script {
+        anyhow::bail!("coinbase vout[1] script mismatch")
+    }
+    Ok(())
+}
+
+fn extract_coinbase_vout_script(block: &[u8], vout_index: usize) -> Result<Vec<u8>> {
+    if block.len() < 161 {
+        anyhow::bail!("block too short")
+    }
+    let mut i = 160;
+    let (tx_count_len, tx_count) = read_varint(&block[i..])?;
+    i += tx_count_len;
+    if tx_count == 0 {
+        anyhow::bail!("block has no txs")
+    }
+    let (_, script) = parse_tx_output_script(&block[i..], vout_index)?;
+    Ok(script)
+}
+
+fn parse_tx_output_script(tx: &[u8], vout_index: usize) -> Result<(usize, Vec<u8>)> {
+    let mut i = 0;
+    i += 4;
+    let (vin_len, vin_cnt) = read_varint(&tx[i..])?;
+    i += vin_len;
+    for _ in 0..vin_cnt {
+        i += 32 + 4;
+        let (sl, ssz) = read_varint(&tx[i..])?;
+        i += sl + ssz as usize;
+        i += 4;
+    }
+    let (vout_len, vout_cnt) = read_varint(&tx[i..])?;
+    i += vout_len;
+    for idx in 0..vout_cnt as usize {
+        i += 8;
+        let (sl, ssz) = read_varint(&tx[i..])?;
+        i += sl;
+        let end = i + ssz as usize;
+        if end > tx.len() {
+            anyhow::bail!("tx output out of bounds")
+        }
+        let script = tx[i..end].to_vec();
+        i = end;
+        if idx == vout_index {
+            return Ok((i, script));
+        }
+    }
+    anyhow::bail!("missing vout index")
+}
+
+fn read_varint(bytes: &[u8]) -> Result<(usize, u64)> {
+    if bytes.is_empty() {
+        anyhow::bail!("missing varint")
+    }
+    match bytes[0] {
+        n @ 0x00..=0xfc => Ok((1, n as u64)),
+        0xfd => {
+            if bytes.len() < 3 { anyhow::bail!("short varint") }
+            Ok((3, u16::from_le_bytes([bytes[1], bytes[2]]) as u64))
+        }
+        0xfe => {
+            if bytes.len() < 5 { anyhow::bail!("short varint") }
+            Ok((5, u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64))
+        }
+        0xff => {
+            if bytes.len() < 9 { anyhow::bail!("short varint") }
+            Ok((9, u64::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8]])))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +491,7 @@ async fn handle_conn(
     db: AccountingDb,
     runtime: StratumRuntime,
     cfg: Config,
+    pool_scripts: ResolvedPoolScripts,
     adapter: Arc<dyn NodeMiningAdapter>,
     stats: Arc<RuntimeStats>,
 ) -> Result<()> {
@@ -674,6 +782,16 @@ async fn handle_conn(
                     }
                 };
 
+                if let Err(err) = ensure_block_coinbase_payout_script(&candidate_block, &pool_scripts.payout_script) {
+                    stats
+                        .candidate_payout_mismatch_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    error!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, template_id = job.template_id, error = %err, "candidate payout script mismatch; rejecting submit");
+                    let err = StratumResponse::err(req_id.clone(), 20, "candidate-payout-mismatch");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
+                }
+
                 let proposal = match adapter.validate_proposal(candidate_block.clone()).await {
                     Ok(v) => v,
                     Err(err) => {
@@ -739,6 +857,26 @@ async fn handle_conn(
                 }
 
                 share_stats.accepted += 1;
+                if matches!(submit_result.result, MiningSubmitResult::Accepted | MiningSubmitResult::Duplicate) {
+                    let persist = db.record_found_block(
+                        &submit_result.block_hash.to_hex_be(),
+                        job.template_id,
+                        worker_row.id,
+                        &submit.worker_name,
+                        &worker_row.payout_address,
+                        "submit_flow",
+                    );
+                    match persist {
+                        Ok(_) => {
+                            stats.found_block_persist_ok_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            stats.found_block_persist_error_total.fetch_add(1, Ordering::Relaxed);
+                            error!(session_id = %session_id, block_hash = %submit_result.block_hash.to_hex_be(), error = %err, "node accepted solved block but DB persist failed");
+                        }
+                    }
+                }
+
                 if node_result_is_share_only_high_hash {
                     info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, reject_reason = %submit_result.reject_reason, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (met pool difficulty; below network target)");
                 } else {

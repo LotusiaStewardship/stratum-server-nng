@@ -2,13 +2,14 @@ use anyhow::Result;
 use clap::Parser;
 use stratum_server_nng::accounting::{AccountingDb, PayoutMethod};
 use stratum_server_nng::api::start_operator_api;
-use stratum_server_nng::config::Config;
+use stratum_server_nng::config::{CliArgs, Config};
 use stratum_server_nng::stratum::server::{run_stratum_server, RuntimeStats};
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = Config::parse();
+    let cli = CliArgs::parse();
+    let cfg = Config::load(&cli)?;
 
     let default_filter = if cfg.debug {
         "stratum_server_nng=debug,bitcoinsuite_bitcoind_nng=info"
@@ -46,6 +47,22 @@ async fn main() -> Result<()> {
     let api_stats = stats.clone();
     let stratum_stats = stats.clone();
 
+    let reconcile_db = db.clone();
+    let reconcile_stats = stats.clone();
+    let reconcile_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if let Ok(missing) = reconcile_db.reconcile_missing_found_blocks() {
+                reconcile_stats
+                    .found_block_observed_not_persisted_total
+                    .store(missing, std::sync::atomic::Ordering::Relaxed);
+                if missing > 0 {
+                    tracing::error!(missing, "accepted submit events missing found_block persistence");
+                }
+            }
+        }
+    });
+
     let api_task =
         tokio::spawn(
             async move { start_operator_api(api_bind, api_token, api_db, api_stats).await },
@@ -53,7 +70,7 @@ async fn main() -> Result<()> {
     let stratum_task =
         tokio::spawn(async move { run_stratum_server(cfg, db, stratum_stats).await });
 
-    let (api_res, stratum_res) = tokio::join!(api_task, stratum_task);
+    let (api_res, stratum_res, _reconcile_res) = tokio::join!(api_task, stratum_task, reconcile_task);
     api_res??;
     stratum_res??;
     Ok(())

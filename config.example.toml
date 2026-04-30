@@ -1,0 +1,33 @@
+debug = false
+stratum_bind = "0.0.0.0:3334"
+api_bind = "127.0.0.1:18080"
+api_token = "devtoken"
+sqlite_path = "./stratum-accounting.sqlite3"
+nng_rpc_url = "ipc://datadir/nngrpc.pipe"
+nng_pub_url = "ipc://datadir/nngpub.pipe"
+initial_difficulty = 1.0
+vardiff_target_secs = 15.0
+vardiff_retarget_secs = 90.0
+min_difficulty = 0.0000001
+max_difficulty = 1e12
+max_request_line_bytes = 8192
+per_conn_req_per_sec = 128
+conn_idle_timeout_secs = 180
+max_jobs_cache = 512
+job_refresh_secs = 15
+
+[pool.mining_identity]
+payout_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# payout_script_hex = "76a914...88ac"
+
+[pool.fee]
+enabled = true
+fee_bps = 100
+fee_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# fee_script_hex = "76a914...88ac"
+
+[pool.pplns]
+n_multiplier = 1.0
+min_payout_sat = 546
+payout_interval_secs = 3600
+min_confirmations = 100

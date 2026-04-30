@@ -80,8 +80,27 @@ impl AccountingDb {
                     round_id INTEGER NOT NULL,
                     block_hash TEXT NOT NULL UNIQUE,
                     height INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    confirmations INTEGER NOT NULL DEFAULT 0,
+                    template_id INTEGER,
+                    worker_id INTEGER,
+                    worker_name TEXT,
+                    payout_address TEXT,
+                    persist_source TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(round_id) REFERENCES rounds(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS submit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_hash TEXT NOT NULL,
+                    template_id INTEGER,
+                    worker_id INTEGER,
+                    worker_name TEXT,
+                    payout_address TEXT,
+                    node_result TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(block_hash, worker_id, node_result)
                 );
 
                 CREATE TABLE IF NOT EXISTS payout_batches (
@@ -107,7 +126,30 @@ impl AccountingDb {
             )?;
         }
 
+        // forward-safe backfill for existing DB files
+        Self::ensure_column(&tx, "found_blocks", "status", "TEXT NOT NULL DEFAULT 'pending'")?;
+        Self::ensure_column(&tx, "found_blocks", "confirmations", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(&tx, "found_blocks", "template_id", "INTEGER")?;
+        Self::ensure_column(&tx, "found_blocks", "worker_id", "INTEGER")?;
+        Self::ensure_column(&tx, "found_blocks", "worker_name", "TEXT")?;
+        Self::ensure_column(&tx, "found_blocks", "payout_address", "TEXT")?;
+        Self::ensure_column(&tx, "found_blocks", "persist_source", "TEXT")?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
+
         tx.commit()?;
+        Ok(())
+    }
+
+    fn ensure_column(tx: &rusqlite::Transaction<'_>, table: &str, col: &str, decl: &str) -> Result<()> {
+        let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == col {
+                return Ok(());
+            }
+        }
+        tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"), [])?;
         Ok(())
     }
 
@@ -292,6 +334,46 @@ impl AccountingDb {
             });
         }
         Ok(out)
+    }
+
+    pub fn record_found_block(
+        &self,
+        block_hash: &str,
+        template_id: u64,
+        worker_id: i64,
+        worker_name: &str,
+        payout_address: &str,
+        persist_source: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO rounds(start_template_id, created_at) VALUES(?1, ?2)",
+            params![template_id as i64, now],
+        )?;
+        let round_id: i64 = conn.query_row("SELECT id FROM rounds ORDER BY id DESC LIMIT 1", [], |r| r.get(0))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO found_blocks(round_id, block_hash, template_id, worker_id, worker_name, payout_address, persist_source, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![round_id, block_hash, template_id as i64, worker_id, worker_name, payout_address, persist_source, Utc::now().to_rfc3339()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO submit_events(block_hash, template_id, worker_id, worker_name, payout_address, node_result, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'accepted', ?6)",
+            params![block_hash, template_id as i64, worker_id, worker_name, payout_address, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn reconcile_missing_found_blocks(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM submit_events se LEFT JOIN found_blocks fb ON fb.block_hash = se.block_hash WHERE se.node_result='accepted' AND fb.id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn active_payout_method(&self) -> Result<Option<String>> {

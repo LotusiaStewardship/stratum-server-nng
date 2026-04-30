@@ -24,6 +24,11 @@ struct StatusResp<'a> {
     payout_method: Option<String>,
     idle_disconnects: u64,
     rate_limit_disconnects: u64,
+    template_payout_mismatch_total: u64,
+    candidate_payout_mismatch_total: u64,
+    found_block_persist_ok_total: u64,
+    found_block_persist_error_total: u64,
+    found_block_observed_not_persisted_total: u64,
 }
 
 fn check_auth(headers: &HeaderMap, token: &str) -> bool {
@@ -64,6 +69,11 @@ async fn status(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoR
         payout_method,
         idle_disconnects: snap.idle_disconnects,
         rate_limit_disconnects: snap.rate_limit_disconnects,
+        template_payout_mismatch_total: snap.template_payout_mismatch_total,
+        candidate_payout_mismatch_total: snap.candidate_payout_mismatch_total,
+        found_block_persist_ok_total: snap.found_block_persist_ok_total,
+        found_block_persist_error_total: snap.found_block_persist_error_total,
+        found_block_observed_not_persisted_total: snap.found_block_observed_not_persisted_total,
     })
     .into_response()
 }

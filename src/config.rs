@@ -1,76 +1,151 @@
+use anyhow::{anyhow, Result};
+use bitcoinsuite_core::CashAddress;
 use clap::Parser;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-/// Runtime configuration for stratum-server-nng.
-///
-/// Defaults are conservative and local-dev friendly. Production operators
-/// should explicitly set token, endpoint addresses, and database location.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "stratum-server-nng")]
-pub struct Config {
-    /// Enable verbose development/debug logging.
+pub struct CliArgs {
+    #[arg(long, default_value = "./config.toml")]
+    pub config: String,
     #[arg(long, default_value_t = false)]
     pub debug: bool,
-    /// Stratum TCP bind address.
-    #[arg(long, default_value = "0.0.0.0:3334")]
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    pub debug: bool,
     pub stratum_bind: String,
-
-    /// Operator API bind address.
-    #[arg(long, default_value = "127.0.0.1:18080")]
     pub api_bind: String,
-
-    /// Required bearer token for operator API.
-    #[arg(long)]
     pub api_token: String,
-
-    /// SQLite file path for accounting state.
-    #[arg(long, default_value = "./stratum-accounting.sqlite3")]
     pub sqlite_path: String,
-
-    /// NNG RPC endpoint (ipc:// or tcp://).
-    #[arg(long, default_value = "ipc://datadir/nngrpc.pipe")]
     pub nng_rpc_url: String,
-
-    /// NNG Pub endpoint (ipc:// or tcp://).
-    #[arg(long, default_value = "ipc://datadir/nngpub.pipe")]
     pub nng_pub_url: String,
-
-    /// Initial worker share difficulty.
-    #[arg(long, default_value_t = 1.0)]
     pub initial_difficulty: f64,
-
-    /// Vardiff target share interval seconds.
-    #[arg(long, default_value_t = 15.0)]
     pub vardiff_target_secs: f64,
-
-    /// Vardiff retarget interval seconds.
-    #[arg(long, default_value_t = 90.0)]
     pub vardiff_retarget_secs: f64,
-
-    /// Minimum allowed vardiff.
-    #[arg(long, default_value_t = 0.0000001)]
     pub min_difficulty: f64,
-
-    /// Maximum allowed vardiff.
-    #[arg(long, default_value_t = 1e12)]
     pub max_difficulty: f64,
-
-    /// Max bytes accepted for one Stratum JSON line.
-    #[arg(long, default_value_t = 8 * 1024)]
     pub max_request_line_bytes: usize,
-
-    /// Per-connection request cap per second.
-    #[arg(long, default_value_t = 128)]
     pub per_conn_req_per_sec: u32,
-
-    /// Max idle seconds without inbound traffic before disconnect.
-    #[arg(long, default_value_t = 180)]
     pub conn_idle_timeout_secs: u64,
-
-    /// Maximum retained jobs in memory for stale checks.
-    #[arg(long, default_value_t = 512)]
     pub max_jobs_cache: usize,
-
-    /// Seconds between forced clean job rotations.
-    #[arg(long, default_value_t = 15)]
     pub job_refresh_secs: u64,
+    pub pool: PoolConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PoolConfig {
+    pub mining_identity: MiningIdentityConfig,
+    pub fee: FeeConfig,
+    pub pplns: PplnsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MiningIdentityConfig {
+    pub payout_script_hex: Option<String>,
+    pub payout_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeeConfig {
+    pub enabled: bool,
+    pub fee_bps: u32,
+    pub fee_address: Option<String>,
+    pub fee_script_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PplnsConfig {
+    pub n_multiplier: f64,
+    pub min_payout_sat: i64,
+    pub payout_interval_secs: u64,
+    pub min_confirmations: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPoolScripts {
+    pub payout_script: Vec<u8>,
+    pub payout_fingerprint: String,
+    pub fee_script: Option<Vec<u8>>,
+}
+
+impl Config {
+    pub fn load(cli: &CliArgs) -> Result<Self> {
+        let raw = std::fs::read_to_string(&cli.config)?;
+        let mut cfg: Config = toml::from_str(&raw)?;
+        if cli.debug {
+            cfg.debug = true;
+        }
+        if let Ok(token) = std::env::var("STRATUM_API_TOKEN") {
+            cfg.api_token = token;
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.api_token.is_empty() {
+            anyhow::bail!("api_token required")
+        }
+        let _ = self.resolve_pool_scripts()?;
+        Ok(())
+    }
+
+    pub fn resolve_pool_scripts(&self) -> Result<ResolvedPoolScripts> {
+        let payout_script = resolve_script(
+            self.pool.mining_identity.payout_script_hex.as_deref(),
+            self.pool.mining_identity.payout_address.as_deref(),
+        )?;
+        reject_nulldata_script(&payout_script, "pool payout")?;
+
+        let fee_script = if self.pool.fee.enabled {
+            let s = resolve_script(
+                self.pool.fee.fee_script_hex.as_deref(),
+                self.pool.fee.fee_address.as_deref(),
+            )?;
+            reject_nulldata_script(&s, "pool fee")?;
+            Some(s)
+        } else {
+            None
+        };
+
+        if self.pool.fee.enabled && self.pool.fee.fee_bps > 10_000 {
+            anyhow::bail!("fee_bps must be <= 10000")
+        }
+
+        Ok(ResolvedPoolScripts {
+            payout_fingerprint: script_fingerprint(&payout_script),
+            payout_script,
+            fee_script,
+        })
+    }
+}
+
+fn resolve_script(script_hex: Option<&str>, address: Option<&str>) -> Result<Vec<u8>> {
+    if let Some(h) = script_hex {
+        let bytes = hex::decode(h).map_err(|e| anyhow!("invalid script hex: {e}"))?;
+        if bytes.is_empty() {
+            anyhow::bail!("script hex cannot be empty")
+        }
+        return Ok(bytes);
+    }
+    if let Some(addr) = address {
+        let cash: CashAddress<'static> = addr.parse().map_err(|e| anyhow!("invalid payout address: {e}"))?;
+        return Ok(cash.to_script().bytecode().to_vec());
+    }
+    anyhow::bail!("must configure either script hex or address")
+}
+
+fn reject_nulldata_script(script: &[u8], label: &str) -> Result<()> {
+    if script.first() == Some(&0x6a) {
+        anyhow::bail!("{label} script cannot be OP_RETURN/nulldata")
+    }
+    Ok(())
+}
+
+fn script_fingerprint(script: &[u8]) -> String {
+    let digest = Sha256::digest(script);
+    hex::encode(&digest[..6])
 }
