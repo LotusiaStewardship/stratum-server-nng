@@ -53,13 +53,16 @@ async fn main() -> Result<()> {
     let reconcile_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if let Ok(missing_rows) = reconcile_db.reconcile_missing_found_blocks_detail() {
+            if let Ok(missing_rows) = reconcile_db.list_repairable_missing_found_blocks() {
                 let missing = missing_rows.len() as u64;
                 reconcile_stats
                     .found_block_observed_not_persisted_total
                     .store(missing, std::sync::atomic::Ordering::Relaxed);
-                if let Some(first) = missing_rows.first() {
-                    tracing::error!(missing, block_hash = %first.block_hash, "accepted submit events missing found_block persistence");
+                if missing > 0 {
+                    let repaired = reconcile_db
+                        .repair_missing_found_blocks_from_submit_events()
+                        .unwrap_or(0);
+                    tracing::error!(missing, repaired, "accepted submit events missing found_block persistence");
                 }
             }
         }

@@ -141,6 +141,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             plan.fee_sat,
             plan.net_reward_sat,
             &plan.outputs,
+            &plan.dust,
             &window_shares,
         )?;
 
@@ -153,13 +154,8 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
         ) {
             Ok(tx) => tx,
             Err(err) => {
-                db.update_payout_batch_state(
-                    batch_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err.to_string()),
-                )?;
+                let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                db.schedule_batch_retry(batch_id, &err.to_string(), &retry_at)?;
                 error!(error = %err, batch_id, found_block_id, block_hash, "failed signing payout tx");
                 continue;
             }
@@ -184,13 +180,8 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 .ok_or_else(|| anyhow!("sendrawtransaction returned non-string txid"))?
                 .to_string(),
             Err(err) => {
-                db.update_payout_batch_state(
-                    batch_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err.to_string()),
-                )?;
+                let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                db.schedule_batch_retry(batch_id, &err.to_string(), &retry_at)?;
                 error!(error = %err, batch_id, found_block_id, block_hash, "failed submitting payout tx via JSON-RPC");
                 continue;
             }
@@ -207,6 +198,28 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             txid = %submitted_txid,
             "payout batch signed and submitted"
         );
+
+        if let Ok(submitted) = db.list_submitted_batches_pending_confirmation(100) {
+            for (submitted_batch_id, submitted_found_block_id, txid) in submitted {
+                let confirmed = bitcoind
+                    .cmd_json("getrawtransaction", &[txid.clone().into(), true.into()])
+                    .await
+                    .ok()
+                    .and_then(|v| v["confirmations"].as_i64())
+                    .unwrap_or(0)
+                    > 0;
+                if confirmed {
+                    db.update_payout_batch_state(
+                        submitted_batch_id,
+                        "confirmed",
+                        None,
+                        Some(&txid),
+                        None,
+                    )?;
+                    db.mark_found_block_paid(submitted_found_block_id)?;
+                }
+            }
+        }
     }
 }
 

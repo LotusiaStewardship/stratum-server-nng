@@ -1,4 +1,4 @@
-use crate::accounting::AccountingDb;
+use crate::accounting::{AccountingDb, ShareOutcomeInsert};
 use crate::config::{Config, ResolvedPoolScripts};
 use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent, NodeMiningAdapter};
 use crate::stratum::engine::{apply_notify, handle_request, SessionState};
@@ -197,6 +197,20 @@ pub async fn run_stratum_server(
                 if matches!(event, NodeEvent::BlockDisconnected) {
                     match db_events.mark_pending_blocks_orphaned() {
                         Ok(orphaned) if orphaned > 0 => {
+                            let _ = db_events.record_accounting_event(
+                                "block_orphaned",
+                                Some("orphaned"),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some("{\"reason\":\"blkdisconctd\"}"),
+                            );
                             warn!(
                                 orphaned,
                                 "marked pending found blocks orphaned due to blkdisconctd"
@@ -644,6 +658,35 @@ async fn handle_conn(
         let params = req.params.clone();
         if let Some(resp) = handle_request(&mut session, req) {
             debug!(session_id = %session_id, method = ?method, req_id = %req_id, response_error = %resp.error, response_result = %resp.result, "sending stratum response");
+            if matches!(method, Method::Authorize) {
+                let worker_name = params
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                match crate::stratum::worker::parse_worker_name(worker_name) {
+                    Ok(parsed) => {
+                        let _ = db.record_authorization_event(
+                            &session_id,
+                            worker_name,
+                            Some(&parsed.payout_address),
+                            parsed.worker_suffix.as_deref(),
+                            resp.error.is_null(),
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        let _ = db.record_authorization_event(
+                            &session_id,
+                            worker_name,
+                            None,
+                            None,
+                            false,
+                            Some(&err.to_string()),
+                        );
+                    }
+                }
+            }
             if matches!(method, Method::Submit) && resp.error.is_null() {
                 let worker = params
                     .as_array()
@@ -692,8 +735,27 @@ async fn handle_conn(
                 let job = runtime
                     .find_job(job_id)
                     .ok_or_else(|| anyhow!("missing job for submit"))?;
+                let round_id = db.resolve_round_for_template(job.template_id)?;
                 let Some(assigned) = assigned_jobs.get(job_id).cloned() else {
                     share_stats.rejected += 1;
+                    let _ = db.record_share_outcome(ShareOutcomeInsert {
+                        session_id: &session_id,
+                        worker_id: worker_row.id,
+                        worker_name: &submit.worker_name,
+                        payout_address: &worker_row.payout_address,
+                        template_id: job.template_id,
+                        template_epoch: job.template_epoch,
+                        job_id: &job.job_id,
+                        round_id,
+                        dedupe_key: &format!("{}:{}:{}:{}:{}:{}", worker_row.id, job.template_id, job.template_epoch, extranonce2, ntime, nonce),
+                        status: "stale",
+                        reject_reason: Some("stale-job"),
+                        node_result: None,
+                        low_diff_ok: None,
+                        network_target_ok: None,
+                        block_hash: None,
+                        share_id: None,
+                    });
                     warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: stale-job (no assigned context)");
                     let err = StratumResponse::err(req_id.clone(), 21, "stale-job");
                     send_json_line(&mut write_half, &err).await?;
@@ -742,7 +804,7 @@ async fn handle_conn(
                         ntime,
                         nonce
                     );
-                    let _ = db.insert_share_idempotent(
+                    let inserted = db.insert_share_idempotent(
                         worker_row.id,
                         job.template_id,
                         share_difficulty,
@@ -750,6 +812,29 @@ async fn handle_conn(
                         false,
                         &dedupe_key,
                     )?;
+                    let share_id = if inserted {
+                        db.list_recent_shares(1)?.first().map(|s| s.id)
+                    } else {
+                        None
+                    };
+                    let _ = db.record_share_outcome(ShareOutcomeInsert {
+                        session_id: &session_id,
+                        worker_id: worker_row.id,
+                        worker_name: &submit.worker_name,
+                        payout_address: &worker_row.payout_address,
+                        template_id: job.template_id,
+                        template_epoch: job.template_epoch,
+                        job_id: &job.job_id,
+                        round_id,
+                        dedupe_key: &dedupe_key,
+                        status: "accepted",
+                        reject_reason: None,
+                        node_result: Some("pool-only"),
+                        low_diff_ok: Some(true),
+                        network_target_ok: Some(false),
+                        block_hash: None,
+                        share_id,
+                    });
 
                     share_stats.accepted += 1;
                     info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (meets pool difficulty; not submitted to lotusd)");
@@ -838,7 +923,7 @@ async fn handle_conn(
                     "{}:{}:{}:{}:{}:{}",
                     worker_row.id, job.template_id, job.template_epoch, extranonce2, ntime, nonce
                 );
-                let _ = db.insert_share_idempotent(
+                let inserted = db.insert_share_idempotent(
                     worker_row.id,
                     job.template_id,
                     share_difficulty,
@@ -846,6 +931,34 @@ async fn handle_conn(
                     false,
                     &dedupe_key,
                 )?;
+                let share_id = if inserted {
+                    db.list_recent_shares(1)?.first().map(|s| s.id)
+                } else {
+                    None
+                };
+                let submit_block_hash = submit_result.block_hash.to_hex_be();
+                let _ = db.record_share_outcome(ShareOutcomeInsert {
+                    session_id: &session_id,
+                    worker_id: worker_row.id,
+                    worker_name: &submit.worker_name,
+                    payout_address: &worker_row.payout_address,
+                    template_id: job.template_id,
+                    template_epoch: job.template_epoch,
+                    job_id: &job.job_id,
+                    round_id,
+                    dedupe_key: &dedupe_key,
+                    status: if share_accepted { "accepted" } else { "rejected" },
+                    reject_reason: if share_accepted {
+                        None
+                    } else {
+                        Some(submit_result.reject_reason.as_str())
+                    },
+                    node_result: Some(&format!("{:?}", submit_result.result)),
+                    low_diff_ok: Some(true),
+                    network_target_ok: Some(true),
+                    block_hash: Some(&submit_block_hash),
+                    share_id,
+                });
 
                 if !share_accepted {
                     share_stats.rejected += 1;
@@ -856,12 +969,26 @@ async fn handle_conn(
                 }
 
                 share_stats.accepted += 1;
+                let _ = db.record_accounting_event(
+                    "submit_result",
+                    Some(if share_accepted { "accepted" } else { "rejected" }),
+                    Some(&session_id),
+                    Some(worker_row.id),
+                    Some(&submit.worker_name),
+                    Some(&worker_row.payout_address),
+                    Some(round_id),
+                    Some(job.template_id),
+                    Some(job.template_epoch),
+                    Some(&job.job_id),
+                    Some(&submit_block_hash),
+                    Some(&format!("{{\"reject_reason\":\"{}\",\"result\":\"{:?}\"}}", submit_result.reject_reason, submit_result.result)),
+                );
                 if matches!(
                     submit_result.result,
                     MiningSubmitResult::Accepted | MiningSubmitResult::Duplicate
                 ) {
                     let persist = db.record_found_block(
-                        &submit_result.block_hash.to_hex_be(),
+                        &submit_block_hash,
                         job.template_id,
                         job.block_height,
                         worker_row.id,

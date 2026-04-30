@@ -1,6 +1,6 @@
 use crate::accounting::{
     AccountingDb, FoundBlockStateSummary, MissingFoundBlock, PayoutBatchStateSummary,
-    SchedulerHealthSummary,
+    RejectedReasonSummary, SchedulerHealthSummary, WorkerAccountingSummary,
 };
 use crate::stratum::server::RuntimeStats;
 use anyhow::Result;
@@ -42,6 +42,16 @@ struct StatusResp<'a> {
 #[derive(Serialize)]
 struct ReconciliationResp {
     missing_found_blocks: Vec<MissingFoundBlock>,
+}
+
+#[derive(Serialize)]
+struct WorkerSummaryResp {
+    workers: Vec<WorkerAccountingSummary>,
+}
+
+#[derive(Serialize)]
+struct RejectedReasonResp {
+    reasons: Vec<RejectedReasonSummary>,
 }
 
 fn check_auth(headers: &HeaderMap, token: &str) -> bool {
@@ -172,6 +182,26 @@ async fn payouts(State(state): State<ApiState>, headers: HeaderMap) -> impl Into
     }
 }
 
+async fn worker_summary(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    match state.db.worker_accounting_summary(200) {
+        Ok(v) => Json(WorkerSummaryResp { workers: v }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn rejected_reasons(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    match state.db.rejected_share_reasons(200) {
+        Ok(v) => Json(RejectedReasonResp { reasons: v }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn reconciliation_missing_found_blocks(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -203,6 +233,8 @@ pub async fn start_operator_api(
         .route("/rounds", get(rounds))
         .route("/shares", get(recent_shares))
         .route("/payouts", get(payouts))
+        .route("/workers/summary", get(worker_summary))
+        .route("/shares/rejected-reasons", get(rejected_reasons))
         .route(
             "/reconciliation/missing-found-blocks",
             get(reconciliation_missing_found_blocks),

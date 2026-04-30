@@ -7,6 +7,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct PayoutPlan {
     pub outputs: Vec<(String, i64)>,
+    pub dust: Vec<(String, i64)>,
     pub gross_reward_sat: i64,
     pub fee_sat: i64,
     pub net_reward_sat: i64,
@@ -50,6 +51,7 @@ pub fn build_pplns_payout_plan(
                 .filter(|_| fee_sat > 0)
                 .map(|addr| vec![(addr.to_string(), fee_sat)])
                 .unwrap_or_default(),
+            dust: Vec::new(),
             gross_reward_sat,
             fee_sat,
             net_reward_sat,
@@ -79,10 +81,15 @@ pub fn build_pplns_payout_plan(
         remainder -= 1;
     }
 
-    let mut outputs: Vec<(String, i64)> = staged
-        .into_iter()
-        .filter_map(|(addr, sat, _)| (sat >= min_payout_sat).then_some((addr, sat)))
-        .collect();
+    let mut outputs: Vec<(String, i64)> = Vec::new();
+    let mut dust: Vec<(String, i64)> = Vec::new();
+    for (addr, sat, _) in staged {
+        if sat >= min_payout_sat {
+            outputs.push((addr, sat));
+        } else if sat > 0 {
+            dust.push((addr, sat));
+        }
+    }
 
     if fee_sat > 0 {
         if let Some(addr) = fee_address {
@@ -92,6 +99,7 @@ pub fn build_pplns_payout_plan(
 
     PayoutPlan {
         outputs,
+        dust,
         gross_reward_sat,
         fee_sat,
         net_reward_sat,

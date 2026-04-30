@@ -47,6 +47,22 @@ pub struct PplnsWindowShare {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkerAccountingSummary {
+    pub worker_id: i64,
+    pub payout_address: String,
+    pub worker_suffix: Option<String>,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub stale: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RejectedReasonSummary {
+    pub reason: String,
+    pub count: u64,
+}
+
 #[derive(Clone)]
 pub struct AccountingDb {
     conn: Arc<Mutex<Connection>>,
@@ -203,6 +219,83 @@ impl AccountingDb {
         )?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS payout_scheduler_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS accounting_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                status TEXT,
+                session_id TEXT,
+                worker_id INTEGER,
+                worker_name TEXT,
+                payout_address TEXT,
+                share_id INTEGER,
+                round_id INTEGER,
+                template_id INTEGER,
+                template_epoch INTEGER,
+                job_id TEXT,
+                block_hash TEXT,
+                height INTEGER,
+                payload_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_accounting_events_type_created ON accounting_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_accounting_events_worker_created ON accounting_events(worker_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_accounting_events_round_created ON accounting_events(round_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_accounting_events_blockhash ON accounting_events(block_hash);
+
+            CREATE TABLE IF NOT EXISTS authorization_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                worker_name TEXT NOT NULL,
+                payout_address TEXT,
+                worker_suffix TEXT,
+                authorized INTEGER NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS share_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                worker_id INTEGER,
+                worker_name TEXT,
+                payout_address TEXT,
+                template_id INTEGER,
+                template_epoch INTEGER,
+                job_id TEXT,
+                round_id INTEGER,
+                dedupe_key TEXT,
+                status TEXT NOT NULL,
+                reject_reason TEXT,
+                node_result TEXT,
+                low_diff_ok INTEGER,
+                network_target_ok INTEGER,
+                block_hash TEXT,
+                share_id INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(dedupe_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS payout_dust_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payout_batch_id INTEGER,
+                found_block_id INTEGER,
+                address TEXT NOT NULL,
+                amount_sat INTEGER NOT NULL,
+                policy TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS round_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                reason TEXT,
+                block_hash TEXT,
+                template_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+            ")?;
 
         Self::ensure_column(&tx, "payout_batches", "retry_key", "TEXT")?;
         Self::ensure_column(&tx, "payout_batches", "signed_payload_ref", "TEXT")?;
@@ -230,10 +323,21 @@ impl AccountingDb {
                 payout_address TEXT NOT NULL,
                 work_units REAL NOT NULL,
                 share_created_at TEXT NOT NULL,
+                ordering_criterion TEXT,
+                truncation_reason TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(payout_batch_id) REFERENCES payout_batches(id)
             );",
         )?;
+        Self::ensure_column(&tx, "payout_share_snapshots", "ordering_criterion", "TEXT")?;
+        Self::ensure_column(&tx, "payout_share_snapshots", "truncation_reason", "TEXT")?;
+        Self::ensure_column(&tx, "submit_events", "session_id", "TEXT")?;
+        Self::ensure_column(&tx, "submit_events", "job_id", "TEXT")?;
+        Self::ensure_column(&tx, "submit_events", "round_id", "INTEGER")?;
+        Self::ensure_column(&tx, "submit_events", "template_epoch", "INTEGER")?;
+        Self::ensure_column(&tx, "rounds", "status", "TEXT NOT NULL DEFAULT 'open'")?;
+        Self::ensure_column(&tx, "rounds", "close_reason", "TEXT")?;
+        Self::ensure_column(&tx, "rounds", "closed_at", "TEXT")?;
 
         tx.commit()?;
         Ok(())
@@ -453,16 +557,8 @@ impl AccountingDb {
         persist_source: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let round_id = self.resolve_round_for_template(template_id)?;
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO rounds(start_template_id, created_at) VALUES(?1, ?2)",
-            params![template_id as i64, now],
-        )?;
-        let round_id: i64 = conn.query_row(
-            "SELECT id FROM rounds WHERE start_template_id=?1 ORDER BY id DESC LIMIT 1",
-            params![template_id as i64],
-            |r| r.get(0),
-        )?;
 
         conn.execute(
             "INSERT INTO found_blocks(round_id, block_hash, height, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
@@ -478,9 +574,25 @@ impl AccountingDb {
             params![round_id, block_hash, block_height, template_id as i64, worker_id, worker_name, payout_address, persist_source, now],
         )?;
         conn.execute(
-            "INSERT OR IGNORE INTO submit_events(block_hash, template_id, worker_id, worker_name, payout_address, node_result, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, 'accepted', ?6)",
-            params![block_hash, template_id as i64, worker_id, worker_name, payout_address, now],
+            "INSERT OR IGNORE INTO submit_events(block_hash, template_id, worker_id, worker_name, payout_address, node_result, round_id, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'accepted', ?6, ?7)",
+            params![block_hash, template_id as i64, worker_id, worker_name, payout_address, round_id, now],
+        )?;
+        drop(conn);
+        self.close_round(round_id, Some(template_id), "round_closed_found_block", Some(block_hash))?;
+        self.record_accounting_event(
+            "found_block_observed",
+            Some("accepted"),
+            None,
+            Some(worker_id),
+            Some(worker_name),
+            Some(payout_address),
+            Some(round_id),
+            Some(template_id),
+            None,
+            None,
+            Some(block_hash),
+            None,
         )?;
         Ok(())
     }
@@ -522,21 +634,22 @@ impl AccountingDb {
         hard_limit: u32,
     ) -> Result<Vec<PplnsWindowShare>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let cutoff: String = conn.query_row(
-            "SELECT created_at FROM found_blocks WHERE id=?1",
+        let (round_id, cutoff): (i64, String) = conn.query_row(
+            "SELECT round_id, created_at FROM found_blocks WHERE id=?1",
             params![found_block_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
 
         let mut stmt = conn.prepare(
             "SELECT s.id, w.payout_address, s.difficulty, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
-             WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
-             ORDER BY s.id DESC
-             LIMIT ?2",
+             JOIN share_outcomes so ON so.share_id = s.id
+             WHERE s.accepted=1 AND s.stale=0 AND so.round_id = ?1 AND s.created_at <= ?2
+             ORDER BY so.id DESC
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![cutoff, hard_limit as i64], |r| {
+        let rows = stmt.query_map(params![round_id, cutoff, hard_limit as i64], |r| {
             Ok(PplnsWindowShare {
                 share_id: r.get::<_, i64>(0)?,
                 payout_address: r.get::<_, String>(1)?,
@@ -595,6 +708,7 @@ impl AccountingDb {
         fee_sat: i64,
         net_reward_sat: i64,
         outputs: &[(String, i64)],
+        dust: &[(String, i64)],
         snapshot_shares: &[PplnsWindowShare],
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
@@ -624,9 +738,16 @@ impl AccountingDb {
         }
         for share in snapshot_shares {
             tx.execute(
-                "INSERT INTO payout_share_snapshots(payout_batch_id, share_id, payout_address, work_units, share_created_at, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO payout_share_snapshots(payout_batch_id, share_id, payout_address, work_units, share_created_at, ordering_criterion, truncation_reason, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, 'round_id+share_outcome_id_desc', NULL, ?6)",
                 params![batch_id, share.share_id, share.payout_address, share.work_units, share.created_at, now],
+            )?;
+        }
+        for (addr, sat) in dust {
+            tx.execute(
+                "INSERT INTO payout_dust_ledger(payout_batch_id, found_block_id, address, amount_sat, policy, created_at)
+                 VALUES(?1, ?2, ?3, ?4, 'carry_forward', ?5)",
+                params![batch_id, found_block_id, addr, sat, now],
             )?;
         }
         tx.commit()?;
@@ -694,6 +815,14 @@ impl AccountingDb {
     pub fn mark_pending_blocks_orphaned(&self) -> Result<u64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut rounds = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT DISTINCT round_id, block_hash, template_id FROM found_blocks WHERE chain_state='pending'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)))?;
+            for row in rows {
+                rounds.push(row?);
+            }
+        }
         let changed = conn.execute(
             "UPDATE found_blocks
              SET chain_state='orphaned', status='orphaned', disconnected_at=?1
@@ -707,6 +836,15 @@ impl AccountingDb {
                AND found_block_id IN (SELECT id FROM found_blocks WHERE chain_state='orphaned')",
             [],
         )?;
+        drop(conn);
+        for (round_id, block_hash, template_id) in rounds {
+            let _ = self.close_round(
+                round_id,
+                template_id.map(|v| v as u64),
+                "round_closed_orphaned",
+                Some(&block_hash),
+            );
+        }
         Ok(changed as u64)
     }
 
@@ -783,6 +921,58 @@ impl AccountingDb {
         })
     }
 
+    pub fn worker_accounting_summary(&self, limit: u32) -> Result<Vec<WorkerAccountingSummary>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT w.id, w.payout_address, w.worker_suffix,
+                    SUM(CASE WHEN so.status='accepted' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN so.status='rejected' THEN 1 ELSE 0 END) AS rejected,
+                    SUM(CASE WHEN so.status='stale' THEN 1 ELSE 0 END) AS stale
+             FROM workers w
+             LEFT JOIN share_outcomes so ON so.worker_id=w.id
+             GROUP BY w.id, w.payout_address, w.worker_suffix
+             ORDER BY w.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(WorkerAccountingSummary {
+                worker_id: r.get(0)?,
+                payout_address: r.get(1)?,
+                worker_suffix: r.get(2)?,
+                accepted: r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                rejected: r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                stale: r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn rejected_share_reasons(&self, limit: u32) -> Result<Vec<RejectedReasonSummary>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(reject_reason, 'unknown') AS reason, COUNT(*)
+             FROM share_outcomes
+             WHERE status='rejected'
+             GROUP BY reason
+             ORDER BY COUNT(*) DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(RejectedReasonSummary {
+                reason: r.get(0)?,
+                count: r.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn scheduler_health_summary(&self) -> Result<SchedulerHealthSummary> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let matured_found_blocks_ready: i64 = conn.query_row(
@@ -822,6 +1012,222 @@ impl AccountingDb {
             .optional()?;
         Ok(v)
     }
+
+    pub fn record_authorization_event(
+        &self,
+        session_id: &str,
+        worker_name: &str,
+        payout_address: Option<&str>,
+        worker_suffix: Option<&str>,
+        authorized: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "INSERT INTO authorization_events(session_id, worker_name, payout_address, worker_suffix, authorized, reason, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id,
+                worker_name,
+                payout_address,
+                worker_suffix,
+                if authorized { 1 } else { 0 },
+                reason,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_accounting_event(
+        &self,
+        event_type: &str,
+        status: Option<&str>,
+        session_id: Option<&str>,
+        worker_id: Option<i64>,
+        worker_name: Option<&str>,
+        payout_address: Option<&str>,
+        round_id: Option<i64>,
+        template_id: Option<u64>,
+        template_epoch: Option<u64>,
+        job_id: Option<&str>,
+        block_hash: Option<&str>,
+        payload_json: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "INSERT INTO accounting_events(event_type, status, session_id, worker_id, worker_name, payout_address, round_id, template_id, template_epoch, job_id, block_hash, payload_json, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                event_type,
+                status,
+                session_id,
+                worker_id,
+                worker_name,
+                payout_address,
+                round_id,
+                template_id.map(|v| v as i64),
+                template_epoch.map(|v| v as i64),
+                job_id,
+                block_hash,
+                payload_json,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn resolve_round_for_template(&self, template_id: u64) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let open_round: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM rounds WHERE status='open' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = open_round {
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO rounds(start_template_id, status, created_at) VALUES(?1, 'open', ?2)",
+            params![template_id as i64, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO round_events(round_id, event_type, template_id, created_at) VALUES(?1, 'round_opened', ?2, ?3)",
+            params![id, template_id as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn close_round(
+        &self,
+        round_id: i64,
+        end_template_id: Option<u64>,
+        reason: &str,
+        block_hash: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE rounds
+             SET status='closed', close_reason=?2, closed_at=?3, end_template_id=COALESCE(?4, end_template_id), found_block_hash=COALESCE(?5, found_block_hash)
+             WHERE id=?1 AND status='open'",
+            params![round_id, reason, now, end_template_id.map(|v| v as i64), block_hash],
+        )?;
+        conn.execute(
+            "INSERT INTO round_events(round_id, event_type, reason, block_hash, template_id, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![round_id, reason, reason, block_hash, end_template_id.map(|v| v as i64), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_share_outcome(&self, outcome: ShareOutcomeInsert<'_>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO share_outcomes(session_id, worker_id, worker_name, payout_address, template_id, template_epoch, job_id, round_id, dedupe_key, status, reject_reason, node_result, low_diff_ok, network_target_ok, block_hash, share_id, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                outcome.session_id,
+                outcome.worker_id,
+                outcome.worker_name,
+                outcome.payout_address,
+                outcome.template_id as i64,
+                outcome.template_epoch as i64,
+                outcome.job_id,
+                outcome.round_id,
+                outcome.dedupe_key,
+                outcome.status,
+                outcome.reject_reason,
+                outcome.node_result,
+                outcome.low_diff_ok.map(|v| if v { 1 } else { 0 }),
+                outcome.network_target_ok.map(|v| if v { 1 } else { 0 }),
+                outcome.block_hash,
+                outcome.share_id,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_submitted_batches_pending_confirmation(&self, limit: u32) -> Result<Vec<(i64, i64, String)>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, found_block_id, submitted_txid
+             FROM payout_batches
+             WHERE status='submitted' AND submitted_txid IS NOT NULL
+             ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn schedule_batch_retry(&self, batch_id: i64, err: &str, retry_at: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE payout_batches SET status='failed', last_error=?2, next_retry_at=?3, attempt_count=attempt_count+1 WHERE id=?1",
+            params![batch_id, err, retry_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_repairable_missing_found_blocks(&self) -> Result<Vec<MissingFoundBlock>> {
+        self.reconcile_missing_found_blocks_detail()
+    }
+
+    pub fn repair_missing_found_blocks_from_submit_events(&self) -> Result<u64> {
+        let missing = self.reconcile_missing_found_blocks_detail()?;
+        let mut repaired = 0u64;
+        for row in missing {
+            if let (Some(template_id), Some(worker_id), Some(worker_name), Some(payout_address)) = (
+                row.template_id,
+                row.worker_id,
+                row.worker_name.as_deref().map(|s| s.to_string()),
+                row.payout_address.as_deref().map(|s| s.to_string()),
+            ) {
+                let _ = self.record_found_block(
+                    &row.block_hash,
+                    template_id as u64,
+                    0,
+                    worker_id,
+                    &worker_name,
+                    &payout_address,
+                    "reconcile_repair",
+                );
+                repaired += 1;
+            }
+        }
+        Ok(repaired)
+    }
+}
+
+pub struct ShareOutcomeInsert<'a> {
+    pub session_id: &'a str,
+    pub worker_id: i64,
+    pub worker_name: &'a str,
+    pub payout_address: &'a str,
+    pub template_id: u64,
+    pub template_epoch: u64,
+    pub job_id: &'a str,
+    pub round_id: i64,
+    pub dedupe_key: &'a str,
+    pub status: &'a str,
+    pub reject_reason: Option<&'a str>,
+    pub node_result: Option<&'a str>,
+    pub low_diff_ok: Option<bool>,
+    pub network_target_ok: Option<bool>,
+    pub block_hash: Option<&'a str>,
+    pub share_id: Option<i64>,
 }
 
 #[cfg(test)]
