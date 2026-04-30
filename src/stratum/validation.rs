@@ -1,5 +1,5 @@
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader, Sha256d, Tx};
 use primitive_types::U256;
-use sha2::{Digest, Sha256};
 
 /// Native submit shape used by share pre-validator.
 #[derive(Debug, Clone)]
@@ -61,9 +61,10 @@ fn is_hex(s: &str) -> bool {
 
 /// Compute SHA256d quickly for helper checks / diagnostics.
 pub fn sha256d(bytes: &[u8]) -> [u8; 32] {
-    let h1 = Sha256::digest(bytes);
-    let h2 = Sha256::digest(h1);
-    h2.into()
+    let hash = Sha256d::digest(bytes.into());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_ref());
+    out
 }
 
 /// Convert difficulty to target ratio against DIFF1.
@@ -107,27 +108,20 @@ pub fn build_candidate_block(
     ))?;
     let header = build_header_bytes(job, extranonce1, sub)?;
 
-    let mut offset = job.template_header.len();
-    if job.template_block.len() <= offset {
-        anyhow::bail!("template block too small")
-    }
+    let mut block_bytes = Bytes::from_slice(&job.template_block);
+    let mut block = LotusBlock::deser(&mut block_bytes)?;
 
-    let (tx_count_len, _) = read_varint(&job.template_block[offset..])?;
-    offset += tx_count_len;
-    let (cb_len_len, cb_len) = read_varint(&job.template_block[offset..])?;
-    let cb_start = offset + cb_len_len;
-    let cb_end = cb_start + cb_len as usize;
-    if cb_end > job.template_block.len() {
-        anyhow::bail!("template coinbase out of range")
-    }
+    let mut header_bytes = Bytes::from_slice(&header);
+    block.header = LotusHeader::deser(&mut header_bytes)?;
 
-    let mut out = Vec::with_capacity(job.template_block.len() + coinbase.len());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&job.template_block[job.template_header.len()..offset]);
-    write_varint(&mut out, coinbase.len() as u64);
-    out.extend_from_slice(&coinbase);
-    out.extend_from_slice(&job.template_block[cb_end..]);
-    Ok(out)
+    let mut coinbase_bytes = Bytes::from_slice(&coinbase);
+    let coinbase_tx = Tx::deser(&mut coinbase_bytes)?;
+    if block.txs.is_empty() {
+        anyhow::bail!("template block has no txs")
+    }
+    block.txs[0] = coinbase_tx;
+
+    Ok(block.ser().as_ref().to_vec())
 }
 
 pub fn build_precomputed_header(
@@ -154,26 +148,15 @@ pub fn share_target_hex_for_difficulty(difficulty: f64) -> anyhow::Result<String
     Ok(hex::encode(out))
 }
 
-fn lotus_hash_160(header: &[u8; 160]) -> [u8; 32] {
-    let tx_layer_hash = Sha256::digest(&header[52..]);
-    let mut pow_layer = [0u8; 52];
-    pow_layer[..20].copy_from_slice(&header[32..52]);
-    pow_layer[20..].copy_from_slice(&tx_layer_hash[..]);
-    let pow_layer_hash = Sha256::digest(pow_layer);
-    let mut chain_layer = [0u8; 64];
-    chain_layer[..32].copy_from_slice(&header[..32]);
-    chain_layer[32..].copy_from_slice(&pow_layer_hash);
-    Sha256::digest(chain_layer).into()
-}
-
 fn header_lotus_hash_u256_be(header: &[u8]) -> anyhow::Result<U256> {
     if header.len() != 160 {
         anyhow::bail!("invalid header length")
     }
-    let mut header_160 = [0u8; 160];
-    header_160.copy_from_slice(header);
-    let hash = lotus_hash_160(&header_160);
-    let mut hash_be = hash;
+    let mut header_bytes = Bytes::from_slice(header);
+    let lotus_header = LotusHeader::deser(&mut header_bytes)?;
+    let hash = lotus_header.calc_hash();
+    let mut hash_be = [0u8; 32];
+    hash_be.copy_from_slice(hash.as_ref());
     hash_be.reverse();
     Ok(U256::from_big_endian(&hash_be))
 }
@@ -224,56 +207,6 @@ fn build_header_bytes(
     Ok(header)
 }
 
-fn read_varint(bytes: &[u8]) -> anyhow::Result<(usize, u64)> {
-    if bytes.is_empty() {
-        anyhow::bail!("missing varint")
-    }
-    match bytes[0] {
-        n @ 0x00..=0xfc => Ok((1, n as u64)),
-        0xfd => {
-            if bytes.len() < 3 {
-                anyhow::bail!("short varint")
-            }
-            Ok((3, u16::from_le_bytes([bytes[1], bytes[2]]) as u64))
-        }
-        0xfe => {
-            if bytes.len() < 5 {
-                anyhow::bail!("short varint")
-            }
-            Ok((
-                5,
-                u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64,
-            ))
-        }
-        0xff => {
-            if bytes.len() < 9 {
-                anyhow::bail!("short varint")
-            }
-            Ok((
-                9,
-                u64::from_le_bytes([
-                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-                ]),
-            ))
-        }
-    }
-}
-
-fn write_varint(out: &mut Vec<u8>, n: u64) {
-    if n <= 0xfc {
-        out.push(n as u8);
-    } else if u16::try_from(n).is_ok() {
-        out.push(0xfd);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if u32::try_from(n).is_ok() {
-        out.push(0xfe);
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        out.push(0xff);
-        out.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
 fn target_for_share_difficulty(difficulty: f64) -> anyhow::Result<U256> {
     if difficulty <= 0.0 || !difficulty.is_finite() {
         anyhow::bail!("invalid difficulty")
@@ -319,9 +252,9 @@ mod tests {
     #[test]
     fn test_lotus_hash_160_vector() {
         let header = hex::decode("0000000000000000000000000000000000000000000000000000000000000000ffff001d00c273600000000041c6ddd303000000010e010000000000000000000000000000000000000000000000000000000000000000000000000000000000934755d60e905ec8778f554164bd9b7f21ab6c15cfed2956123a722a6f6fa62e1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a").unwrap();
-        let mut h160 = [0u8; 160];
-        h160.copy_from_slice(&header);
-        let mut hash = lotus_hash_160(&h160);
+        let mut header_bytes = Bytes::from_slice(&header);
+        let lotus_header = LotusHeader::deser(&mut header_bytes).unwrap();
+        let mut hash = lotus_header.calc_hash().as_ref().to_vec();
         hash.reverse();
         assert_eq!(
             hex::encode(hash),

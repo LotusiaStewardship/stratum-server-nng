@@ -113,7 +113,7 @@ mod tests {
 
         let auth = handle_line(
             &mut s,
-            r#"{"id":2,"method":"mining.authorize","params":["lotus_abc.rig","x"]}"#,
+            r#"{"id":2,"method":"mining.authorize","params":["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig","x"]}"#,
             8192,
         )
         .unwrap()

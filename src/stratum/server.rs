@@ -11,7 +11,7 @@ use crate::stratum::validation::{
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
 use bitcoinsuite_bitcoind_nng::{MiningSubmitResult, MiningTemplate};
-use bitcoinsuite_core::Hashed;
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock};
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -360,76 +360,21 @@ async fn send_set_difficulty(
 }
 
 fn ensure_block_coinbase_payout_script(block: &[u8], expected_script: &[u8]) -> Result<()> {
-    let script = extract_coinbase_vout_script(block, 1)?;
-    if script != expected_script {
+    let mut block_bytes = Bytes::from_slice(block);
+    let parsed_block = LotusBlock::deser(&mut block_bytes)?;
+    let coinbase = parsed_block
+        .txs
+        .first()
+        .ok_or_else(|| anyhow!("block has no txs"))?;
+    let payout = coinbase
+        .outputs()
+        .get(1)
+        .ok_or_else(|| anyhow!("coinbase missing vout[1]"))?;
+
+    if payout.script.bytecode().as_ref() != expected_script {
         anyhow::bail!("coinbase vout[1] script mismatch")
     }
     Ok(())
-}
-
-fn extract_coinbase_vout_script(block: &[u8], vout_index: usize) -> Result<Vec<u8>> {
-    if block.len() < 161 {
-        anyhow::bail!("block too short")
-    }
-    let mut i = 160;
-    let (tx_count_len, tx_count) = read_varint(&block[i..])?;
-    i += tx_count_len;
-    if tx_count == 0 {
-        anyhow::bail!("block has no txs")
-    }
-    let (_, script) = parse_tx_output_script(&block[i..], vout_index)?;
-    Ok(script)
-}
-
-fn parse_tx_output_script(tx: &[u8], vout_index: usize) -> Result<(usize, Vec<u8>)> {
-    let mut i = 0;
-    i += 4;
-    let (vin_len, vin_cnt) = read_varint(&tx[i..])?;
-    i += vin_len;
-    for _ in 0..vin_cnt {
-        i += 32 + 4;
-        let (sl, ssz) = read_varint(&tx[i..])?;
-        i += sl + ssz as usize;
-        i += 4;
-    }
-    let (vout_len, vout_cnt) = read_varint(&tx[i..])?;
-    i += vout_len;
-    for idx in 0..vout_cnt as usize {
-        i += 8;
-        let (sl, ssz) = read_varint(&tx[i..])?;
-        i += sl;
-        let end = i + ssz as usize;
-        if end > tx.len() {
-            anyhow::bail!("tx output out of bounds")
-        }
-        let script = tx[i..end].to_vec();
-        i = end;
-        if idx == vout_index {
-            return Ok((i, script));
-        }
-    }
-    anyhow::bail!("missing vout index")
-}
-
-fn read_varint(bytes: &[u8]) -> Result<(usize, u64)> {
-    if bytes.is_empty() {
-        anyhow::bail!("missing varint")
-    }
-    match bytes[0] {
-        n @ 0x00..=0xfc => Ok((1, n as u64)),
-        0xfd => {
-            if bytes.len() < 3 { anyhow::bail!("short varint") }
-            Ok((3, u16::from_le_bytes([bytes[1], bytes[2]]) as u64))
-        }
-        0xfe => {
-            if bytes.len() < 5 { anyhow::bail!("short varint") }
-            Ok((5, u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64))
-        }
-        0xff => {
-            if bytes.len() < 9 { anyhow::bail!("short varint") }
-            Ok((9, u64::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8]])))
-        }
-    }
 }
 
 #[cfg(test)]

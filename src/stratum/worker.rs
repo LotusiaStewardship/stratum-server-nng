@@ -1,4 +1,4 @@
-use regex::Regex;
+use bitcoinsuite_core::LotusAddress;
 
 /// Enforced worker authorization grammar:
 /// `<lotus_address>[.<worker>]`
@@ -15,10 +15,9 @@ pub fn parse_worker_name(input: &str) -> anyhow::Result<WorkerName> {
     let address = parts.next().unwrap_or_default();
     let suffix = parts.next();
 
-    let re = Regex::new(r"^lotus_[A-Za-z0-9]+$").unwrap();
-    if !re.is_match(address) {
-        anyhow::bail!("worker name must begin with a lotus_* payout identity")
-    }
+    let _: LotusAddress = address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid lotus address: {e}"))?;
     if suffix.is_some_and(|s| s.is_empty()) {
         anyhow::bail!("worker suffix must not be empty when '.' is present")
     }
@@ -35,12 +34,12 @@ mod tests {
 
     #[test]
     fn test_parse_worker() {
-        let w = parse_worker_name("lotus_abc.rig01").unwrap();
-        assert_eq!(w.payout_address, "lotus_abc");
+        let w = parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01").unwrap();
+        assert_eq!(w.payout_address, "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi");
         assert_eq!(w.worker_suffix.as_deref(), Some("rig01"));
         assert!(parse_worker_name("bad.worker").is_err());
         assert!(parse_worker_name("lotusabc.r1").is_err());
         assert!(parse_worker_name("lotus_.r1").is_err());
-        assert!(parse_worker_name("lotus_abc.").is_err());
+        assert!(parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.").is_err());
     }
 }

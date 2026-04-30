@@ -2150,7 +2150,6 @@ dependencies = [
  "hex",
  "primitive-types",
  "rand 0.8.6",
- "regex",
  "rusqlite",
  "serde",
  "serde_json",

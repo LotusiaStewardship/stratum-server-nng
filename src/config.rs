@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
-use bitcoinsuite_core::CashAddress;
+use bitcoinsuite_core::{Hashed, LotusAddress, Sha256, Script};
 use clap::Parser;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "stratum-server-nng")]
@@ -125,15 +124,15 @@ impl Config {
 
 fn resolve_script(script_hex: Option<&str>, address: Option<&str>) -> Result<Vec<u8>> {
     if let Some(h) = script_hex {
-        let bytes = hex::decode(h).map_err(|e| anyhow!("invalid script hex: {e}"))?;
-        if bytes.is_empty() {
+        let script = Script::from_hex(h).map_err(|e| anyhow!("invalid script hex: {e}"))?;
+        if script.bytecode().is_empty() {
             anyhow::bail!("script hex cannot be empty")
         }
-        return Ok(bytes);
+        return Ok(script.bytecode().as_ref().to_vec());
     }
     if let Some(addr) = address {
-        let cash: CashAddress<'static> = addr.parse().map_err(|e| anyhow!("invalid payout address: {e}"))?;
-        return Ok(cash.to_script().bytecode().to_vec());
+        let lotus: LotusAddress = addr.parse().map_err(|e| anyhow!("invalid payout address: {e}"))?;
+        return Ok(lotus.script().bytecode().to_vec());
     }
     anyhow::bail!("must configure either script hex or address")
 }
@@ -146,6 +145,6 @@ fn reject_nulldata_script(script: &[u8], label: &str) -> Result<()> {
 }
 
 fn script_fingerprint(script: &[u8]) -> String {
-    let digest = Sha256::digest(script);
-    hex::encode(&digest[..6])
+    let digest = Sha256::digest(script.to_vec().into());
+    hex::encode(&digest.as_ref()[..6])
 }
