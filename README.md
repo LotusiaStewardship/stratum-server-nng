@@ -20,10 +20,11 @@ At a high level, the process runs three concurrent loops:
    - token-auth protected (except `/healthz` and `/readyz`)
 
 3. **Job refresh loop**
-   - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`)
+   - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`, `blkdisconctd`)
    - fetches consensus-derived templates via `GetMiningTemplateRequest`
    - builds per-session **precomputed Lotus work objects** and fans them out to connected miners
    - also performs periodic template refresh ticks
+   - marks pending found blocks orphaned on `blkdisconctd`
 
 All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
 
@@ -78,6 +79,7 @@ payout_address = "lotus_..." # or payout_script_hex
 ```
 
 Startup now hard-fails if payout script is missing or resolves to `OP_RETURN`/nulldata.
+The runtime also requires a signing section for `pool.signing.mode = "internal"`.
 
 CLI flags now only control bootstrap:
 - `--config`
@@ -188,6 +190,14 @@ Validation contract:
 - `mining.set_extranonce`: parsed but currently rejected as unsupported
 - `mining.suggest_difficulty`: parsed but currently rejected as unsupported
 
+### Payout scheduling
+
+- A periodic payout scheduler runs from `config.toml` using the configured `pool.pplns.payout_interval_secs`.
+- Coinbase maturity is tracked in `found_blocks` with a default of 100 confirmations.
+- `blkdisconctd` marks pending found blocks orphaned.
+- The current payout batch lifecycle is persisted, but the in-process submit/broadcast step is still a synthetic placeholder rather than a real signer/transport path.
+- PPLNS outputs are computed from accepted non-stale shares and split deterministically by payout address.
+
 ---
 
 ## 6) Operator API
@@ -226,10 +236,11 @@ curl -H 'Authorization: Bearer devtoken' http://127.0.0.1:18080/status
 
 - startup and config load
 - NNG adapter connection + subscriptions
-- inbound NNG events (`updateblktip`, `mempool refresh`, `miningwrkchg`)
+- inbound NNG events (`updateblktip`, `mempool refresh`, `miningwrkchg`, `blkdisconctd`)
 - job refresh tick and job publication
 - connection accept/close
 - accepted shares persisted
+- found-block persistence and orphan transitions
 - vardiff retarget changes
 - rate-limit or idle disconnect events
 

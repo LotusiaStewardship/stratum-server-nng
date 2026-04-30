@@ -42,9 +42,12 @@ pub fn build_pplns_payout_plan(
     }
 
     let total_work: f64 = work_by_address.values().sum();
-    if total_work <= 0.0 {
+    if total_work <= 0.0 || net_reward_sat <= 0 {
         return PayoutPlan {
-            outputs: vec![],
+            outputs: fee_address
+                .filter(|_| fee_sat > 0)
+                .map(|addr| vec![(addr.to_string(), fee_sat)])
+                .unwrap_or_default(),
             gross_reward_sat,
             fee_sat,
             net_reward_sat,
@@ -58,13 +61,19 @@ pub fn build_pplns_payout_plan(
             (addr, raw.floor() as i64, raw.fract())
         })
         .collect();
-    staged.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    staged.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let paid_floor: i64 = staged.iter().map(|(_, v, _)| *v).sum();
     let mut remainder = net_reward_sat - paid_floor;
-    for i in 0..staged.len() {
-        if remainder <= 0 { break; }
-        staged[i].1 += 1;
+    for item in staged.iter_mut() {
+        if remainder <= 0 {
+            break;
+        }
+        item.1 += 1;
         remainder -= 1;
     }
 
@@ -109,5 +118,17 @@ mod tests {
         let p = build_pplns_payout_plan(1000, 100, Some("fee"), &shares, 0);
         assert_eq!(p.fee_sat, 10);
         assert_eq!(p.net_reward_sat, 990);
+    }
+
+    #[test]
+    fn remainder_distribution_is_deterministic() {
+        let shares = vec![
+            WeightedShare { payout_address: "b".into(), work_units: 1.0 },
+            WeightedShare { payout_address: "a".into(), work_units: 1.0 },
+            WeightedShare { payout_address: "c".into(), work_units: 1.0 },
+        ];
+        let p = build_pplns_payout_plan(10, 0, None, &shares, 0);
+        assert_eq!(p.outputs.iter().map(|(_, v)| *v).sum::<i64>(), 10);
+        assert_eq!(p.outputs, vec![("a".into(), 4), ("b".into(), 3), ("c".into(), 3)]);
     }
 }

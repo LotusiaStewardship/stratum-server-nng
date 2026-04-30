@@ -367,17 +367,28 @@ impl AccountingDb {
             "INSERT OR IGNORE INTO rounds(start_template_id, created_at) VALUES(?1, ?2)",
             params![template_id as i64, now],
         )?;
-        let round_id: i64 = conn.query_row("SELECT id FROM rounds ORDER BY id DESC LIMIT 1", [], |r| r.get(0))?;
+        let round_id: i64 = conn.query_row(
+            "SELECT id FROM rounds WHERE start_template_id=?1 ORDER BY id DESC LIMIT 1",
+            params![template_id as i64],
+            |r| r.get(0),
+        )?;
 
         conn.execute(
-            "INSERT OR IGNORE INTO found_blocks(round_id, block_hash, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'pending', 'pending', 0, ?8)",
-            params![round_id, block_hash, template_id as i64, worker_id, worker_name, payout_address, persist_source, Utc::now().to_rfc3339()],
+            "INSERT INTO found_blocks(round_id, block_hash, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'pending', 'pending', 0, ?8)
+             ON CONFLICT(block_hash) DO UPDATE SET
+                round_id=excluded.round_id,
+                template_id=excluded.template_id,
+                worker_id=excluded.worker_id,
+                worker_name=excluded.worker_name,
+                payout_address=excluded.payout_address,
+                persist_source=excluded.persist_source",
+            params![round_id, block_hash, template_id as i64, worker_id, worker_name, payout_address, persist_source, now],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO submit_events(block_hash, template_id, worker_id, worker_name, payout_address, node_result, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, 'accepted', ?6)",
-            params![block_hash, template_id as i64, worker_id, worker_name, payout_address, Utc::now().to_rfc3339()],
+            params![block_hash, template_id as i64, worker_id, worker_name, payout_address, now],
         )?;
         Ok(())
     }
@@ -500,6 +511,12 @@ impl AccountingDb {
                 WHEN coinbase_maturity_blocks > ?2 THEN coinbase_maturity_blocks ELSE ?2 END",
             params![now, min_confirmations as i64],
         )?;
+        conn.execute(
+            "UPDATE found_blocks
+             SET status='matured'
+             WHERE chain_state='matured' AND status!='matured'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -546,5 +563,44 @@ mod tests {
         assert!(!db
             .insert_share_idempotent(worker.id, 1, 1.0, true, false, "k1")
             .unwrap());
+    }
+
+    #[test]
+    fn test_found_block_record_is_idempotent_and_updates_attribution() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        let worker = db.upsert_worker("lotus_abc", Some("rig1")).unwrap();
+        db.record_found_block("bh1", 9, worker.id, "lotus_abc.rig1", &worker.payout_address, "submit_flow")
+            .unwrap();
+        db.record_found_block("bh1", 9, worker.id, "lotus_abc.rig1", &worker.payout_address, "submit_flow")
+            .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM found_blocks WHERE block_hash='bh1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let status: String = conn.query_row("SELECT status FROM found_blocks WHERE block_hash='bh1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn test_found_block_maturity_and_orphaning() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        let worker = db.upsert_worker("lotus_abc", None).unwrap();
+        db.record_found_block("bh2", 10, worker.id, "lotus_abc", &worker.payout_address, "submit_flow")
+            .unwrap();
+        assert_eq!(db.mark_pending_blocks_orphaned().unwrap(), 1);
+        db.record_found_block("bh3", 11, worker.id, "lotus_abc", &worker.payout_address, "submit_flow")
+            .unwrap();
+        for _ in 0..100 {
+            db.advance_found_block_confirmations(100).unwrap();
+        }
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn.query_row("SELECT status FROM found_blocks WHERE block_hash='bh3'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "matured");
     }
 }
