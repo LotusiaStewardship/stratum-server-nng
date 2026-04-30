@@ -134,7 +134,23 @@ impl AccountingDb {
         Self::ensure_column(&tx, "found_blocks", "worker_name", "TEXT")?;
         Self::ensure_column(&tx, "found_blocks", "payout_address", "TEXT")?;
         Self::ensure_column(&tx, "found_blocks", "persist_source", "TEXT")?;
+        Self::ensure_column(&tx, "found_blocks", "coinbase_maturity_blocks", "INTEGER NOT NULL DEFAULT 100")?;
+        Self::ensure_column(&tx, "found_blocks", "matured_at", "TEXT")?;
+        Self::ensure_column(&tx, "found_blocks", "disconnected_at", "TEXT")?;
+        Self::ensure_column(&tx, "found_blocks", "chain_state", "TEXT NOT NULL DEFAULT 'pending'")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS payout_scheduler_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
+
+        Self::ensure_column(&tx, "payout_batches", "retry_key", "TEXT")?;
+        Self::ensure_column(&tx, "payout_batches", "signed_payload_ref", "TEXT")?;
+        Self::ensure_column(&tx, "payout_batches", "submitted_txid", "TEXT")?;
+        Self::ensure_column(&tx, "payout_batches", "last_error", "TEXT")?;
+        Self::ensure_column(&tx, "payout_batches", "next_retry_at", "TEXT")?;
+        Self::ensure_column(&tx, "payout_batches", "attempt_count", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(&tx, "payout_batches", "gross_reward_sat", "INTEGER")?;
+        Self::ensure_column(&tx, "payout_batches", "fee_sat", "INTEGER")?;
+        Self::ensure_column(&tx, "payout_batches", "net_reward_sat", "INTEGER")?;
+        Self::ensure_column(&tx, "payout_batches", "confirmed_at", "TEXT")?;
 
         tx.commit()?;
         Ok(())
@@ -354,8 +370,8 @@ impl AccountingDb {
         let round_id: i64 = conn.query_row("SELECT id FROM rounds ORDER BY id DESC LIMIT 1", [], |r| r.get(0))?;
 
         conn.execute(
-            "INSERT OR IGNORE INTO found_blocks(round_id, block_hash, template_id, worker_id, worker_name, payout_address, persist_source, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO found_blocks(round_id, block_hash, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'pending', 'pending', 0, ?8)",
             params![round_id, block_hash, template_id as i64, worker_id, worker_name, payout_address, persist_source, Utc::now().to_rfc3339()],
         )?;
         conn.execute(
@@ -374,6 +390,129 @@ impl AccountingDb {
             |r| r.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    pub fn list_weighted_shares_for_pplns(&self, limit: u32) -> Result<Vec<(String, f64)>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT w.payout_address, s.difficulty
+             FROM shares s
+             JOIN workers w ON w.id = s.worker_id
+             WHERE s.accepted=1 AND s.stale=0
+             ORDER BY s.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn take_next_matured_found_block(&self) -> Result<Option<(i64, String)>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, block_hash FROM found_blocks WHERE chain_state='matured' AND status='matured' ORDER BY id ASC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn mark_found_block_paid(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks SET status='paid' WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_payout_batch(
+        &self,
+        retry_key: &str,
+        gross_reward_sat: i64,
+        fee_sat: i64,
+        net_reward_sat: i64,
+        outputs: &[(String, i64)],
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO payout_batches(method, status, retry_key, gross_reward_sat, fee_sat, net_reward_sat, created_at)
+             VALUES('pplns', 'planned', ?1, ?2, ?3, ?4, ?5)",
+            params![retry_key, gross_reward_sat, fee_sat, net_reward_sat, now],
+        )?;
+        let batch_id = tx.last_insert_rowid();
+        for (addr, sat) in outputs {
+            tx.execute(
+                "INSERT INTO payout_entries(payout_batch_id, address, amount_sat, created_at) VALUES(?1, ?2, ?3, ?4)",
+                params![batch_id, addr, sat, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(batch_id)
+    }
+
+    pub fn update_payout_batch_state(
+        &self,
+        batch_id: i64,
+        status: &str,
+        signed_payload_ref: Option<&str>,
+        submitted_txid: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE payout_batches
+             SET status=?2,
+                 signed_payload_ref=COALESCE(?3, signed_payload_ref),
+                 submitted_txid=COALESCE(?4, submitted_txid),
+                 last_error=?5,
+                 attempt_count=attempt_count+1,
+                 next_retry_at=?6,
+                 confirmed_at=CASE WHEN ?2='confirmed' THEN ?6 ELSE confirmed_at END
+             WHERE id=?1",
+            params![batch_id, status, signed_payload_ref, submitted_txid, last_error, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn advance_found_block_confirmations(&self, min_confirmations: u32) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks
+             SET confirmations = confirmations + 1
+             WHERE chain_state='pending'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE found_blocks
+             SET chain_state='matured', status='matured', matured_at=?1
+             WHERE chain_state='pending' AND confirmations >= CASE
+                WHEN coinbase_maturity_blocks > ?2 THEN coinbase_maturity_blocks ELSE ?2 END",
+            params![now, min_confirmations as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_pending_blocks_orphaned(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let changed = conn.execute(
+            "UPDATE found_blocks
+             SET chain_state='orphaned', status='orphaned', disconnected_at=?1
+             WHERE chain_state='pending'",
+            params![now],
+        )?;
+        Ok(changed as u64)
     }
 
     pub fn active_payout_method(&self) -> Result<Option<String>> {

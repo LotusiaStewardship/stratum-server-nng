@@ -152,6 +152,7 @@ pub async fn run_stratum_server(
     let adapter_events = adapter.clone();
     let pool_scripts_events = pool_scripts.clone();
     let stats_events = stats.clone();
+    let db_events = db.clone();
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
@@ -160,13 +161,23 @@ pub async fn run_stratum_server(
             while let Some(event) = rx.recv().await {
                 let clean = matches!(
                     event,
-                    NodeEvent::UpdateBlkTip | NodeEvent::MiningWorkChanged
+                    NodeEvent::UpdateBlkTip | NodeEvent::MiningWorkChanged | NodeEvent::BlockDisconnected
                 );
                 let reason = match event {
                     NodeEvent::UpdateBlkTip => "updateblktip",
                     NodeEvent::MempoolRefresh => "mempool",
                     NodeEvent::MiningWorkChanged => "miningwrkchg",
+                    NodeEvent::BlockDisconnected => "blkdisconctd",
                 };
+                if matches!(event, NodeEvent::BlockDisconnected) {
+                    match db_events.mark_pending_blocks_orphaned() {
+                        Ok(orphaned) if orphaned > 0 => {
+                            warn!(orphaned, "marked pending found blocks orphaned due to blkdisconctd");
+                        }
+                        Ok(_) => {}
+                        Err(err) => error!(error = %err, "failed applying blkdisconctd orphan update"),
+                    }
+                }
                 if let Err(err) = refresh_job_from_node(
                     &runtime_events,
                     adapter_events_inner.clone(),

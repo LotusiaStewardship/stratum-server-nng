@@ -1,3 +1,5 @@
+pub mod scheduler;
+
 use std::collections::HashMap;
 
 use anyhow::Result;

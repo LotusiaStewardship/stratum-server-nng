@@ -39,6 +39,7 @@ pub struct PoolConfig {
     pub mining_identity: MiningIdentityConfig,
     pub fee: FeeConfig,
     pub pplns: PplnsConfig,
+    pub signing: SigningConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +62,12 @@ pub struct PplnsConfig {
     pub min_payout_sat: i64,
     pub payout_interval_secs: u64,
     pub min_confirmations: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SigningConfig {
+    pub mode: String,
+    pub private_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +120,15 @@ impl Config {
         if self.pool.fee.enabled && self.pool.fee.fee_bps > 10_000 {
             anyhow::bail!("fee_bps must be <= 10000")
         }
+        if self.pool.signing.mode == "internal" {
+            let key = self
+                .pool
+                .signing
+                .private_key
+                .as_deref()
+                .ok_or_else(|| anyhow!("pool.signing.private_key required for internal signer mode"))?;
+            validate_private_key_format(key)?;
+        }
 
         Ok(ResolvedPoolScripts {
             payout_fingerprint: script_fingerprint(&payout_script),
@@ -120,6 +136,21 @@ impl Config {
             fee_script,
         })
     }
+}
+
+fn validate_private_key_format(key: &str) -> Result<()> {
+    let trimmed = key.trim();
+    if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
+        return Ok(());
+    }
+    if (trimmed.len() == 51 || trimmed.len() == 52)
+        && trimmed
+            .chars()
+            .all(|c| "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("unsupported private key format: expected 32-byte hex or WIF")
 }
 
 fn resolve_script(script_hex: Option<&str>, address: Option<&str>) -> Result<Vec<u8>> {

@@ -11,6 +11,7 @@ pub enum NodeEvent {
     UpdateBlkTip,
     MempoolRefresh,
     MiningWorkChanged,
+    BlockDisconnected,
 }
 
 /// Thin abstraction to keep pool core decoupled from concrete NNG client
@@ -54,7 +55,10 @@ impl BitcoindNngAdapter {
         pubif
             .subscribe("miningwrkchg")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        info!("NNG pub subscriptions active: updateblktip,mempooltxadd,mempooltxrem,miningwrkchg");
+        pubif
+            .subscribe("blkdisconctd")
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        info!("NNG pub subscriptions active: updateblktip,mempooltxadd,mempooltxrem,miningwrkchg,blkdisconctd");
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             loop {
@@ -71,6 +75,7 @@ impl BitcoindNngAdapter {
                     "updateblktip" => on_event(NodeEvent::UpdateBlkTip),
                     "mempooltxadd" | "mempooltxrem" => on_event(NodeEvent::MempoolRefresh),
                     "miningwrkchg" => on_event(NodeEvent::MiningWorkChanged),
+                    "blkdisconctd" => on_event(NodeEvent::BlockDisconnected),
                     _ => warn!(topic, "unknown NNG topic ignored"),
                 }
             }
