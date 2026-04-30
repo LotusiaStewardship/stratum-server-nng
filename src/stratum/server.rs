@@ -355,7 +355,6 @@ struct SessionShareStats {
     errored: u64,
 }
 
-
 async fn send_set_difficulty(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     diff: f64,
@@ -389,6 +388,7 @@ async fn send_mining_notify(
             job.nbits,
             job.ntime,
             job.clean_jobs,
+            hex::encode(&job.template_header),
         ],
     });
     let mut data = serde_json::to_vec(&v)?;
@@ -470,7 +470,7 @@ async fn handle_conn(
                 vardiff.current = next_diff;
             }
             apply_notify(&mut session, &job);
-            if session.is_subscribed {
+            if session.is_subscribed && session.is_authorized {
                 send_mining_notify(&mut write_half, &job).await?;
                 info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, ntime = %job.ntime, clean_jobs = job.clean_jobs, "assigned mining.notify work");
                 assigned_jobs.insert(
@@ -545,6 +545,8 @@ async fn handle_conn(
             debug!(session_id = %session_id, method = ?method, req_id = %req_id, response_error = %resp.error, response_result = %resp.result, "sending stratum response");
             if matches!(method, Method::Subscribe) && resp.error.is_null() {
                 send_set_difficulty(&mut write_half, vardiff.current).await?;
+            }
+            if matches!(method, Method::Authorize) && resp.error.is_null() {
                 if let Some(job) = runtime.latest_job() {
                     apply_notify(&mut session, &job);
                     send_mining_notify(&mut write_half, &job).await?;
@@ -557,7 +559,7 @@ async fn handle_conn(
                     );
                     assigned_job_order.push_back(job.job_id.clone());
                     prune_assigned_jobs(&session, &mut assigned_jobs, &mut assigned_job_order);
-                    info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, clean_jobs = job.clean_jobs, "assigned initial mining.notify work after subscribe");
+                    info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, clean_jobs = job.clean_jobs, "assigned initial mining.notify work after authorize");
                 }
             }
             if matches!(method, Method::Authorize) {
@@ -623,7 +625,7 @@ async fn handle_conn(
                     ntime_hex_6b: ntime.to_string(),
                     nonce_hex_8b: nonce.to_string(),
                 };
-                if prevalidate_submit_shape(&submit).is_err() {
+                if prevalidate_submit_shape(&submit, session.extranonce2_size).is_err() {
                     share_stats.errored += 1;
                     warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, extranonce2 = %submit.extranonce2, ntime = %submit.ntime_hex_6b, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-submit-shape");
                     let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
@@ -764,8 +766,11 @@ async fn handle_conn(
                     continue;
                 }
 
-                let candidate_block = match build_candidate_block(&job, &session.extranonce1, &submit)
-                {
+                let candidate_block = match build_candidate_block(
+                    &job,
+                    &session.extranonce1,
+                    &submit,
+                ) {
                     Ok(v) => v,
                     Err(_) => {
                         share_stats.errored += 1;
@@ -785,6 +790,25 @@ async fn handle_conn(
                         .fetch_add(1, Ordering::Relaxed);
                     error!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, template_id = job.template_id, error = %err, "candidate payout script mismatch; rejecting submit");
                     let err = StratumResponse::err(req_id.clone(), 20, "candidate-payout-mismatch");
+                    send_json_line(&mut write_half, &err).await?;
+                    continue;
+                }
+
+                let merkle_matches_block = {
+                    let mut block_bytes = Bytes::from_slice(&candidate_block);
+                    match LotusBlock::deser(&mut block_bytes) {
+                        Ok(mut block) => {
+                            let header_merkle = block.header.merkle_root.clone();
+                            block.update_merkle_root();
+                            block.header.merkle_root == header_merkle
+                        }
+                        Err(_) => false,
+                    }
+                };
+                if !merkle_matches_block {
+                    share_stats.rejected += 1;
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: bad-txnmrklroot");
+                    let err = StratumResponse::err(req_id.clone(), 20, "bad-txnmrklroot");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
@@ -902,10 +926,7 @@ async fn handle_conn(
                         submit_result.reject_reason, submit_result.result
                     )),
                 );
-                if matches!(
-                    submit_result.result,
-                    MiningSubmitResult::Accepted | MiningSubmitResult::Duplicate
-                ) {
+                if submit_result.accepted {
                     let persist = db.record_found_block(
                         &submit_block_hash,
                         job.template_id,

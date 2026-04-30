@@ -1,3 +1,4 @@
+use bitcoinsuite_core::lotus_txid;
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader, Sha256d, Tx};
 use primitive_types::U256;
 
@@ -39,11 +40,15 @@ const DIFF_SCALE: u128 = 100_000_000;
 ///
 /// Full network-target validation still belongs to lotusd submit path; this
 /// method is for low-latency pool-side filtering.
-pub fn prevalidate_submit_shape(sub: &NativeSubmit) -> anyhow::Result<()> {
+pub fn prevalidate_submit_shape(sub: &NativeSubmit, extranonce2_size: u8) -> anyhow::Result<()> {
     if sub.worker_name.is_empty() || sub.job_id.is_empty() {
         anyhow::bail!("missing worker/job")
     }
-    if sub.extranonce2.len() != 8 || !is_hex(&sub.extranonce2) {
+    let expected_extranonce2_hex_len = usize::from(extranonce2_size) * 2;
+    if expected_extranonce2_hex_len == 0
+        || sub.extranonce2.len() != expected_extranonce2_hex_len
+        || !is_hex(&sub.extranonce2)
+    {
         anyhow::bail!("invalid extranonce2")
     }
     if sub.ntime_hex_6b.len() != 12 || !is_hex(&sub.ntime_hex_6b) {
@@ -86,15 +91,7 @@ pub fn validate_submit_meets_difficulty(
     difficulty: f64,
 ) -> anyhow::Result<()> {
     let header = build_header_bytes(job, extranonce1, sub)?;
-    let hash = sha256d(&header);
-    let mut hash_be = hash;
-    hash_be.reverse();
-    let hash_u256 = U256::from_big_endian(&hash_be);
-    let share_target = target_for_share_difficulty(difficulty)?;
-    if hash_u256 > share_target {
-        anyhow::bail!("low difficulty share")
-    }
-    Ok(())
+    validate_header_meets_difficulty(&header, difficulty)
 }
 
 pub fn build_candidate_block(
@@ -120,6 +117,7 @@ pub fn build_candidate_block(
         anyhow::bail!("template block has no txs")
     }
     block.txs[0] = coinbase_tx;
+    block.update_merkle_root();
 
     Ok(block.ser().as_ref().to_vec())
 }
@@ -184,11 +182,23 @@ fn build_header_bytes(
     extranonce1: &str,
     sub: &NativeSubmit,
 ) -> anyhow::Result<Vec<u8>> {
-    let coinbase = hex::decode(format!(
+    // Decode and deserialize coinbase to Tx
+    let coinbase_hex = format!(
         "{}{}{}{}",
         job.coinbase1, extranonce1, sub.extranonce2, job.coinbase2
-    ))?;
-    let mut merkle = sha256d(&coinbase).to_vec();
+    );
+    let coinbase_bytes = hex::decode(&coinbase_hex)?;
+    let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
+    let coinbase_tx = Tx::deser(&mut coinbase_buf)?;
+
+    // Lotus merkle leaf: SHA256d(txid || lotus_txid) using bitcoinsuite primitives
+    let txid = coinbase_tx.hash();
+    let lotus_txid_val = lotus_txid(coinbase_tx.unhashed_tx());
+    let mut merkle_leaf_raw = Vec::with_capacity(64);
+    merkle_leaf_raw.extend_from_slice(txid.as_ref());
+    merkle_leaf_raw.extend_from_slice(lotus_txid_val.as_ref());
+    let merkle_leaf = sha256d(&merkle_leaf_raw);
+    let mut merkle = merkle_leaf.to_vec();
     for branch_hex in &job.merkle_branches {
         let branch = hex::decode(branch_hex)?;
         let mut concat = Vec::with_capacity(64);
@@ -197,14 +207,35 @@ fn build_header_bytes(
         merkle = sha256d(&concat).to_vec();
     }
 
-    let mut header = Vec::with_capacity(4 + 32 + 32 + 6 + 4 + 8);
-    header.extend_from_slice(&hex::decode(&job.version)?);
-    header.extend_from_slice(&hex::decode(&job.prevhash)?);
-    header.extend_from_slice(&merkle);
-    header.extend_from_slice(&hex::decode(&sub.ntime_hex_6b)?);
-    header.extend_from_slice(&hex::decode(&job.nbits)?);
-    header.extend_from_slice(&hex::decode(&sub.nonce_hex_8b)?);
-    Ok(header)
+    let mut header_bytes = Bytes::from_slice(&job.template_header);
+    let mut header = LotusHeader::deser(&mut header_bytes)?;
+
+    let nbits_bytes: [u8; 4] = hex::decode(&job.nbits)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid nbits length"))?;
+    let ntime_bytes: [u8; 6] = hex::decode(&sub.ntime_hex_6b)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid ntime length"))?;
+    let nonce_bytes: [u8; 8] = hex::decode(&sub.nonce_hex_8b)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
+    let merkle_bytes: [u8; 32] = merkle
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid merkle length"))?;
+
+    let mut ntime_le8 = [0u8; 8];
+    ntime_le8[..6].copy_from_slice(&ntime_bytes);
+
+    header.bits = u32::from_le_bytes(nbits_bytes);
+    header.timestamp = i64::from_le_bytes(ntime_le8);
+    header.nonce = u64::from_le_bytes(nonce_bytes);
+    header.merkle_root = Sha256d::new(merkle_bytes);
+
+    Ok(header.ser().as_ref().to_vec())
 }
 
 fn target_for_share_difficulty(difficulty: f64) -> anyhow::Result<U256> {
@@ -246,7 +277,7 @@ mod tests {
             ntime_hex_6b: "001122334455".to_string(),
             nonce_hex_8b: "0011223344556677".to_string(),
         };
-        assert!(prevalidate_submit_shape(&ok).is_ok());
+        assert!(prevalidate_submit_shape(&ok, 4).is_ok());
     }
 
     #[test]
@@ -260,5 +291,6 @@ mod tests {
             hex::encode(hash),
             "000000006275dc5039da85620773f3223d629759495f80b49a381d79cae77c11"
         );
+        assert!(validate_header_meets_difficulty(&header, 1.0).is_ok());
     }
 }
