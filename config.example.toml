@@ -1,37 +1,123 @@
+# -----------------------------------------------------------------------------
+# stratum-server-nng example configuration
+# -----------------------------------------------------------------------------
+#
+# This file is meant to be copied to `config.toml` and adjusted for your site.
+#
+# Safety notes:
+# - The pool payout script must be explicit.
+# - Do not leave it as OP_RETURN / nulldata.
+# - `pool.signing.private_key` is only for the in-process signer path.
+# - Prefer keeping private keys out of the stratum process when you can.
+# -----------------------------------------------------------------------------
+
 debug = false
+
+# Stratum TCP listen address for miners.
+# Common defaults:
+# - 0.0.0.0:3334 for public pool ingress
+# - 127.0.0.1:3334 for local testing only
 stratum_bind = "0.0.0.0:3334"
+
+# Operator API listen address.
+# Keep this on localhost or a protected network segment.
 api_bind = "127.0.0.1:18080"
+
+# Bearer token for authenticated operator endpoints.
+# Can also be overridden by STRATUM_API_TOKEN in the environment.
 api_token = "devtoken"
+
+# SQLite accounting database path.
 sqlite_path = "./stratum-accounting.sqlite3"
+
+# lotusd NNG RPC endpoint used for mining template requests and block submission.
+# Use ipc:// on the same host or tcp:// when intentionally exposed.
 nng_rpc_url = "ipc://datadir/nngrpc.pipe"
+
+# lotusd NNG Pub/Sub endpoint used for updateblktip / mempool / reorg events.
 nng_pub_url = "ipc://datadir/nngpub.pipe"
+
+# Initial vardiff difficulty assigned to a new miner session.
 initial_difficulty = 1.0
+
+# Target time between accepted shares, in seconds.
+# Lower values generally mean more shares and more frequent vardiff adjustments.
 vardiff_target_secs = 15.0
+
+# How often vardiff retargeting is allowed to occur, in seconds.
 vardiff_retarget_secs = 90.0
+
+# Hard clamp for vardiff floor/ceiling.
 min_difficulty = 0.0000001
 max_difficulty = 1e12
+
+# Protocol hardening limits.
 max_request_line_bytes = 8192
 per_conn_req_per_sec = 128
 conn_idle_timeout_secs = 180
+
+# Bound how many jobs are kept in memory for stale-job / duplicate-request handling.
 max_jobs_cache = 512
+
+# Periodic refresh interval for fetching a fresh mining template from lotusd.
 job_refresh_secs = 15
 
 [pool.mining_identity]
+# The payout destination for block subsidies and mining rewards.
+# One of these must be set:
+# - payout_address (recommended for operator ergonomics)
+# - payout_script_hex (raw scriptPubKey)
+#
+# The resolved script must not be OP_RETURN / nulldata.
 payout_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # payout_script_hex = "76a914...88ac"
 
 [pool.fee]
+# Enable or disable pool fee collection.
+# When enabled, the fee is deducted from gross block reward before miner payouts.
 enabled = true
+
+# Fee rate in basis points.
+# Example: 100 = 1.00%, 50 = 0.50%, 0 = disabled behavior without turning off the section.
 fee_bps = 100
+
+# Fee destination.
+# One of these must be set when fee collection is enabled:
+# - fee_address
+# - fee_script_hex
 fee_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # fee_script_hex = "76a914...88ac"
 
 [pool.pplns]
+# Difficulty-weighted PPLNS window multiplier.
+# 1.0 means roughly one block's worth of work in the window.
+# Larger values smooth variance but slow down responsiveness.
 n_multiplier = 1.0
+
+# Minimum miner payout threshold, in satoshis.
+# Outputs below this are filtered out rather than producing dust.
 min_payout_sat = 546
+
+# Scheduler interval, in seconds.
+# The scheduler checks for matured found blocks and produces payout batches on this cadence.
 payout_interval_secs = 3600
+
+# Minimum confirmations required before a found block becomes payout-eligible.
+# The code also enforces a hard coinbase maturity baseline of 100 blocks.
 min_confirmations = 100
 
 [pool.signing]
+# Signing mode for payout batches.
+# Currently supported first-draft mode:
+# - internal: sign inside the pool process using `private_key`
+#
+# Other modes are reserved for future transport integrations.
 mode = "internal"
+
+# Private key material for internal signing.
+# Accepted formats in the current implementation:
+# - 32-byte hex
+# - WIF-like base58 string
+#
+# Never log this value. Prefer loading from a secure file or secret store.
 private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
