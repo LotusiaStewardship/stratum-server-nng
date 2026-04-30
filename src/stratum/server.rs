@@ -5,8 +5,8 @@ use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
 use crate::stratum::validation::{
-    prevalidate_submit_shape, share_target_hex_for_difficulty, validate_header_meets_difficulty,
-    validate_header_meets_target_hex, NativeSubmit,
+    build_candidate_block, build_precomputed_header, prevalidate_submit_shape,
+    validate_header_meets_target_hex, validate_submit_meets_difficulty, NativeSubmit,
 };
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
@@ -345,9 +345,7 @@ const MAX_ASSIGNED_JOBS_PER_SESSION: usize = 128;
 #[derive(Debug, Clone)]
 struct AssignedJob {
     share_difficulty: f64,
-    extranonce2: String,
     ntime_hex_6b: String,
-    header_160: [u8; 160],
 }
 
 #[derive(Debug, Default)]
@@ -357,56 +355,6 @@ struct SessionShareStats {
     errored: u64,
 }
 
-async fn send_precomputed_work(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    job: &MiningJob,
-    header_160_hex: &str,
-    share_target_hex: &str,
-    extranonce2: &str,
-    ntime_hex_6b: &str,
-) -> Result<()> {
-    let v = serde_json::json!({
-        "id": serde_json::Value::Null,
-        "method": "lotus.precomputed_work",
-        "params": [
-            job.job_id,
-            header_160_hex,
-            share_target_hex,
-            extranonce2,
-            ntime_hex_6b,
-            job.clean_jobs,
-        ],
-    });
-    let mut data = serde_json::to_vec(&v)?;
-    data.push(b'\n');
-    writer.write_all(&data).await?;
-    debug!(job_id = %job.job_id, template_epoch = job.template_epoch, "sent lotus.precomputed_work");
-    Ok(())
-}
-
-fn make_precomputed_header_160(job: &MiningJob) -> Result<[u8; 160]> {
-    if job.template_header.len() != 160 {
-        anyhow::bail!("template_header must be 160 bytes for precomputed work")
-    }
-    let ntime = hex::decode(&job.ntime)?;
-    if ntime.len() != 6 {
-        anyhow::bail!("job ntime must be 6 bytes")
-    }
-    let mut header = [0u8; 160];
-    header.copy_from_slice(&job.template_header);
-    // Miner mutates this 8-byte nonce field while hashing.
-    header[44..52].copy_from_slice(&0u64.to_le_bytes());
-    Ok(header)
-}
-
-fn build_candidate_block_from_header(job: &MiningJob, header_160: &[u8; 160]) -> Result<Vec<u8>> {
-    if job.template_block.len() < 160 {
-        anyhow::bail!("template_block too small for header replacement")
-    }
-    let mut block = job.template_block.clone();
-    block[0..160].copy_from_slice(header_160);
-    Ok(block)
-}
 
 async fn send_set_difficulty(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -424,7 +372,7 @@ async fn send_set_difficulty(
     Ok(())
 }
 
-async fn send_mining_notify_compat(
+async fn send_mining_notify(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     job: &MiningJob,
 ) -> Result<()> {
@@ -446,7 +394,7 @@ async fn send_mining_notify_compat(
     let mut data = serde_json::to_vec(&v)?;
     data.push(b'\n');
     writer.write_all(&data).await?;
-    debug!(job_id = %job.job_id, "sent mining.notify compatibility message");
+    debug!(job_id = %job.job_id, "sent mining.notify");
     Ok(())
 }
 
@@ -482,62 +430,6 @@ fn ensure_block_coinbase_payout_script(block: &[u8], expected_script: &[u8]) -> 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_precomputed_header_requires_160() {
-        let mut job = MiningJob {
-            job_id: "j".into(),
-            template_id: 1,
-            prevhash: String::new(),
-            coinbase1: String::new(),
-            coinbase2: String::new(),
-            merkle_branches: vec![],
-            version: String::new(),
-            nbits: String::new(),
-            ntime: "000000000000".into(),
-            network_target_hex: "00".repeat(32),
-            clean_jobs: true,
-            template_epoch: 1,
-            template_header: vec![0u8; 159],
-            template_block: vec![0u8; 200],
-            block_height: 0,
-        };
-        assert!(make_precomputed_header_160(&job).is_err());
-        job.template_header = vec![7u8; 160];
-        let h = make_precomputed_header_160(&job).unwrap();
-        assert_eq!(h.len(), 160);
-        assert_eq!(&h[44..52], &[0u8; 8]);
-    }
-
-    #[test]
-    fn test_build_candidate_block_replaces_header() {
-        let job = MiningJob {
-            job_id: "j".into(),
-            template_id: 1,
-            prevhash: String::new(),
-            coinbase1: String::new(),
-            coinbase2: String::new(),
-            merkle_branches: vec![],
-            version: String::new(),
-            nbits: String::new(),
-            ntime: "000000000000".into(),
-            network_target_hex: "00".repeat(32),
-            clean_jobs: true,
-            template_epoch: 1,
-            template_header: vec![0u8; 160],
-            template_block: vec![1u8; 300],
-            block_height: 0,
-        };
-        let hdr = [9u8; 160];
-        let block = build_candidate_block_from_header(&job, &hdr).unwrap();
-        assert_eq!(&block[..160], &hdr);
-        assert_eq!(block.len(), 300);
-    }
-}
-
 async fn handle_conn(
     socket: TcpStream,
     db: AccountingDb,
@@ -549,6 +441,7 @@ async fn handle_conn(
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
+    session.extranonce1 = format!("{:08x}", thread_rng().r#gen::<u32>());
     let mut vardiff = VarDiff::new(
         cfg.initial_difficulty,
         cfg.min_difficulty,
@@ -578,31 +471,13 @@ async fn handle_conn(
             }
             apply_notify(&mut session, &job);
             if session.is_subscribed {
-                let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
-                let ntime_hex_6b = job.ntime.clone();
-                let header_160 = make_precomputed_header_160(&job)?;
-                let header_160_hex = hex::encode(header_160);
-                let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
-                send_precomputed_work(
-                    &mut write_half,
-                    &job,
-                    &header_160_hex,
-                    &share_target_hex,
-                    &extranonce2,
-                    &ntime_hex_6b,
-                )
-                .await?;
-                if cfg.emit_mining_notify_compat {
-                    send_mining_notify_compat(&mut write_half, &job).await?;
-                }
-                info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, extranonce2 = %extranonce2, ntime = %ntime_hex_6b, clean_jobs = job.clean_jobs, "assigned precomputed work");
+                send_mining_notify(&mut write_half, &job).await?;
+                info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, ntime = %job.ntime, clean_jobs = job.clean_jobs, "assigned mining.notify work");
                 assigned_jobs.insert(
                     job.job_id.clone(),
                     AssignedJob {
                         share_difficulty: vardiff.current,
-                        extranonce2,
-                        ntime_hex_6b,
-                        header_160,
+                        ntime_hex_6b: job.ntime.clone(),
                     },
                 );
                 assigned_job_order.push_back(job.job_id.clone());
@@ -672,35 +547,17 @@ async fn handle_conn(
                 send_set_difficulty(&mut write_half, vardiff.current).await?;
                 if let Some(job) = runtime.latest_job() {
                     apply_notify(&mut session, &job);
-                    let extranonce2 = format!("{:08x}", thread_rng().r#gen::<u32>());
-                    let ntime_hex_6b = job.ntime.clone();
-                    let header_160 = make_precomputed_header_160(&job)?;
-                    let header_160_hex = hex::encode(header_160);
-                    let share_target_hex = share_target_hex_for_difficulty(vardiff.current)?;
-                    send_precomputed_work(
-                        &mut write_half,
-                        &job,
-                        &header_160_hex,
-                        &share_target_hex,
-                        &extranonce2,
-                        &ntime_hex_6b,
-                    )
-                    .await?;
-                    if cfg.emit_mining_notify_compat {
-                        send_mining_notify_compat(&mut write_half, &job).await?;
-                    }
+                    send_mining_notify(&mut write_half, &job).await?;
                     assigned_jobs.insert(
                         job.job_id.clone(),
                         AssignedJob {
                             share_difficulty: vardiff.current,
-                            extranonce2,
-                            ntime_hex_6b,
-                            header_160,
+                            ntime_hex_6b: job.ntime.clone(),
                         },
                     );
                     assigned_job_order.push_back(job.job_id.clone());
                     prune_assigned_jobs(&session, &mut assigned_jobs, &mut assigned_job_order);
-                    info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, clean_jobs = job.clean_jobs, "assigned initial precomputed work after subscribe");
+                    info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, clean_jobs = job.clean_jobs, "assigned initial mining.notify work after subscribe");
                 }
             }
             if matches!(method, Method::Authorize) {
@@ -814,35 +671,43 @@ async fn handle_conn(
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 };
-                if submit.extranonce2 != assigned.extranonce2
-                    || submit.ntime_hex_6b != assigned.ntime_hex_6b
-                {
+                if submit.ntime_hex_6b != assigned.ntime_hex_6b {
                     share_stats.rejected += 1;
-                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_extranonce2 = %submit.extranonce2, assigned_extranonce2 = %assigned.extranonce2, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: precomputed-mismatch");
-                    let err = StratumResponse::err(req_id.clone(), 20, "precomputed-mismatch");
+                    warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: ntime-mismatch");
+                    let err = StratumResponse::err(req_id.clone(), 20, "ntime-mismatch");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
                 let share_difficulty = assigned.share_difficulty;
-                let nonce_bytes = match hex::decode(&submit.nonce_hex_8b) {
-                    Ok(v) if v.len() == 8 => v,
-                    _ => {
-                        share_stats.errored += 1;
-                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-submit-shape (nonce)");
-                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
-                        send_json_line(&mut write_half, &err).await?;
-                        continue;
-                    }
-                };
-                let mut solved_header = assigned.header_160;
-                solved_header[44..52].copy_from_slice(&nonce_bytes);
-                if let Err(_) = validate_header_meets_difficulty(&solved_header, share_difficulty) {
+                if let Err(_) = validate_submit_meets_difficulty(
+                    &job,
+                    &session.extranonce1,
+                    &submit,
+                    share_difficulty,
+                ) {
                     share_stats.rejected += 1;
                     warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, difficulty = share_difficulty, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: low-difficulty-share");
                     let err = StratumResponse::err(req_id.clone(), 23, "low-difficulty-share");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
                 }
+
+                let solved_header = match build_precomputed_header(
+                    &job,
+                    &session.extranonce1,
+                    &submit.extranonce2,
+                    &submit.ntime_hex_6b,
+                    &submit.nonce_hex_8b,
+                ) {
+                    Ok(header) => header,
+                    Err(_) => {
+                        share_stats.errored += 1;
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-header");
+                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
+                        send_json_line(&mut write_half, &err).await?;
+                        continue;
+                    }
+                };
 
                 let meets_network_target =
                     validate_header_meets_target_hex(&solved_header, &job.network_target_hex)
@@ -899,7 +764,7 @@ async fn handle_conn(
                     continue;
                 }
 
-                let candidate_block = match build_candidate_block_from_header(&job, &solved_header)
+                let candidate_block = match build_candidate_block(&job, &session.extranonce1, &submit)
                 {
                     Ok(v) => v,
                     Err(_) => {

@@ -33,8 +33,6 @@ pub struct Config {
     pub conn_idle_timeout_secs: u64,
     pub max_jobs_cache: usize,
     pub job_refresh_secs: u64,
-    #[serde(default)]
-    pub emit_mining_notify_compat: bool,
     pub pool: PoolConfig,
 }
 
