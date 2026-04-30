@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bitcoinsuite_bitcoind_nng::{
-    Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
-    SubmitMinedBlockResult, ValidateMinedBlockProposalResult,
+    Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface, SubmitMinedBlockResult,
+    ValidateMinedBlockProposalResult,
 };
 use tracing::{debug, info, warn};
 
@@ -20,8 +20,11 @@ pub enum NodeEvent {
 /// implementation and ease testing/fault injection.
 #[async_trait]
 pub trait NodeMiningAdapter: Send + Sync {
-    async fn get_mining_template(&self, coinbase_script: Option<Vec<u8>>)
-        -> Result<MiningTemplate>;
+    async fn get_mining_template(
+        &self,
+        coinbase_script: Option<Vec<u8>>,
+        coinbase_identity: Option<Vec<u8>>,
+    ) -> Result<MiningTemplate>;
     async fn get_block_by_hash(&self, block_hash_hex_be: &str) -> Result<Block>;
     async fn submit_mined_block(&self, block: Vec<u8>) -> Result<SubmitMinedBlockResult>;
     async fn validate_proposal(&self, block: Vec<u8>) -> Result<ValidateMinedBlockProposalResult>;
@@ -94,10 +97,17 @@ impl NodeMiningAdapter for BitcoindNngAdapter {
     async fn get_mining_template(
         &self,
         coinbase_script: Option<Vec<u8>>,
+        coinbase_identity: Option<Vec<u8>>,
     ) -> Result<MiningTemplate> {
         let template = self
             .rpc
-            .get_mining_template(coinbase_script.as_deref(), 4, 4, true)
+            .get_mining_template(
+                coinbase_script.as_deref(),
+                coinbase_identity.as_deref(),
+                4,
+                4,
+                true,
+            )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(template)
     }

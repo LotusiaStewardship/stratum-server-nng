@@ -265,7 +265,10 @@ async fn refresh_job_from_node(
     reason: &str,
 ) -> Result<()> {
     let template = adapter
-        .get_mining_template(Some(pool_scripts.payout_script.clone()))
+        .get_mining_template(
+            Some(pool_scripts.payout_script.clone()),
+            pool_scripts.coinbase_identity_bytes.clone(),
+        )
         .await?;
     ensure_block_coinbase_payout_script(&template.block, &pool_scripts.payout_script).map_err(
         |e| {

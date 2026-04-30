@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bitcoinsuite_bitcoind_nng::encode_coinbase_identity_utf8;
 use bitcoinsuite_core::{ecc::SecKey, Hashed, LotusAddress, Script, Sha256};
 use clap::Parser;
 use serde::Deserialize;
@@ -47,6 +48,7 @@ pub struct PoolConfig {
 pub struct MiningIdentityConfig {
     pub payout_script_hex: Option<String>,
     pub payout_address: Option<String>,
+    pub coinbase_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +85,7 @@ pub struct ResolvedPoolScripts {
     pub payout_script: Vec<u8>,
     pub payout_fingerprint: String,
     pub fee_script: Option<Vec<u8>>,
+    pub coinbase_identity_bytes: Option<Vec<u8>>,
 }
 
 impl Config {
@@ -135,10 +138,20 @@ impl Config {
             validate_private_key_format(key)?;
         }
 
+        let coinbase_identity_bytes = self
+            .pool
+            .mining_identity
+            .coinbase_identity
+            .as_deref()
+            .map(encode_coinbase_identity_utf8)
+            .transpose()
+            .map_err(|e| anyhow!("invalid pool.mining_identity.coinbase_identity: {e}"))?;
+
         Ok(ResolvedPoolScripts {
             payout_fingerprint: script_fingerprint(&payout_script),
             payout_script,
             fee_script,
+            coinbase_identity_bytes,
         })
     }
 }

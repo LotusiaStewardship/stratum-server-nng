@@ -72,6 +72,10 @@ job_refresh_secs = 15
 payout_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # payout_script_hex = "76a914...88ac"
 
+# Optional UTF-8 pool/operator identity tag embedded in coinbase scriptSig.
+# This is metadata, not a payout destination.
+# coinbase_identity = "Lotusia Pool"
+
 [pool.fee]
 # Enable or disable pool fee collection.
 # When enabled, the fee is deducted from gross block reward before miner payouts.

@@ -46,7 +46,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
     loop {
         tokio::time::sleep(interval).await;
 
-        let tip_height = match adapter.get_mining_template(None).await {
+        let tip_height = match adapter.get_mining_template(None, None).await {
             Ok(t) => t.height as i64,
             Err(err) => {
                 error!(error = %err, "failed loading tip height for payout maturity sync");
@@ -175,7 +175,10 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             None,
         )?;
 
-        let submitted_txid = match bitcoind.cmd_json("sendrawtransaction", &[raw_tx.hex().into()]).await {
+        let submitted_txid = match bitcoind
+            .cmd_json("sendrawtransaction", &[raw_tx.hex().into()])
+            .await
+        {
             Ok(txid_json) => txid_json
                 .as_str()
                 .ok_or_else(|| anyhow!("sendrawtransaction returned non-string txid"))?
@@ -285,4 +288,3 @@ fn build_and_sign_payout_tx(
 
     Ok(tx_builder.sign(&ecc, 0, 0)?)
 }
-
