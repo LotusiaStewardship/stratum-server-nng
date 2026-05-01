@@ -2296,6 +2296,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "parking_lot",
  "primitive-types",
  "rand 0.8.6",
  "rusqlite",

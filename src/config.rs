@@ -23,11 +23,7 @@ pub struct Config {
     pub nng_rpc_url: String,
     pub nng_pub_url: String,
     pub bitcoind_rpc: BitcoindRpcConfig,
-    pub initial_difficulty: f64,
-    pub vardiff_target_secs: f64,
-    pub vardiff_retarget_secs: f64,
-    pub min_difficulty: f64,
-    pub max_difficulty: f64,
+    pub vardiff: VarDiffConfig,
     pub max_request_line_bytes: usize,
     pub per_conn_req_per_sec: u32,
     pub conn_idle_timeout_secs: u64,
@@ -80,6 +76,80 @@ pub struct BitcoindRpcConfig {
     pub rpc_pass: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct VarDiffConfig {
+    /// Ratio of network difficulty to pool difficulty.
+    /// pool_difficulty = network_difficulty / share_target_ratio
+    /// 
+    /// Rationale:
+    /// - Higher values = easier shares = more frequent submissions
+    /// - Lower values = harder shares = fewer submissions
+    /// - 100.0 is a good balance: pool shares are 100x easier than network blocks
+    /// - Typical range: 50-200 depending on desired share frequency
+    #[serde(default = "default_share_ratio")]
+    pub share_target_ratio: f64,
+    
+    /// Minimum pool difficulty (absolute floor).
+    /// 
+    /// Rationale:
+    /// - Prevents difficulty from crashing to near-zero on low-hashrate testnet
+    /// - Old default of 0.0000001 allowed difficulty to become meaningless
+    /// - 4.0 is a reasonable floor: high enough to prevent abuse, low enough
+    ///   for low-powered miners to contribute
+    /// - Should be significantly lower than typical network difficulty
+    #[serde(default = "default_min_diff")]
+    pub min_difficulty: f64,
+    
+    /// Maximum pool difficulty (absolute ceiling).
+    /// 
+    /// Rationale:
+    /// - Prevents pool difficulty from exceeding reasonable bounds
+    /// - 1_000_000.0 is high enough for any realistic scenario
+    /// - Protects against bugs or extreme network difficulty spikes
+    #[serde(default = "default_max_diff")]
+    pub max_difficulty: f64,
+    
+    /// Target time between accepted shares for vardiff tuning.
+    /// 
+    /// Rationale:
+    /// - Lower values (5-10s) = more shares, more precise hashrate estimation,
+    ///   more server load, more network traffic
+    /// - Higher values (30-60s) = fewer shares, less precision, less load
+    /// - 15.0 is a good balance for most deployments
+    /// - VarDiff adjusts per-miner from this target
+    #[serde(default = "default_target_secs")]
+    pub vardiff_target_secs: f64,
+    
+    /// How often vardiff is allowed to retarget per miner.
+    /// 
+    /// Rationale:
+    /// - Shorter intervals (30s) = faster adaptation to hashrate changes,
+    ///   but more volatile difficulty
+    /// - Longer intervals (120s+) = more stable difficulty, slower adaptation
+    /// - 90.0 provides good stability while allowing reasonable adaptation
+    /// - Should be significantly longer than vardiff_target_secs to allow
+    ///   enough samples for meaningful statistics
+    #[serde(default = "default_retarget_secs")]
+    pub vardiff_retarget_secs: f64,
+}
+
+fn default_share_ratio() -> f64 { 100.0 }
+fn default_min_diff() -> f64 { 4.0 }
+fn default_max_diff() -> f64 { 1_000_000.0 }
+fn default_target_secs() -> f64 { 15.0 }
+fn default_retarget_secs() -> f64 { 90.0 }
+
+impl VarDiffConfig {
+    pub fn validate(&self) -> Result<()> {
+        bitcoinsuite_bitcoind_stratum::validate_difficulty_config(
+            self.min_difficulty,
+            self.max_difficulty,
+            self.share_target_ratio,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid vardiff config: {}", e))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedPoolScripts {
     pub payout_script: Vec<u8>,
@@ -107,6 +177,7 @@ impl Config {
             anyhow::bail!("api_token required")
         }
         let _ = self.resolve_pool_scripts()?;
+        self.vardiff.validate()?;
         Ok(())
     }
 

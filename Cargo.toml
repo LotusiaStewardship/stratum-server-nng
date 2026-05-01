@@ -18,6 +18,7 @@ bitcoinsuite-ecc-secp256k1 = { path = "../bitcoinsuite/bitcoinsuite-ecc-secp256k
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+parking_lot = "0.12"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 serde = { version = "1", features = ["derive"] }

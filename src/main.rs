@@ -4,6 +4,8 @@ use stratum_server_nng::accounting::{AccountingDb, PayoutMethod};
 use stratum_server_nng::api::start_operator_api;
 use stratum_server_nng::config::{CliArgs, Config};
 use stratum_server_nng::payout::scheduler::run_payout_scheduler;
+use stratum_server_nng::stratum::diff_cache::DifficultyCache;
+use stratum_server_nng::stratum::network_diff::{DynamicDiffConfig, NetworkDifficultyTracker};
 use stratum_server_nng::stratum::server::{run_stratum_server, RuntimeStats};
 use tracing::info;
 
@@ -41,12 +43,27 @@ async fn main() -> Result<()> {
 
     let stats = std::sync::Arc::new(RuntimeStats::default());
 
+    // Initialize dynamic difficulty tracker
+    let diff_config = DynamicDiffConfig {
+        share_target_ratio: cfg.vardiff.share_target_ratio,
+        min_difficulty: cfg.vardiff.min_difficulty,
+        max_difficulty: cfg.vardiff.max_difficulty,
+    };
+    let tracker = NetworkDifficultyTracker::new(diff_config);
+    let diff_cache = DifficultyCache::new(tracker);
+    
+    info!(
+        share_target_ratio = cfg.vardiff.share_target_ratio,
+        min_difficulty = cfg.vardiff.min_difficulty,
+        max_difficulty = cfg.vardiff.max_difficulty,
+        "dynamic pool difficulty initialized"
+    );
+
     let api_db = db.clone();
     let api_bind = cfg.api_bind.clone();
     let api_token = cfg.api_token.clone();
 
     let api_stats = stats.clone();
-    let stratum_stats = stats.clone();
 
     let reconcile_db = db.clone();
     let reconcile_stats = stats.clone();
@@ -74,6 +91,9 @@ async fn main() -> Result<()> {
 
     let scheduler_cfg = cfg.clone();
     let scheduler_db = db.clone();
+    let stratum_cfg = cfg.clone();
+    let stratum_db = db.clone();
+    let stratum_diff_cache = diff_cache.clone();
 
     let api_task =
         tokio::spawn(
@@ -82,7 +102,7 @@ async fn main() -> Result<()> {
     let scheduler_task =
         tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
     let stratum_task =
-        tokio::spawn(async move { run_stratum_server(cfg, db, stratum_stats).await });
+        tokio::spawn(async move { run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache).await });
 
     let (api_res, stratum_res, _reconcile_res, scheduler_res) =
         tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task);

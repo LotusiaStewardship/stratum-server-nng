@@ -1,5 +1,7 @@
+pub mod diff_cache;
 pub mod engine;
 pub mod job;
+pub mod network_diff;
 pub mod protocol;
 pub mod server;
 pub mod validation;

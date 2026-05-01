@@ -1,6 +1,7 @@
 use crate::accounting::{AccountingDb, ShareOutcomeInsert};
 use crate::config::{Config, ResolvedPoolScripts};
 use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent, NodeMiningAdapter};
+use crate::stratum::diff_cache::DifficultyCache;
 use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
@@ -127,6 +128,7 @@ pub async fn run_stratum_server(
     cfg: Config,
     db: AccountingDb,
     stats: Arc<RuntimeStats>,
+    diff_cache: DifficultyCache,
 ) -> Result<()> {
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
@@ -141,6 +143,7 @@ pub async fn run_stratum_server(
         adapter.clone(),
         &pool_scripts,
         stats.clone(),
+        &diff_cache,
         true,
         "startup",
     )
@@ -156,6 +159,7 @@ pub async fn run_stratum_server(
     let pool_scripts_events = pool_scripts.clone();
     let stats_events = stats.clone();
     let db_events = db.clone();
+    let diff_cache_events = diff_cache.clone();
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
@@ -207,6 +211,7 @@ pub async fn run_stratum_server(
                     adapter_events_inner.clone(),
                     &pool_scripts_events,
                     stats_events.clone(),
+                    &diff_cache_events,
                     clean,
                     reason,
                 )
@@ -238,9 +243,10 @@ pub async fn run_stratum_server(
         let adapter = adapter.clone();
         let stats = stats.clone();
         let pool_scripts = pool_scripts.clone();
+        let diff_cache = diff_cache.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                handle_conn(socket, db, runtime, cfg, pool_scripts, adapter, stats).await
+                handle_conn(socket, db, runtime, cfg, pool_scripts, adapter, stats, diff_cache).await
             {
                 warn!(error = %err, peer = %peer_addr, "stratum connection closed with error");
             } else {
@@ -255,6 +261,7 @@ async fn refresh_job_from_node(
     adapter: Arc<dyn NodeMiningAdapter>,
     pool_scripts: &ResolvedPoolScripts,
     stats: Arc<RuntimeStats>,
+    diff_cache: &DifficultyCache,
     clean_jobs: bool,
     reason: &str,
 ) -> Result<()> {
@@ -264,6 +271,17 @@ async fn refresh_job_from_node(
             pool_scripts.coinbase_identity_bytes.clone(),
         )
         .await?;
+    
+    // Update difficulty cache with new template
+    let (old_diff, new_diff, significant) = diff_cache.update_template(&template);
+    if significant {
+        info!(
+            old_diff = %old_diff,
+            new_diff = %new_diff,
+            "network difficulty updated"
+        );
+    }
+    
     ensure_block_coinbase_payout_script(&template.block, &pool_scripts.payout_script).map_err(
         |e| {
             stats
@@ -408,23 +426,37 @@ async fn handle_conn(
     pool_scripts: ResolvedPoolScripts,
     adapter: Arc<dyn NodeMiningAdapter>,
     stats: Arc<RuntimeStats>,
+    diff_cache: DifficultyCache,
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
     session.extranonce1 = format!("{:08x}", thread_rng().r#gen::<u32>());
+    
+    // Get current pool difficulty for this miner's baseline
+    let baseline_diff = diff_cache.pool_diff();
+    
+    // Initialize VarDiff with dynamic baseline
     let mut vardiff = VarDiff::new(
-        cfg.initial_difficulty,
-        cfg.min_difficulty,
-        cfg.max_difficulty,
-        cfg.vardiff_target_secs,
-        cfg.vardiff_retarget_secs,
+        baseline_diff,
+        cfg.vardiff.min_difficulty,
+        cfg.vardiff.max_difficulty,
+        cfg.vardiff.vardiff_target_secs,
+        cfg.vardiff.vardiff_retarget_secs,
     );
 
-    info!(session_id = %session_id, "stratum session started");
+    info!(
+        session_id = %session_id,
+        baseline_diff = baseline_diff,
+        network_diff = diff_cache.network_diff(),
+        "stratum session started with dynamic difficulty"
+    );
 
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
     let mut pub_rx = runtime.subscribe();
+    
+    // Subscribe to difficulty updates from network
+    let mut diff_rx = diff_cache.subscribe();
 
     let mut pending_difficulty: Option<f64> = None;
     let mut assigned_jobs: HashMap<String, AssignedJob> = HashMap::new();
@@ -455,6 +487,22 @@ async fn handle_conn(
             }
         }
 
+        // Check for difficulty updates from network (non-blocking)
+        while let Ok(new_diff) = diff_rx.try_recv() {
+            info!(
+                session_id = %session_id,
+                old_diff = vardiff.current,
+                new_diff = new_diff,
+                "difficulty updated from network"
+            );
+            vardiff.current = new_diff;
+            // Send updated difficulty to miner
+            if let Err(e) = send_set_difficulty(&mut write_half, new_diff).await {
+                warn!(session_id = %session_id, error = %e, "failed to send difficulty update");
+                break;
+            }
+        }
+        
         if req_window_start.elapsed().as_secs() >= 1 {
             req_window_start = std::time::Instant::now();
             req_count = 0;
