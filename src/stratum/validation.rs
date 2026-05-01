@@ -101,6 +101,15 @@ pub fn build_candidate_block(
     extranonce1: &str,
     sub: &NativeSubmit,
 ) -> anyhow::Result<Vec<u8>> {
+    // Deserialize the template block first to get the height, epoch_hash, and extended_metadata_hash
+    let mut block = LotusBlock::deser(&mut Bytes::from_slice(&job.template_block))
+        .map_err(|e| anyhow::anyhow!("block deser error: {}", e))?;
+    
+    // Preserve header fields that aren't provided by stratum
+    let preserved_height = block.header.height;
+    let preserved_epoch_hash = block.header.epoch_hash.clone();
+    let preserved_extended_metadata_hash = block.header.extended_metadata_hash.clone();
+    
     // Build the header using the shared primitive
     let header_bytes = build_stratum_header(
         &job.coinbase1,
@@ -116,12 +125,14 @@ pub fn build_candidate_block(
     )
     .map_err(|e| anyhow::anyhow!("header build error: {}", e))?;
 
-    let mut block = LotusBlock::deser(&mut Bytes::from_slice(&job.template_block))
-        .map_err(|e| anyhow::anyhow!("block deser error: {}", e))?;
-
     let mut header_bytes_for_deser = Bytes::from_slice(&header_bytes);
     block.header = LotusHeader::deser(&mut header_bytes_for_deser)
         .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?;
+    
+    // Restore preserved header fields
+    block.header.height = preserved_height;
+    block.header.epoch_hash = preserved_epoch_hash;
+    block.header.extended_metadata_hash = preserved_extended_metadata_hash;
 
     // Rebuild coinbase with extranonce
     let coinbase_hex = format!(
@@ -137,8 +148,16 @@ pub fn build_candidate_block(
     }
     block.txs[0] = coinbase_tx;
     block.update_merkle_root();
-
-    Ok(block.ser().as_ref().to_vec())
+    
+    // Update the block size field in the header to match the actual serialized size.
+    // The size is encoded as 7 bytes little-endian in the header, so the serialized
+    // size will be constant regardless of the size value. We serialize once to get
+    // the size, set it, then serialize again.
+    let first_serialization = block.ser();
+    block.header.size = first_serialization.len() as u64;
+    let final_serialization = block.ser();
+    
+    Ok(final_serialization.as_ref().to_vec())
 }
 
 pub fn share_target_hex_for_difficulty(difficulty: f64) -> anyhow::Result<String> {

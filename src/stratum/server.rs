@@ -664,31 +664,37 @@ async fn handle_conn(
                     continue;
                 }
 
-                let solved_header = match bitcoinsuite_bitcoind_stratum::build_stratum_header(
-                    &job.coinbase1,
+                // Build the full candidate block first (preserves height, epoch_hash, etc.)
+                let candidate_block = match build_candidate_block(
+                    &job,
                     &session.extranonce1,
-                    &submit.extranonce2,
-                    &job.coinbase2,
-                    &job.merkle_branches,
-                    &job.prevhash,
-                    &job.version,
-                    &job.nbits,
-                    &submit.ntime_hex_6b,
-                    &submit.nonce_hex_8b,
+                    &submit,
                 ) {
-                    Ok(header) => header,
+                    Ok(v) => v,
                     Err(_) => {
                         share_stats.errored += 1;
-                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-header");
-                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
+                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-candidate block assembly");
+                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
                         send_json_line(&mut write_half, &err).await?;
                         continue;
                     }
                 };
 
-                let meets_network_target =
-                    validate_header_meets_target_hex(&solved_header, &job.network_target_hex)
-                        .is_ok();
+                // Extract header from candidate block and validate against network target
+                let meets_network_target = {
+                    let mut block_bytes = Bytes::from_slice(&candidate_block);
+                    let block = match LotusBlock::deser(&mut block_bytes) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            share_stats.errored += 1;
+                            warn!(session_id = %session_id, req_id = %req_id, "candidate block deserialization failed");
+                            continue;
+                        }
+                    };
+                    let header_bytes = block.header.ser();
+                    validate_header_meets_target_hex(header_bytes.as_ref(), &job.network_target_hex)
+                        .is_ok()
+                };
                 if !meets_network_target {
                     let dedupe_key = format!(
                         "{}:{}:{}:{}:{}:{}",
@@ -741,20 +747,7 @@ async fn handle_conn(
                     continue;
                 }
 
-                let candidate_block = match build_candidate_block(
-                    &job,
-                    &session.extranonce1,
-                    &submit,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        share_stats.errored += 1;
-                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-candidate block assembly");
-                        let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
-                        send_json_line(&mut write_half, &err).await?;
-                        continue;
-                    }
-                };
+                // candidate_block already built above for target validation
 
                 if let Err(err) = ensure_block_coinbase_payout_script(
                     &candidate_block,
