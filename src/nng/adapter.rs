@@ -1,6 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use bitcoinsuite_bitcoind_nng::{Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface};
+use bitcoinsuite_bitcoind_nng::{
+    Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
+};
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, Sha256d};
 use tracing::{debug, info, warn};
 
@@ -98,7 +100,6 @@ impl JsonRpcClient {
 pub enum NodeEvent {
     UpdateBlkTip,
     MempoolRefresh,
-    MiningWorkChanged,
     BlockDisconnected,
 }
 
@@ -141,13 +142,10 @@ impl NngAdapter {
             .subscribe("mempooltxrem")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         pubif
-            .subscribe("miningwrkchg")
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        pubif
             .subscribe("blkdisconctd")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        info!("NNG pub subscriptions active: updateblktip,mempooltxadd,mempooltxrem,miningwrkchg,blkdisconctd");
+        info!("NNG pub subscriptions active: updateblktip,mempooltxadd,mempooltxrem,blkdisconctd");
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             loop {
@@ -163,7 +161,6 @@ impl NngAdapter {
                 match topic {
                     "updateblktip" => on_event(NodeEvent::UpdateBlkTip),
                     "mempooltxadd" | "mempooltxrem" => on_event(NodeEvent::MempoolRefresh),
-                    "miningwrkchg" => on_event(NodeEvent::MiningWorkChanged),
                     "blkdisconctd" => on_event(NodeEvent::BlockDisconnected),
                     _ => warn!(topic, "unknown NNG topic ignored"),
                 }

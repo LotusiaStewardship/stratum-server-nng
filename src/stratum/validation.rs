@@ -114,7 +114,7 @@ pub fn build_candidate_block(
     // Deserialize the template block to get the template-specific header fields
     let mut block = LotusBlock::deser(&mut Bytes::from_slice(&job.template_block))
         .map_err(|e| anyhow::anyhow!("block deser error: {}", e))?;
-    
+
     // Build the header with the precomputed block size
     let header_bytes = build_stratum_header(
         &job.coinbase1,
@@ -146,12 +146,12 @@ pub fn build_candidate_block(
     let coinbase_bytes = hex::decode(&coinbase_hex)?;
     let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
     let coinbase_tx = Tx::deser(&mut coinbase_buf)?;
-    
+
     if block.txs.is_empty() {
         anyhow::bail!("template block has no txs")
     }
     block.txs[0] = coinbase_tx;
-    
+
     // Verify merkle root matches
     let expected_merkle_root = block.header.merkle_root.clone();
     block.update_merkle_root();
@@ -162,7 +162,7 @@ pub fn build_candidate_block(
             block.header.merkle_root.to_hex_be()
         );
     }
-    
+
     let final_serialization = block.ser();
     Ok(final_serialization.as_ref().to_vec())
 }
@@ -182,7 +182,7 @@ pub fn build_candidate_block_with_stratum_hash(
     // Deserialize template block
     let mut block = LotusBlock::deser(&mut Bytes::from_slice(&job.template_block))
         .map_err(|e| anyhow::anyhow!("block deser error: {}", e))?;
-    
+
     // Build header with all template fields including the precomputed block size.
     // The block size is deterministic because the coinbase size is constant
     // regardless of extranonce values (extranonce1 + extranonce2 = fixed 8 bytes).
@@ -215,12 +215,12 @@ pub fn build_candidate_block_with_stratum_hash(
     );
     let coinbase_bytes = hex::decode(&coinbase_hex)?;
     let coinbase_tx = Tx::deser(&mut Bytes::from_slice(&coinbase_bytes))?;
-    
+
     if block.txs.is_empty() {
         anyhow::bail!("template block has no txs");
     }
     block.txs[0] = coinbase_tx;
-    
+
     // Verify merkle root matches
     let expected_merkle_root = block.header.merkle_root.clone();
     block.update_merkle_root();
@@ -231,14 +231,18 @@ pub fn build_candidate_block_with_stratum_hash(
             block.header.merkle_root.to_hex_be()
         );
     }
-    
+
     // Compute hash with the correct size already in the header
     let final_hash_hex = block.header.calc_hash().to_hex_be();
     let final_merkle_root_hex = block.header.merkle_root.to_hex_be();
-    
+
     let serialized_block = block.ser();
-    
-    Ok((serialized_block.as_ref().to_vec(), final_hash_hex, final_merkle_root_hex))
+
+    Ok((
+        serialized_block.as_ref().to_vec(),
+        final_hash_hex,
+        final_merkle_root_hex,
+    ))
 }
 
 /// Convert a difficulty to its target representation in hex (big-endian).
@@ -260,10 +264,10 @@ pub fn validate_header_meets_target_hex(header: &[u8], target_hex_be: &str) -> a
     let mut hash_be = [0u8; 32];
     hash_be.copy_from_slice(hash.as_ref());
     hash_be.reverse();
-    
+
     let hash_u256 = U256::from_big_endian(&hash_be);
     let target_u256 = U256::from_big_endian(&target);
-    
+
     if hash_u256 > target_u256 {
         anyhow::bail!("high-hash");
     }

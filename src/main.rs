@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     };
     let tracker = NetworkDifficultyTracker::new(diff_config);
     let diff_cache = DifficultyCache::new(tracker);
-    
+
     info!(
         share_target_ratio = cfg.vardiff.share_target_ratio,
         min_difficulty = cfg.vardiff.min_difficulty,
@@ -105,8 +105,9 @@ async fn main() -> Result<()> {
         );
     let scheduler_task =
         tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
-    let stratum_task =
-        tokio::spawn(async move { run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache).await });
+    let stratum_task = tokio::spawn(async move {
+        run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache).await
+    });
 
     let (api_res, stratum_res, _reconcile_res, scheduler_res) =
         tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task);

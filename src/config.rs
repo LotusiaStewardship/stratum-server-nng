@@ -80,7 +80,7 @@ pub struct BitcoindRpcConfig {
 pub struct VarDiffConfig {
     /// Ratio of network difficulty to pool difficulty.
     /// pool_difficulty = network_difficulty / share_target_ratio
-    /// 
+    ///
     /// Rationale:
     /// - Higher values = easier shares = more frequent submissions
     /// - Lower values = harder shares = fewer submissions
@@ -88,9 +88,9 @@ pub struct VarDiffConfig {
     /// - Typical range: 50-200 depending on desired share frequency
     #[serde(default = "default_share_ratio")]
     pub share_target_ratio: f64,
-    
+
     /// Minimum pool difficulty (absolute floor).
-    /// 
+    ///
     /// Rationale:
     /// - Prevents difficulty from crashing to near-zero on low-hashrate testnet
     /// - Old default of 0.0000001 allowed difficulty to become meaningless
@@ -99,18 +99,18 @@ pub struct VarDiffConfig {
     /// - Should be significantly lower than typical network difficulty
     #[serde(default = "default_min_diff")]
     pub min_difficulty: f64,
-    
+
     /// Maximum pool difficulty (absolute ceiling).
-    /// 
+    ///
     /// Rationale:
     /// - Prevents pool difficulty from exceeding reasonable bounds
     /// - 1_000_000.0 is high enough for any realistic scenario
     /// - Protects against bugs or extreme network difficulty spikes
     #[serde(default = "default_max_diff")]
     pub max_difficulty: f64,
-    
+
     /// Maximum allowed pool difficulty change per update.
-    /// 
+    ///
     /// Rationale:
     /// - Prevents sudden difficulty jumps from destabilizing miners
     /// - 0.5 = 50% max change per update (industry standard)
@@ -118,9 +118,9 @@ pub struct VarDiffConfig {
     /// - Higher values (0.67-1.0) = faster adaptation, more volatile
     #[serde(default = "default_max_change_pct")]
     pub max_change_pct: f64,
-    
+
     /// Target time between accepted shares for vardiff tuning.
-    /// 
+    ///
     /// Rationale:
     /// - Lower values (5-10s) = more shares, more precise hashrate estimation,
     ///   more server load, more network traffic
@@ -129,9 +129,9 @@ pub struct VarDiffConfig {
     /// - VarDiff adjusts per-miner from this target
     #[serde(default = "default_target_secs")]
     pub vardiff_target_secs: f64,
-    
+
     /// How often vardiff is allowed to retarget per miner.
-    /// 
+    ///
     /// Rationale:
     /// - Shorter intervals (30s) = faster adaptation to hashrate changes,
     ///   but more volatile difficulty
@@ -143,17 +143,31 @@ pub struct VarDiffConfig {
     pub vardiff_retarget_secs: f64,
 }
 
-fn default_share_ratio() -> f64 { 100.0 }
-fn default_min_diff() -> f64 { 0.5 }
-fn default_max_diff() -> f64 { 1_000_000.0 }
-fn default_max_change_pct() -> f64 { 0.5 }
-fn default_target_secs() -> f64 { 15.0 }
-fn default_retarget_secs() -> f64 { 90.0 }
+fn default_share_ratio() -> f64 {
+    100.0
+}
+fn default_min_diff() -> f64 {
+    0.5
+}
+fn default_max_diff() -> f64 {
+    1_000_000.0
+}
+fn default_max_change_pct() -> f64 {
+    0.5
+}
+fn default_target_secs() -> f64 {
+    15.0
+}
+fn default_retarget_secs() -> f64 {
+    90.0
+}
 
 impl VarDiffConfig {
     pub fn validate(&self) -> Result<()> {
         if self.max_change_pct <= 0.0 || self.max_change_pct > 1.0 {
-            return Err(anyhow::anyhow!("max_change_pct must be between 0.0 and 1.0"));
+            return Err(anyhow::anyhow!(
+                "max_change_pct must be between 0.0 and 1.0"
+            ));
         }
         bitcoinsuite_bitcoind_stratum::validate_difficulty_config(
             self.min_difficulty,

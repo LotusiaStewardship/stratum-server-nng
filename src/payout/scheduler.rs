@@ -10,7 +10,7 @@ use bitcoinsuite_core::{
 };
 use bitcoinsuite_ecc_secp256k1::EccSecp256k1;
 
-use crate::nng::adapter::{BitcoindMiningAdapter, JsonRpcClient, NodeMiningAdapter, NngAdapter};
+use crate::nng::adapter::{BitcoindMiningAdapter, JsonRpcClient, NngAdapter, NodeMiningAdapter};
 
 use crate::{
     accounting::AccountingDb,
@@ -231,7 +231,8 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
 }
 
 fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
-    SecKey::from_hex_or_wif(private_key.trim()).map_err(|e| anyhow::anyhow!("invalid private key: {e}"))
+    SecKey::from_hex_or_wif(private_key.trim())
+        .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))
 }
 
 fn build_and_sign_payout_tx(
