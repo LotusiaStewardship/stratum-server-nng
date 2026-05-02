@@ -55,7 +55,8 @@ impl VarDiff {
             return None;
         }
         // Prevent short bursty share windows from causing runaway difficulty jumps.
-        ratio = ratio.clamp(0.5, 2.0);
+        // Industry standard: ±50% max change (0.67-1.5 range)
+        ratio = ratio.clamp(0.67, 1.5);
         let mut new_diff = self.current * ratio;
         if !new_diff.is_finite() {
             return None;
@@ -81,12 +82,14 @@ mod tests {
     fn vardiff_resets_window_after_retarget() {
         let mut vd = VarDiff::new(1.0, 0.1, 100.0, 15.0, 90.0);
 
-        // Fast shares at diff=1 would previously jump straight to 5.
+        // Fast shares at diff=1 (every 3s, target is 15s)
+        // Would jump to 5.0 without clamping, but clamped to 1.5x max
         for t in [0, 3, 6, 9, 12] {
             vd.record_share(t);
         }
         let d1 = vd.maybe_retarget(90).unwrap();
-        assert!((d1 - 2.0).abs() < 1e-9);
+        // With 0.67-1.5 clamping: ratio=5.0 clamped to 1.5, so new_diff = 1.0 * 1.5 = 1.5
+        assert!((d1 - 1.5).abs() < 1e-9);
 
         // Post-retarget shares come in around target interval; diff should stay bounded,
         // not compound from old low-diff history.

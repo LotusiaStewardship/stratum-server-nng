@@ -1,321 +1,616 @@
 # stratum-server-nng
 
-Rust Stratum V1 pooled mining server for Lotus.
+Production-grade Stratum V1 pool server for Lotus blockchain using NNG (Nanomsg Next Generation) endpoints.
 
-This service uses **lotusd NNG RPC + NNG Pub/Sub** as its node-control plane, and stores pool accounting state in SQLite.
+## Overview
 
----
+`stratum-server-nng` is a high-performance mining pool server that connects Lotus miners to the Lotus network. It provides:
 
-## 1) What this server does at runtime
+- **Stratum V1 protocol** compatibility with existing mining hardware and software
+- **Dynamic difficulty adjustment** that tracks network difficulty automatically
+- **PPLNS (Pay Per Last N Shares)** payout scheme for fair reward distribution
+- **SQLite-based accounting** for shares, rounds, found blocks, and payouts
+- **NNG integration** for efficient communication with lotusd nodes
+- **Operator API** for monitoring and management
+- **Automatic payout scheduling** with internal transaction signing
 
-At a high level, the process runs three concurrent loops:
+## Architecture
 
-1. **Stratum TCP loop** (`--stratum-bind`)
-   - accepts miner sockets
-   - handles `subscribe/authorize/submit/ping`
-   - pushes `lotus.precomputed_work` and `mining.set_difficulty`
+### NNG Event-Driven Template Refresh
 
-2. **Operator API loop** (`--api-bind`)
-   - exposes health + admin read endpoints
-   - token-auth protected (except `/healthz` and `/readyz`)
+The Stratum server uses a **pub/sub notification + RPC fetch** pattern for mining template updates:
 
-3. **Job refresh loop**
-   - receives NNG pub events (`updateblktip`, `mempooltxadd`, `mempooltxrem`, `miningwrkchg`, `blkdisconctd`)
-   - fetches consensus-derived templates via `GetMiningTemplateRequest`
-   - builds per-session **precomputed Lotus work objects** and fans them out to connected miners
-   - also performs periodic template refresh ticks
-   - marks pending found blocks orphaned on `blkdisconctd`
+1. **NNG Pub/Sub** - Subscribes to lightweight event notifications from lotusd:
+   - `updateblktip` - New block found, template must refresh
+   - `miningwrkchg` - Mining work changed (e.g., difficulty adjustment)
+   - `mempooltxadd` / `mempooltxrem` - Mempool changes affecting coinbase
+   - `blkdisconctd` - Chain reorganization, template invalid
 
-All accepted shares are written idempotently into SQLite (`shares.dedupe_key`).
+2. **RPC Fetch** - On receiving any notification, the server fetches the full `MiningTemplate` via NNG RPC:
+   - `prev_hash_stratum` - Previous block hash for miners
+   - `coinbase1` / `coinbase2` - Coinbase transaction parts
+   - `merkle_branches` - Transaction merkle path
+   - `nbits_stratum`, `ntime_stratum` - Block header fields
+   - `target` - Network difficulty target
+   - `block` - Serialized block template
+   - `height`, `template_id` - Block metadata
 
----
+**Why this design?** The pub/sub channel transmits only event **topics** (strings), not heavy template payloads. This keeps the notification path lightweight while allowing on-demand template fetches with full control over parameters (payout script, coinbase identity).
 
-## 2) Runtime model (important concepts)
-
-### Job + template epoch
-
-- Every generated job gets a monotonic `template_epoch`.
-- `template_epoch` is used to reason about work freshness and staleness.
-- Job IDs are derived as `job-<template_id>-<template_epoch>`.
-- `template_id` comes from lotusd `GetMiningTemplateResponse`.
-
-### Worker identity format
-
-Workers are strictly parsed as:
-
-```text
-<lotus_address>[.<worker>]
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                        stratum-server-nng                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │   Stratum    │  │  Operator    │  │   Payout     │          │
+│  │    Server    │  │     API      │  │  Scheduler   │          │
+│  │  (TCP:3334)  │  │ (TCP:18080)  │  │  (Hourly)    │          │
+│  └──────┬───────┘  └──────────────┘  └──────┬───────┘          │
+│         │                                    │                   │
+│  ┌──────▼────────────────────────────────────▼───────┐          │
+│  │              Accounting Database                   │          │
+│  │         (SQLite: stratum-accounting)              │          │
+│  │  - workers, shares, rounds, found_blocks          │          │
+│  │  - payout_batches, schema_migrations              │          │
+│  └──────┬────────────────────────────────────┬───────┘          │
+│         │                                    │                   │
+│  ┌──────▼───────────┐              ┌─────────▼────────┐         │
+│  │  NNG Adapter     │              │  Bitcoind RPC    │         │
+│  │  - RPC (ipc/tcp) │              │  - sendrawtx     │         │
+│  │  - Pub/Sub       │              │  - getrawtx      │         │
+│  │                  │              │                  │         │
+│  │  Pub/Sub events: │              │                  │         │
+│  │  • updateblktip  │              │                  │         │
+│  │  • miningwrkchg  │──fetches──►  │  MiningTemplate  │         │
+│  │  • mempooltxadd  │  template    │  (full payload)  │         │
+│  │  • blkdisconctd  │              │                  │         │
+│  └──────────────────┘              └──────────────────┘         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+         │                                    │
+         ▼                                    ▼
+┌─────────────────┐                 ┌─────────────────┐
+│    lotusd       │                 │    lotusd       │
+│  NNG Endpoints  │                 │  JSON-RPC API   │
+│  - nngrpc.pipe  │                 │  (port 10604)   │
+│  - nngpub.pipe  │                 │                 │
+└─────────────────┘                 └─────────────────┘
+```
+
+## Directory Structure
+
+```
+stratum-server-nng/
+├── src/
+│   ├── main.rs              # Entry point, task orchestration
+│   ├── config.rs            # Configuration loading and validation
+│   ├── lib.rs               # Library exports
+│   ├── stratum/             # Stratum protocol implementation
+│   │   ├── server.rs        # TCP server, connection handling
+│   │   ├── engine.rs        # Request/response handling
+│   │   ├── protocol.rs      # Stratum V1 protocol types
+│   │   ├── job.rs           # Mining job management
+│   │   ├── validation.rs    # Share and block validation
+│   │   ├── vardiff.rs       # Variable difficulty algorithm
+│   │   ├── network_diff.rs  # Network difficulty tracking
+│   │   ├── diff_cache.rs    # Difficulty broadcast cache
+│   │   └── mod.rs
+│   ├── accounting/          # SQLite accounting layer
+│   │   ├── sqlite.rs        # Database operations
+│   │   ├── models.rs        # Data models
+│   │   └── mod.rs
+│   ├── api/                 # Operator HTTP API
+│   │   ├── mod.rs           # Axum routes and handlers
+│   │   └── ...
+│   ├── payout/              # Payout scheduling and signing
+│   │   ├── scheduler.rs     # Payout automation
+│   │   ├── mod.rs           # PPLNS plan building
+│   │   └── ...
+│   └── nng/                 # NNG integration
+│       ├── adapter.rs       # Bitcoind NNG adapter
+│       └── mod.rs
+├── config.toml              # Runtime configuration
+├── config.example.toml      # Configuration template
+├── Cargo.toml               # Rust dependencies
+├── docs/                    # Documentation
+│   ├── plans/               # Implementation plans
+│   └── ...
+└── tests/                   # Integration tests
+```
+
+## Configuration
+
+Copy `config.example.toml` to `config.toml` and adjust for your environment.
+
+### Top-Level Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `debug` | bool | `false` | Enable debug-level logging |
+| `stratum_bind` | string | `"0.0.0.0:3334"` | TCP bind address for miner connections |
+| `api_bind` | string | `"127.0.0.1:18080"` | TCP bind address for operator API |
+| `api_token` | string | required | Bearer token for API authentication |
+| `sqlite_path` | string | `"./stratum-accounting.sqlite3"` | Path to SQLite database |
+| `nng_rpc_url` | string | required | lotusd NNG RPC endpoint (e.g., `ipc://datadir/nngrpc.pipe`) |
+| `nng_pub_url` | string | required | lotusd NNG Pub/Sub endpoint (e.g., `ipc://datadir/nngpub.pipe`) |
+| `max_request_line_bytes` | int | `8192` | Maximum Stratum request line size |
+| `per_conn_req_per_sec` | int | `128` | Rate limit per connection (requests/second) |
+| `conn_idle_timeout_secs` | int | `180` | Disconnect idle connections after this duration |
+| `max_jobs_cache` | int | `512` | Maximum mining jobs kept in memory |
+| `job_refresh_secs` | int | `15` | Template refresh interval from lotusd |
+
+### VarDiff Configuration (`[vardiff]`)
+
+Dynamic difficulty adjustment parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `share_target_ratio` | float | `100.0` | Ratio of network difficulty to pool difficulty. Higher = easier shares. Typical range: 50-200 |
+| `min_difficulty` | float | `4.0` | Minimum pool difficulty (absolute floor). Prevents crash to near-zero |
+| `max_difficulty` | float | `1000000.0` | Maximum pool difficulty (ceiling). Protects against extreme spikes |
+| `vardiff_target_secs` | float | `15.0` | Target time between accepted shares. Lower = more shares, more precision |
+| `vardiff_retarget_secs` | float | `90.0` | How often vardiff adjusts per miner. Should be > vardiff_target_secs |
+
+**Rationale for defaults:**
+- `share_target_ratio: 100.0` means pool shares are 100x easier than network blocks
+- `min_difficulty: 4.0` prevents the difficulty crash that occurred with the old 0.0000001 default
+- `vardiff_target_secs: 15.0` provides a good balance between precision and server load
+- `vardiff_retarget_secs: 90.0` allows ~6 samples for stable statistical adjustment
+
+### Pool Configuration (`[pool]`)
+
+#### Mining Identity (`[pool.mining_identity]`)
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `payout_address` | string | ✅ (or `payout_script_hex`) | Lotus address for block subsidies |
+| `payout_script_hex` | string | ✅ (or `payout_address`) | Raw scriptPubKey hex for payouts |
+| `coinbase_identity` | string | optional | UTF-8 tag embedded in coinbase scriptSig (e.g., `"Lotusia Pool"`) |
+
+**Important:** The payout script must NOT be OP_RETURN/nulldata. The server validates this on startup.
+
+#### Fee Configuration (`[pool.fee]`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable pool fee collection |
+| `fee_bps` | int | `100` | Fee in basis points (100 = 1.00%, max 10000) |
+| `fee_address` | string | ✅ (if enabled) | Lotus address for fee collection |
+| `fee_script_hex` | string | ✅ (if enabled) | Raw scriptPubKey hex for fees |
+
+#### PPLNS Configuration (`[pool.pplns]`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `n_multiplier` | float | `1.0` | PPLNS window size multiplier. 1.0 ≈ one block's worth of work |
+| `min_payout_sat` | int | `546` | Minimum payout per miner (dust threshold) |
+| `payout_interval_secs` | int | `3600` | Scheduler run interval (seconds) |
+| `min_confirmations` | int | `100` | Confirmations before payout eligibility (enforced minimum: 100) |
+
+**PPLNS window behavior:**
+- `n_multiplier: 1.0` = window covers ~1 block of work
+- `n_multiplier: 2.0` = window covers ~2 blocks (more smoothing, slower response)
+- Larger values reduce variance but slow responsiveness to hashrate changes
+
+#### Signing Configuration (`[pool.signing]`)
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mode` | string | `"internal"` | Signing mode (currently only `internal` supported) |
+| `private_key` | string | ✅ (for internal) | Private key for payout signing (32-byte hex or WIF format) |
+
+**Security note:** The private key is used only for signing payout transactions. Never log this value. Prefer loading from a secure file or secret store.
+
+### Bitcoind RPC Configuration (`[bitcoind_rpc]`)
+
+Used for raw transaction broadcast (payout submission):
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | required | JSON-RPC endpoint (e.g., `http://127.0.0.1:10604`) |
+| `rpc_user` | string | required | RPC username |
+| `rpc_pass` | string | required | RPC password |
+
+## Operator API
+
+The operator API provides monitoring and management endpoints. All endpoints except `/healthz` require Bearer token authentication.
+
+### Authentication
+
+Include the `Authorization` header with your configured token:
+
+```bash
+curl -H "Authorization: Bearer devtoken" http://127.0.0.1:18080/status
+```
+
+### Endpoints
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/healthz` | ❌ | Health check (always returns 200) |
+| `GET` | `/readyz` | ❌ | Readiness check (checks DB availability) |
+| `GET` | `/status` | ✅ | Full status snapshot with stats |
+| `GET` | `/workers` | ✅ | List workers (last 100) |
+| `GET` | `/rounds` | ✅ | List recent rounds (last 100) |
+| `GET` | `/shares` | ✅ | List recent shares (last 100) |
+| `GET` | `/payouts` | ✅ | List recent payout batches (last 100) |
+| `GET` | `/workers/summary` | ✅ | Worker accounting summary with accepted/rejected/stale counts |
+| `GET` | `/shares/rejected-reasons` | ✅ | Breakdown of rejected share reasons |
+| `GET` | `/reconciliation/missing-found-blocks` | ✅ | Found blocks with missing persistence (reconciliation) |
+
+### Example: Status Response
+
+```json
+{
+  "status": "ok",
+  "payout_method": "pplns",
+  "idle_disconnects": 42,
+  "rate_limit_disconnects": 3,
+  "template_payout_mismatch_total": 0,
+  "candidate_payout_mismatch_total": 0,
+  "found_block_persist_ok_total": 5,
+  "found_block_persist_error_total": 0,
+  "found_block_observed_not_persisted_total": 0,
+  "found_blocks": {
+    "pending": 2,
+    "matured": 1,
+    "orphaned": 0,
+    "paid": 2
+  },
+  "payout_batches": {
+    "planned": 1,
+    "signed": 0,
+    "submitted": 0,
+    "confirmed": 0,
+    "invalidated_orphan": 0,
+    "failed": 0
+  },
+  "latest_payout_batch_status": "confirmed",
+  "latest_payout_batch_txid": "abc123...",
+  "scheduler": {
+    "matured_found_blocks_ready": 1,
+    "retry_ready_batches": 0,
+    "next_retry_at": null
+  }
+}
+```
+
+## Database Schema
+
+The SQLite database tracks all accounting state. Key tables:
+
+### `workers`
+- `id` - Primary key
+- `payout_address` - Lotus address
+- `worker_suffix` - Optional worker identifier (e.g., `rig1`, `worker-abc`)
+- `created_at` - Timestamp
+
+### `shares`
+- `id` - Primary key
+- `worker_id` - Foreign key to workers
+- `template_id` - Mining template ID
+- `difficulty` - Share difficulty
+- `accepted` - 1 if accepted, 0 if rejected
+- `stale` - 1 if stale, 0 if not
+- `dedupe_key` - Unique key for deduplication
+- `created_at` - Timestamp
+
+### `rounds`
+- `id` - Primary key
+- `start_template_id` - Round start template
+- `end_template_id` - Round end template (when found)
+- `found_block_hash` - Block hash if found
+- `created_at` - Timestamp
+
+### `found_blocks`
+- `id` - Primary key
+- `round_id` - Foreign key to rounds
+- `block_hash` - Unique block hash
+- `height` - Block height
+- `status` - `pending`, `matured`, `orphaned`, `paid`
+- `confirmations` - Number of confirmations
+- `template_id` - Template that found the block
+- `worker_id` - Worker that found the block
+- `worker_name` - Worker name at find time
+- `payout_address` - Payout address at find time
+- `persist_source` - How the block was persisted
+- `created_at` - Timestamp
+
+### `payout_batches`
+- `id` - Primary key
+- `found_block_id` - Foreign key to found_blocks
+- `retry_key` - Idempotency key for retries
+- `gross_reward_sat` - Total reward in satoshis
+- `fee_sat` - Pool fee in satoshis
+- `net_reward_sat` - Net reward after fees
+- `status` - `planned`, `signed`, `submitted`, `confirmed`, `failed`
+- `submitted_txid` - Transaction ID if submitted
+- `error` - Error message if failed
+- `retry_at` - Scheduled retry time
+- `created_at` - Timestamp
+
+## Stratum Protocol
+
+Implements Stratum V1 protocol with the following methods:
+
+### Client → Server
+
+- `mining.subscribe` - Subscribe to mining notifications
+- `mining.authorize` - Authenticate worker (format: `address.workerSuffix`)
+- `mining.submit` - Submit share (params: `user`, `job_id`, `extraNonce2`, `nTime`, `nonce`)
+- `mining.extranonce.subscribe` - Subscribe to extranonce changes
+
+### Server → Client
+
+- `mining.notify` - New mining job notification
+- `mining.set_difficulty` - Adjust miner difficulty
+- `mining.set_extranonce` - Update extranonce range
+
+### Authentication Format
+
+Workers authenticate with: `lotus_address.worker_suffix`
 
 Examples:
-- `lotus_abc`
-- `lotus_abc.rig01`
+- `lotus_qq987...xyz.main`
+- `lotus_qq123...abc.rig1`
+- `lotus_qq456...def` (no suffix)
 
-The left side is payout identity, optional suffix is a worker label.
+The payout address is extracted from the authentication string. All shares are attributed to this address.
 
-### Share lifecycle
+## Dynamic Difficulty
 
-On `mining.submit`:
-1. request shape checks (hex lengths etc.)
-2. worker authorization + active job ownership checks
-3. pool-side difficulty precheck
-4. candidate block reconstruction from template + submit tuple
-5. lotusd proposal validation (`ValidateMinedBlockProposalRequest`)
-6. lotusd candidate submit (`SubmitMinedBlockRequest`)
-7. response classification and idempotent share write
-8. vardiff update and optional retarget (`mining.set_difficulty`)
+The server implements a two-tier difficulty system:
 
----
+1. **Network Difficulty** - Tracked from lotusd mining templates, changes with network conditions
+2. **Pool Difficulty** - Calculated as `network_difficulty / share_target_ratio`, clamped to min/max
 
-## 3) Runtime configuration (config.toml)
+### How It Works
 
-Server configuration is file-based. Start with `--config` (default `./config.toml`).
+1. lotusd sends template updates via NNG Pub/Sub
+2. Server extracts network target from template, converts to difficulty
+3. Pool difficulty is calculated and clamped
+4. If pool difficulty changes >10%, broadcast to all miners
+5. Each miner's VarDiff fine-tunes from the baseline based on their individual share rate
 
-Minimal required safety section:
+### VarDiff Algorithm
 
-```toml
-[pool.mining_identity]
-payout_address = "lotus_..." # or payout_script_hex
+Per-miner variable difficulty adjusts based on:
+- **Target share rate** - Configured by `vardiff_target_secs`
+- **Actual share rate** - Measured from accepted shares
+- **Retarget window** - Configured by `vardiff_retarget_secs`
+
+If a miner submits shares faster than the target, their difficulty increases. If slower, it decreases.
+
+## Payout System
+
+### PPLNS Algorithm
+
+The server uses PPLNS (Pay Per Last N Shares) for fair reward distribution:
+
+1. When a block is found, it enters `pending` status
+2. After `min_confirmations` (min 100), it becomes `matured`
+3. The scheduler runs every `payout_interval_secs`
+4. For each matured block:
+   - Load shares from the PPLNS window (last N work units)
+   - Calculate each worker's share of the reward
+   - Build payout plan with fee deduction
+   - Sign and broadcast payout transaction
+   - Track confirmation
+
+### Fee Calculation
+
+```
+fee_sat = gross_reward_sat * (fee_bps / 10000)
+net_reward_sat = gross_reward_sat - fee_sat
 ```
 
-Startup now hard-fails if payout script is missing or resolves to `OP_RETURN`/nulldata.
-The runtime also requires a signing section for `pool.signing.mode = "internal"`.
+Fees are deducted before distributing to miners. If no fee address is configured, fees return to the pool payout address.
 
-CLI flags now only control bootstrap:
-- `--config`
-- `--debug`
+### Transaction Signing
 
-### Logging and diagnostics
+The internal signer:
+1. Loads the coinbase transaction from the found block
+2. Creates a new transaction spending the payout output (vout[1])
+3. Signs with the configured private key (P2PKH only)
+4. Broadcasts via JSON-RPC `sendrawtransaction`
+5. Tracks confirmation via `getrawtransaction`
 
-- `--debug` (default: `false`)
-  - Enables verbose request/event debug logs.
-  - Normal mode still emits operationally useful logs.
+**Limitation:** Current implementation supports only P2PKH payout scripts.
 
-### Network/service binds
+## Deployment
 
-- `--stratum-bind` (default: `0.0.0.0:3334`)
-- `--api-bind` (default: `127.0.0.1:18080`)
+### Prerequisites
 
-### Auth
+- Rust 1.70+ (edition 2021)
+- lotusd node with NNG endpoints enabled
+- JSON-RPC access to lotusd for payout broadcast
 
-- `api_token` is configured in `config.toml` (or env override `STRATUM_API_TOKEN`).
-
-### Storage + lotusd connectivity
-
-Configured in `config.toml`:
-- `sqlite_path`
-- `nng_rpc_url`
-- `nng_pub_url`
-
-Both `ipc://` and `tcp://` NNG URLs are supported.
-
-### Difficulty / vardiff
-
-Configured in `config.toml`:
-- `initial_difficulty`, `min_difficulty`, `max_difficulty`
-- `vardiff_target_secs`, `vardiff_retarget_secs`
-
-### Protocol hardening
-
-- `--max-request-line-bytes` (default: `8192`)
-- `--per-conn-req-per-sec` (default: `128`)
-- `--conn-idle-timeout-secs` (default: `180`)
-- `--max-jobs-cache` (default: `512`)
-- `--job-refresh-secs` (default: `15`)
-
----
-
-## 4) Launch examples
-
-### Local development / regtest
+### Build
 
 ```bash
-cp config.example.toml config.toml
-cargo run -- --config ./config.toml
+cd stratum-server-nng
+cargo build --release
 ```
 
-### Verbose debug run
+### Configuration
+
+1. Copy `config.example.toml` to `config.toml`
+2. Set `payout_address` to your pool's receiving address
+3. Configure `nng_rpc_url` and `nng_pub_url` for your lotusd instance
+4. Set `api_token` to a secure random value
+5. Configure `pool.signing.private_key` for payout signing
+6. Adjust vardiff parameters for your network (testnet vs mainnet)
+
+### Run
 
 ```bash
-cargo run -- --config ./config.toml --debug
+./target/release/stratum-server-nng --config config.toml
 ```
 
-### Production-style run (release)
+Or with debug logging:
 
 ```bash
-cargo run --release -- \
-  --api-token 'replace-with-long-random-token' \
-  --stratum-bind 0.0.0.0:3334 \
-  --api-bind 127.0.0.1:18080 \
-  --sqlite-path /var/lib/stratum-server-nng/accounting.sqlite3 \
-  --nng-rpc-url tcp://127.0.0.1:4555 \
-  --nng-pub-url tcp://127.0.0.1:4556
+./target/release/stratum-server-nng --config config.toml --debug
 ```
 
----
+### Environment Variables
 
-## 5) Stratum protocol support
+| Variable | Overrides | Description |
+|----------|-----------|-------------|
+| `STRATUM_API_TOKEN` | `api_token` | Bearer token for API authentication |
 
-Profile reference: `docs/lotus-stratum-v1-profile.md`
+### Systemd Service Example
 
-### Implemented methods
+```ini
+[Unit]
+Description=Lotus Stratum Server
+After=network.target lotusd.service
 
-Client -> server:
-- `mining.subscribe`
-- `mining.authorize`
-- `mining.submit`
-- `mining.ping`
+[Service]
+Type=simple
+User=lotus
+WorkingDirectory=/opt/lotus/stratum-server-nng
+ExecStart=/opt/lotus/stratum-server-nng/target/release/stratum-server-nng --config config.toml
+Restart=on-failure
+LimitNOFILE=65535
 
-Server -> client:
-- `mining.set_difficulty`
-- `lotus.precomputed_work` (required Lotus mining work notification)
-
-`lotus.precomputed_work` params are:
-1. `job_id`
-2. `header_160_hex`
-3. `share_target_hex` (32-byte hex, big-endian)
-4. `extranonce2_hex`
-5. `ntime_hex_6b`
-6. `clean_jobs`
-
-Validation contract:
-- `job_id` non-empty string
-- `header_160_hex` length `320` hex chars
-- `share_target_hex` length `64` hex chars
-- `extranonce2_hex` length `8` hex chars
-- `ntime_hex_6b` length `12` hex chars
-- `clean_jobs` boolean
-
-### Optional/scaffold behavior
-
-- `emit_mining_notify_compat = true` (config) additionally emits legacy `mining.notify` alongside `lotus.precomputed_work` for interoperability testing.
-
-- `mining.extranonce.subscribe`: accepted/acknowledged
-- `mining.set_extranonce`: parsed but currently rejected as unsupported
-- `mining.suggest_difficulty`: parsed but currently rejected as unsupported
-
-### Payout scheduling
-
-- A periodic payout scheduler runs from `config.toml` using the configured `pool.pplns.payout_interval_secs`.
-- Coinbase maturity is tracked in `found_blocks` with a default of 100 confirmations.
-- `blkdisconctd` marks pending found blocks orphaned.
-- The current payout batch lifecycle is persisted, but the in-process submit/broadcast step is still a synthetic placeholder rather than a real signer/transport path.
-- PPLNS outputs are computed from accepted non-stale shares and split deterministically by payout address.
-
----
-
-## 6) Operator API
-
-### Health endpoints
-
-- `GET /healthz`
-- `GET /readyz`
-
-### Authenticated endpoints
-
-Require:
-
-```http
-Authorization: Bearer <api-token>
+[Install]
+WantedBy=multi-user.target
 ```
 
-Routes:
-- `GET /status` (includes runtime idle/rate-limit disconnect counters)
-- `GET /workers`
-- `GET /rounds`
-- `GET /shares`
-- `GET /payouts`
+## Monitoring
 
-Example:
+### Metrics to Watch
+
+- **`/status` endpoint** - Overall health and statistics
+- **Idle disconnects** - High values may indicate network issues
+- **Rate limit disconnects** - May indicate misconfigured miners or attacks
+- **Found block persistence errors** - Should always be 0
+- **Template/candidate payout mismatch** - Configuration drift indicator
+
+### Logs
+
+Key log messages:
+- `runtime configuration loaded` - Startup config summary
+- `nng endpoints configured` - NNG connection info
+- `dynamic pool difficulty initialized` - VarDiff setup
+- `payout batch signed and submitted` - Successful payout
+
+Enable debug logging with `--debug` flag or `RUST_LOG` environment variable.
+
+## Development
+
+### Testing
 
 ```bash
-curl -H 'Authorization: Bearer devtoken' http://127.0.0.1:18080/status
+# Run all tests
+cargo test --lib
+
+# Run specific module tests
+cargo test --lib network_diff
+cargo test --lib diff_cache
+cargo test --lib accounting
+
+# Check for compilation errors
+cargo check
+
+# Build with all features
+cargo build --bin stratum-server-nng
 ```
 
----
+### Code Structure Guidelines
 
-## 7) Log guide for operators
+- **stratum/** - Protocol and connection handling (stateless where possible)
+- **accounting/** - Database operations (single source of truth)
+- **api/** - HTTP handlers (thin layer over accounting)
+- **payout/** - Payout logic (isolated from stratum)
+- **nng/** - Node communication (adapter pattern)
 
-## Normal INFO logs you should expect
+### Adding Features
 
-- startup and config load
-- NNG adapter connection + subscriptions
-- inbound NNG events (`updateblktip`, `mempool refresh`, `miningwrkchg`, `blkdisconctd`)
-- job refresh tick and job publication
-- connection accept/close
-- accepted shares persisted
-- found-block persistence and orphan transitions
-- vardiff retarget changes
-- rate-limit or idle disconnect events
+Before implementing:
+1. Check nearest `AGENTS.md` for project guidelines
+2. Verify no existing implementation in codebase
+3. Consider if feature belongs in stratum-server or separate service
+4. Ensure changes don't break existing accounting or payout logic
 
-## DEBUG logs (`--debug`) include
+## Security Considerations
 
-- per-request method/id traces
-- per-message NNG payload traces
-- detailed precomputed_work/set_difficulty send traces
-- cache depth and job publish diagnostics
+### Private Keys
 
-## Example: healthy new-block flow
+- `pool.signing.private_key` is used only for payout signing
+- Never log or expose this value
+- Consider using a hardware wallet or external signer for production
+- File permissions should be restricted (e.g., `chmod 600 config.toml`)
 
-1. `NNG pub message received topic="updateblktip" ...` (debug)
-2. `NNG event: updateblktip; refreshing job template_epoch=...` (info)
-3. `published mining job job_id=... template_epoch=...` (debug)
-4. `forwarded new mining job to miner ...` (info)
+### API Token
 
-If step (2) appears but step (4) does not, there may be no active miner sessions.
+- Use a strong random token (e.g., `openssl rand -hex 32`)
+- Restrict API access to localhost or protected network
+- Use reverse proxy with TLS for remote access
 
----
+### Database
 
-## 8) Troubleshooting checklist
+- SQLite WAL mode is enabled by default for durability
+- Regular backups recommended for production
+- Database contains sensitive payout information
 
-### No NNG events appear
+### Network
 
-- verify lotusd launched with matching `-nngpub` endpoint
-- verify topic enablement includes `miningwrkchg` / `updateblktip`
-- verify IPC path permissions (`ls -l` on pipe directory)
-- run with `--debug` and check for `NNG pub subscriptions active` log
+- Stratum port (3334) should be publicly accessible for miners
+- API port (18080) should be restricted to localhost/internal network
+- NNG endpoints should use IPC when possible (not TCP)
 
-### Miners connect but do not receive new jobs
+## Troubleshooting
 
-- verify `mining.subscribe` and `mining.authorize` success from miner logs
-- check for `sent lotus.precomputed_work` lines
-- check for session disconnects due to idle/rate limits
+### Common Issues
 
-### Shares rejected or duplicated
+**"invalid payout address"**
+- Ensure address is valid Lotus address format
+- Check network (testnet vs mainnet)
 
-- inspect `invalid-submit-shape`, `unauthorized-worker`, `stale-job`
-- verify miner worker string format `<lotus_address>[.<worker>]`
-- inspect duplicate share warnings in logs
+**"payout script cannot be OP_RETURN"**
+- The payout address must be spendable (P2PKH, P2SH, etc.)
+- OP_RETURN/nulldata scripts are rejected for safety
 
----
+**"api_token required"**
+- Set `api_token` in config or `STRATUM_API_TOKEN` env var
+- Token cannot be empty
 
-## 9) Security baseline
+**"failed connecting to NNG endpoint"**
+- Verify lotusd is running with NNG enabled
+- Check IPC path permissions
+- Ensure `nng_rpc_url` and `nng_pub_url` are correct
 
-- Operator API is bearer-token protected.
-- Keep API bound to localhost or secured ingress.
-- Prefer NNG IPC endpoints on same host where possible.
-- Keep signing keys outside the core process unless explicitly enabling signer integrations.
+**"payout scheduler disabled"**
+- Only `internal` signing mode is currently supported
+- Check `pool.signing.mode` configuration
 
----
+### Reconciliation
 
-## 10) Node integration expectations
+The server includes automatic reconciliation for missing found block persistence:
 
-This server is designed around lotusd NNG mining-capable interfaces and topics.
+- Runs every 60 seconds
+- Checks for `found_block` records without proper persistence
+- Attempts repair from submit events
+- Exposed via `/reconciliation/missing-found-blocks` API endpoint
 
-Expected mining-capable surfaces include:
-- `GetMiningTemplateRequest`
-- `SubmitMinedBlockRequest`
-- `ValidateMinedBlockProposalRequest`
-- `GetMiningStatusRequest`
-- `miningwrkchg`
+## License
 
-Current integration uses typed mining RPCs in `bitcoinsuite-bitcoind-nng` (flatbuffers v25 generation) and direct template-to-job mapping in server runtime.
+MIT License - see LICENSE file for details.
 
----
+## Contributing
 
-## 11) Development quickstart
+1. Read the root `AGENTS.md` for repository guidelines
+2. Read nested `AGENTS.md` files for subproject-specific guidance
+3. Keep changes minimal and focused
+4. Add tests for new functionality
+5. Update documentation as needed
 
-```bash
-cargo test
-cargo run -- --api-token devtoken --debug
-```
+## See Also
+
+- [lotusd](../lotusd/) - Lotus core node
+- [bitcoinsuite](../bitcoinsuite/) - Bitcoin/Lotus protocol primitives
+- [lotus-web-wallet](../lotus-web-wallet/) - Web wallet that can connect to pool
+- [chronik_nng](../chronik_nng/) - NNG indexer integration

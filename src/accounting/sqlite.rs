@@ -554,7 +554,7 @@ impl AccountingDb {
         &self,
         block_hash: &str,
         template_id: u64,
-        block_height: i64,
+        block_height: i32,
         worker_id: i64,
         worker_name: &str,
         payout_address: &str,

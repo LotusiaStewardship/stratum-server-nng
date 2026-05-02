@@ -6,13 +6,14 @@ use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
 use crate::stratum::protocol::{decode_request_line, Method, StratumResponse};
 use crate::stratum::validation::{
-    build_candidate_block, prevalidate_submit_shape, validate_header_meets_target_hex,
+    build_candidate_block_with_stratum_hash, prevalidate_submit_shape, validate_header_meets_target_hex,
     validate_submit_meets_difficulty, NativeSubmit,
 };
+use bitcoinsuite_bitcoind_stratum::build_stratum_header;
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
 use bitcoinsuite_bitcoind_nng::{MiningSubmitResult, MiningTemplate};
-use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock};
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader};
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -308,7 +309,15 @@ fn make_job_from_template(
     template_epoch: u64,
     clean_jobs: bool,
 ) -> Result<MiningJob> {
+    use bitcoinsuite_core::{BitcoinCode, Bytes, LotusBlock};
+    
     let version = format!("{:08x}", template.version);
+    
+    // Extract epoch_hash and extended_metadata_hash from the template block header
+    let block = LotusBlock::deser(&mut Bytes::from_slice(&template.block))?;
+    let epoch_hash_hex = block.header.epoch_hash.to_hex_be();
+    let extended_metadata_hash_hex = block.header.extended_metadata_hash.to_hex_be();
+    
     Ok(MiningJob {
         job_id: format!("job-{}-{}", template.template_id, template_epoch),
         template_id: template.template_id,
@@ -323,7 +332,9 @@ fn make_job_from_template(
         clean_jobs,
         template_epoch,
         template_block: template.block,
-        block_height: template.height as i64,
+        block_height: template.height,
+        epoch_hash_hex,
+        extended_metadata_hash_hex,
     })
 }
 
@@ -365,6 +376,23 @@ async fn send_set_difficulty(
     data.push(b'\n');
     writer.write_all(&data).await?;
     debug!(difficulty = diff, "sent mining.set_difficulty");
+    Ok(())
+}
+
+async fn send_set_extranonce(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    extranonce1: &str,
+    extranonce2_size: usize,
+) -> Result<()> {
+    let v = serde_json::json!({
+        "id": serde_json::Value::Null,
+        "method": "mining.set_extranonce",
+        "params": [extranonce1, extranonce2_size],
+    });
+    let mut data = serde_json::to_vec(&v)?;
+    data.push(b'\n');
+    writer.write_all(&data).await?;
+    info!(extranonce1 = %extranonce1, extranonce2_size = extranonce2_size, "sent mining.set_extranonce");
     Ok(())
 }
 
@@ -448,6 +476,7 @@ async fn handle_conn(
         session_id = %session_id,
         baseline_diff = baseline_diff,
         network_diff = diff_cache.network_diff(),
+        extranonce1 = %session.extranonce1,
         "stratum session started with dynamic difficulty"
     );
 
@@ -457,6 +486,13 @@ async fn handle_conn(
     
     // Subscribe to difficulty updates from network
     let mut diff_rx = diff_cache.subscribe();
+
+    // Send extranonce to miner so it can construct the correct coinbase
+    // extranonce2_size=4 is standard (allows 2^32 = 4 billion nonces per extranonce1)
+    const EXTRANONCE2_SIZE: usize = 4;
+    if let Err(e) = send_set_extranonce(&mut write_half, &session.extranonce1, EXTRANONCE2_SIZE).await {
+        warn!(session_id = %session_id, error = %e, "failed to send extranonce");
+    }
 
     let mut pending_difficulty: Option<f64> = None;
     let mut assigned_jobs: HashMap<String, AssignedJob> = HashMap::new();
@@ -712,8 +748,28 @@ async fn handle_conn(
                     continue;
                 }
 
-                // Build the full candidate block first (preserves height, epoch_hash, etc.)
-                let candidate_block = match build_candidate_block(
+                // Build coinbase hex for debugging
+                let coinbase_hex = format!(
+                    "{}{}{}{}",
+                    &job.coinbase1, &session.extranonce1, &submit.extranonce2, &job.coinbase2
+                );
+                info!(
+                    session_id = %session_id,
+                    job_id = %submit.job_id,
+                    coinbase1_len = job.coinbase1.len() / 2,
+                    extranonce1 = %session.extranonce1,
+                    extranonce2 = %submit.extranonce2,
+                    coinbase2_len = job.coinbase2.len() / 2,
+                    coinbase_total_len = coinbase_hex.len() / 2,
+                    coinbase_preview = &coinbase_hex[..64],
+                    "building candidate block with coinbase"
+                );
+
+                // Build the full candidate block and compute the stratum hash
+                // The stratum hash is computed from the header with default values for
+                // height, epoch_hash, extended_metadata_hash, and size - matching what
+                // GPU miners compute.
+                let (candidate_block, stratum_hash_hex, stratum_merkle_root_hex) = match build_candidate_block_with_stratum_hash(
                     &job,
                     &session.extranonce1,
                     &submit,
@@ -728,20 +784,46 @@ async fn handle_conn(
                     }
                 };
 
-                // Extract header from candidate block and validate against network target
-                let meets_network_target = {
-                    let mut block_bytes = Bytes::from_slice(&candidate_block);
-                    let block = match LotusBlock::deser(&mut block_bytes) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            share_stats.errored += 1;
-                            warn!(session_id = %session_id, req_id = %req_id, "candidate block deserialization failed");
-                            continue;
-                        }
-                    };
-                    let header_bytes = block.header.ser();
-                    validate_header_meets_target_hex(header_bytes.as_ref(), &job.network_target_hex)
-                        .is_ok()
+                // Validate the stratum hash against network target
+                // This hash matches what the GPU miner computed
+                let (meets_network_target, header_debug, template_debug) = {
+                    let header_bytes = build_stratum_header(
+                        &job.coinbase1,
+                        &session.extranonce1,
+                        &submit.extranonce2,
+                        &job.coinbase2,
+                        &job.merkle_branches,
+                        &job.prevhash,
+                        &job.version,
+                        &job.nbits,
+                        &submit.ntime_hex_6b,
+                        &submit.nonce_hex_8b,
+                        Some(job.block_height),
+                        Some(&job.epoch_hash_hex),
+                        Some(&job.extended_metadata_hash_hex),
+                        None,
+                    ).map_err(|e| anyhow::anyhow!("header build error: {}", e))?;
+                    let meets = validate_header_meets_target_hex(&header_bytes, &job.network_target_hex).is_ok();
+                    let header = LotusHeader::deser(&mut Bytes::from_slice(&header_bytes))
+                        .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?;
+                    let header_debug = format!(
+                        "version={} nbits={:08x} timestamp={} nonce={} merkle={}",
+                        header.version,
+                        header.bits,
+                        header.timestamp,
+                        header.nonce,
+                        header.merkle_root.to_hex_be()
+                    );
+                    let template_debug = format!(
+                        "template_id={} epoch={} prevhash={} nbits={} ntime={} target={}",
+                        job.template_id,
+                        job.template_epoch,
+                        job.prevhash,
+                        job.nbits,
+                        job.ntime,
+                        job.network_target_hex
+                    );
+                    (meets, header_debug, template_debug)
                 };
                 if !meets_network_target {
                     let dedupe_key = format!(
@@ -781,7 +863,23 @@ async fn handle_conn(
                     });
 
                     share_stats.accepted += 1;
-                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (meets pool difficulty; not submitted to lotusd)");
+                    info!(
+                        session_id = %session_id,
+                        req_id = %req_id,
+                        worker_id = worker_row.id,
+                        job_id = %job.job_id,
+                        template_id = job.template_id,
+                        block_hash = %stratum_hash_hex,
+                        merkle_root = %stratum_merkle_root_hex,
+                        header = %header_debug,
+                        template = %template_debug,
+                        share_difficulty = share_difficulty,
+                        network_difficulty = diff_cache.network_diff(),
+                        total_accepted = share_stats.accepted,
+                        total_rejected = share_stats.rejected,
+                        total_errored = share_stats.errored,
+                        "share accepted (meets pool difficulty; not submitted to lotusd)"
+                    );
 
                     let now = chrono::Utc::now().timestamp();
                     vardiff.record_share(now);
@@ -968,9 +1066,43 @@ async fn handle_conn(
                 }
 
                 if node_result_is_share_only_high_hash {
-                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, reject_reason = %submit_result.reject_reason, total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted (met pool difficulty; below network target)");
+                    info!(
+                        session_id = %session_id,
+                        req_id = %req_id,
+                        worker_id = worker_row.id,
+                        job_id = %job.job_id,
+                        template_id = job.template_id,
+                        block_hash = %stratum_hash_hex,
+                        merkle_root = %stratum_merkle_root_hex,
+                        header = %header_debug,
+                        template = %template_debug,
+                        share_difficulty = share_difficulty,
+                        network_difficulty = diff_cache.network_diff(),
+                        reject_reason = %submit_result.reject_reason,
+                        total_accepted = share_stats.accepted,
+                        total_rejected = share_stats.rejected,
+                        total_errored = share_stats.errored,
+                        "share accepted (met pool difficulty; below network target)"
+                    );
                 } else {
-                    info!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, template_id = job.template_id, result = ?submit_result.result, accepted = submit_result.accepted, block_hash = %submit_result.block_hash.to_hex_be(), total_accepted = share_stats.accepted, total_rejected = share_stats.rejected, total_errored = share_stats.errored, "share accepted via proposal+submit flow");
+                    info!(
+                        session_id = %session_id,
+                        req_id = %req_id,
+                        worker_id = worker_row.id,
+                        job_id = %job.job_id,
+                        template_id = job.template_id,
+                        block_hash = %submit_block_hash,
+                        header = %header_debug,
+                        template = %template_debug,
+                        share_difficulty = share_difficulty,
+                        network_difficulty = diff_cache.network_diff(),
+                        result = ?submit_result.result,
+                        accepted = submit_result.accepted,
+                        total_accepted = share_stats.accepted,
+                        total_rejected = share_stats.rejected,
+                        total_errored = share_stats.errored,
+                        "share accepted via proposal+submit flow"
+                    );
                 }
 
                 let now = chrono::Utc::now().timestamp();

@@ -109,6 +109,16 @@ pub struct VarDiffConfig {
     #[serde(default = "default_max_diff")]
     pub max_difficulty: f64,
     
+    /// Maximum allowed pool difficulty change per update.
+    /// 
+    /// Rationale:
+    /// - Prevents sudden difficulty jumps from destabilizing miners
+    /// - 0.5 = 50% max change per update (industry standard)
+    /// - Lower values (0.25-0.33) = more stable, slower adaptation
+    /// - Higher values (0.67-1.0) = faster adaptation, more volatile
+    #[serde(default = "default_max_change_pct")]
+    pub max_change_pct: f64,
+    
     /// Target time between accepted shares for vardiff tuning.
     /// 
     /// Rationale:
@@ -134,13 +144,17 @@ pub struct VarDiffConfig {
 }
 
 fn default_share_ratio() -> f64 { 100.0 }
-fn default_min_diff() -> f64 { 4.0 }
+fn default_min_diff() -> f64 { 0.5 }
 fn default_max_diff() -> f64 { 1_000_000.0 }
+fn default_max_change_pct() -> f64 { 0.5 }
 fn default_target_secs() -> f64 { 15.0 }
 fn default_retarget_secs() -> f64 { 90.0 }
 
 impl VarDiffConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.max_change_pct <= 0.0 || self.max_change_pct > 1.0 {
+            return Err(anyhow::anyhow!("max_change_pct must be between 0.0 and 1.0"));
+        }
         bitcoinsuite_bitcoind_stratum::validate_difficulty_config(
             self.min_difficulty,
             self.max_difficulty,

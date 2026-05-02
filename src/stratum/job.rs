@@ -15,11 +15,14 @@ pub struct MiningJob {
     pub clean_jobs: bool,
     pub template_epoch: u64,
     pub template_block: Vec<u8>,
-    pub block_height: i64,
+    pub block_height: i32,
+    pub epoch_hash_hex: String,
+    pub extended_metadata_hash_hex: String,
 }
 
 impl MiningJob {
-    /// Returns standard Stratum V1 mining.notify params (9 elements)
+    /// Returns mining.notify params with Lotus extensions.
+    /// Standard params (9) + Lotus extensions (height, epoch_hash, extended_metadata_hash)
     pub fn notify_params(&self) -> serde_json::Value {
         json!([
             self.job_id,
@@ -30,7 +33,11 @@ impl MiningJob {
             self.version,
             self.nbits,
             self.ntime,
-            self.clean_jobs
+            self.clean_jobs,
+            // Lotus-specific extensions
+            self.block_height,
+            self.epoch_hash_hex,
+            self.extended_metadata_hash_hex,
         ])
     }
 }

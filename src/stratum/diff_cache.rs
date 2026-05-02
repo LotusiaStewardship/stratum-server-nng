@@ -75,6 +75,9 @@ mod tests {
             share_target_ratio: 100.0,
             min_difficulty: 1.0,
             max_difficulty: 1_000_000.0,
+            max_change_pct: 0.5,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
         };
         let tracker = NetworkDifficultyTracker::new(config);
         let cache = DifficultyCache::new(tracker);
