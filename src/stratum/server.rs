@@ -1,6 +1,6 @@
 use crate::accounting::{AccountingDb, ShareOutcomeInsert};
 use crate::config::{Config, ResolvedPoolScripts};
-use crate::nng::adapter::{BitcoindNngAdapter, NodeEvent, NodeMiningAdapter};
+use crate::nng::adapter::{BitcoindMiningAdapter, JsonRpcClient, NodeEvent, NodeMiningAdapter, NngAdapter};
 use crate::stratum::diff_cache::DifficultyCache;
 use crate::stratum::engine::{apply_notify, handle_request, SessionState};
 use crate::stratum::job::MiningJob;
@@ -12,7 +12,7 @@ use crate::stratum::validation::{
 use bitcoinsuite_bitcoind_stratum::build_stratum_header;
 use crate::stratum::vardiff::VarDiff;
 use anyhow::{anyhow, Result};
-use bitcoinsuite_bitcoind_nng::{MiningSubmitResult, MiningTemplate};
+use bitcoinsuite_bitcoind_nng::MiningTemplate;
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader};
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -90,6 +90,28 @@ impl StratumRuntime {
     }
 
     pub fn publish_job(&self, job: MiningJob) {
+        // Validate job data before publishing
+        let coinbase1_valid = hex::decode(&job.coinbase1).is_ok();
+        let coinbase2_valid = hex::decode(&job.coinbase2).is_ok();
+        let merkle_valid = job.merkle_branches.iter().all(|b| hex::decode(b).is_ok());
+        let template_valid = !job.template_block.is_empty();
+        
+        if !coinbase1_valid || !coinbase2_valid || !merkle_valid || !template_valid {
+            error!(
+                job_id = %job.job_id,
+                template_id = job.template_id,
+                coinbase1_valid,
+                coinbase2_valid,
+                merkle_valid,
+                template_valid,
+                coinbase1_len = job.coinbase1.len(),
+                coinbase2_len = job.coinbase2.len(),
+                merkle_branches_count = job.merkle_branches.len(),
+                template_block_len = job.template_block.len(),
+                "INVALID job data detected before publishing"
+            );
+        }
+        
         let mut jobs = self.jobs.lock().expect("jobs lock");
         jobs.push_back(job.clone());
         while jobs.len() > self.max_jobs {
@@ -134,8 +156,26 @@ pub async fn run_stratum_server(
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
 
+    // Validate bitcoind_rpc.url is HTTP(S), not IPC
+    if !cfg.bitcoind_rpc.url.starts_with("http://") && !cfg.bitcoind_rpc.url.starts_with("https://") {
+        anyhow::bail!(
+            "bitcoind_rpc.url must be HTTP/HTTPS (e.g., http://127.0.0.1:10604/), got: {}. \
+             IPC paths (ipc://) work for nng_rpc_url but not for bitcoind_rpc.url",
+            cfg.bitcoind_rpc.url
+        );
+    }
+
+    info!(bitcoind_rpc_url = %cfg.bitcoind_rpc.url, "using HTTP RPC for submitblock");
+
+    // Create separate NNG and JSON-RPC clients, then compose them
+    let nng_adapter = NngAdapter::connect(&cfg.nng_rpc_url)?;
+    let json_rpc_client = JsonRpcClient::new(
+        cfg.bitcoind_rpc.url.clone(),
+        cfg.bitcoind_rpc.rpc_user.clone(),
+        cfg.bitcoind_rpc.rpc_pass.clone(),
+    );
     let adapter: Arc<dyn NodeMiningAdapter> =
-        Arc::new(BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?);
+        Arc::new(BitcoindMiningAdapter::new(nng_adapter, json_rpc_client));
     let pool_scripts = cfg.resolve_pool_scripts()?;
     info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
@@ -155,7 +195,7 @@ pub async fn run_stratum_server(
     // work changes. This replaces the legacy periodic polling approach.
     let runtime_nng = runtime.clone();
     let nng_pub_url = cfg.nng_pub_url.clone();
-    let rpc_adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
+    let rpc_adapter = NngAdapter::connect(&cfg.nng_rpc_url)?;
     let adapter_events = adapter.clone();
     let pool_scripts_events = pool_scripts.clone();
     let stats_events = stats.clone();
@@ -318,6 +358,27 @@ fn make_job_from_template(
     let epoch_hash_hex = block.header.epoch_hash.to_hex_be();
     let extended_metadata_hash_hex = block.header.extended_metadata_hash.to_hex_be();
     
+    // Compute the total block size for the final candidate block.
+    // The NNG template splits the coinbase into coinbase1/coinbase2 with the
+    // extranonce bytes omitted (lotusd's SplitCoinbase reserves space but does
+    // not include the extranonce in the template block).  We must account for
+    // the extranonce size delta so the header.size field matches the actual
+    // serialized candidate block that lotusd validates.
+    let template_coinbase_size = block.txs[0].ser().as_ref().len();
+    // Build a sample coinbase with zeroed extranonce to measure the final tx size.
+    let sample_coinbase_hex = format!(
+        "{}{:016x}{}",
+        &template.coinbase1,
+        0u64, // dummy extranonce1(4) + extranonce2(4)
+        &template.coinbase2,
+    );
+    let sample_coinbase_bytes = hex::decode(&sample_coinbase_hex)
+        .map_err(|e| anyhow!("sample coinbase decode: {e}"))?;
+    let sample_coinbase_tx = bitcoinsuite_core::Tx::deser(&mut Bytes::from_slice(&sample_coinbase_bytes))
+        .map_err(|e| anyhow!("sample coinbase deser: {e}"))?;
+    let candidate_coinbase_size = sample_coinbase_tx.ser().as_ref().len();
+    let block_size = template.block.len() as u64 + (candidate_coinbase_size - template_coinbase_size) as u64;
+    
     Ok(MiningJob {
         job_id: format!("job-{}-{}", template.template_id, template_epoch),
         template_id: template.template_id,
@@ -335,6 +396,7 @@ fn make_job_from_template(
         block_height: template.height,
         epoch_hash_hex,
         extended_metadata_hash_hex,
+        block_size,
     })
 }
 
@@ -503,12 +565,33 @@ async fn handle_conn(
     let mut req_window_start = std::time::Instant::now();
 
     loop {
+        // Only process the latest job from the channel, skip intermediate ones.
+        // This prevents flooding miners with rapid template changes.
+        // BUT: if ANY job has clean_jobs=true, preserve that signal.
+        let mut latest_job: Option<MiningJob> = None;
+        let mut any_clean_jobs = false;
         while let Ok(job) = pub_rx.try_recv() {
+            if job.clean_jobs {
+                any_clean_jobs = true;
+            }
+            latest_job = Some(job);
+        }
+        
+        if let Some(mut job) = latest_job.take() {
+            // Propagate clean_jobs=true if any coalesced job had it
+            if any_clean_jobs {
+                job.clean_jobs = true;
+            }
             if let Some(next_diff) = pending_difficulty.take() {
                 vardiff.current = next_diff;
             }
             apply_notify(&mut session, &job);
             if session.is_subscribed && session.is_authorized {
+                // When clean_jobs=true, clear assigned_jobs to prevent stale submissions
+                if job.clean_jobs {
+                    assigned_jobs.clear();
+                    assigned_job_order.clear();
+                }
                 send_mining_notify(&mut write_half, &job).await?;
                 info!(session_id = %session_id, job_id = %job.job_id, template_epoch = job.template_epoch, difficulty = vardiff.current, ntime = %job.ntime, clean_jobs = job.clean_jobs, "assigned mining.notify work");
                 assigned_jobs.insert(
@@ -601,8 +684,26 @@ async fn handle_conn(
                 send_set_difficulty(&mut write_half, vardiff.current).await?;
             }
             if matches!(method, Method::Authorize) && resp.error.is_null() {
-                if let Some(job) = runtime.latest_job() {
+                // Drain any backlog before sending initial job to avoid flooding
+                let mut latest_job: Option<MiningJob> = None;
+                let mut any_clean_jobs = false;
+                while let Ok(job) = pub_rx.try_recv() {
+                    if job.clean_jobs {
+                        any_clean_jobs = true;
+                    }
+                    latest_job = Some(job);
+                }
+                if let Some(mut job) = latest_job.or_else(|| runtime.latest_job()) {
+                    // Propagate clean_jobs=true if any coalesced job had it
+                    if any_clean_jobs {
+                        job.clean_jobs = true;
+                    }
                     apply_notify(&mut session, &job);
+                    // When clean_jobs=true, clear assigned_jobs to prevent stale submissions
+                    if job.clean_jobs {
+                        assigned_jobs.clear();
+                        assigned_job_order.clear();
+                    }
                     send_mining_notify(&mut write_half, &job).await?;
                     assigned_jobs.insert(
                         job.job_id.clone(),
@@ -748,23 +849,6 @@ async fn handle_conn(
                     continue;
                 }
 
-                // Build coinbase hex for debugging
-                let coinbase_hex = format!(
-                    "{}{}{}{}",
-                    &job.coinbase1, &session.extranonce1, &submit.extranonce2, &job.coinbase2
-                );
-                info!(
-                    session_id = %session_id,
-                    job_id = %submit.job_id,
-                    coinbase1_len = job.coinbase1.len() / 2,
-                    extranonce1 = %session.extranonce1,
-                    extranonce2 = %submit.extranonce2,
-                    coinbase2_len = job.coinbase2.len() / 2,
-                    coinbase_total_len = coinbase_hex.len() / 2,
-                    coinbase_preview = &coinbase_hex[..64],
-                    "building candidate block with coinbase"
-                );
-
                 // Build the full candidate block and compute the stratum hash
                 // The stratum hash is computed from the header with default values for
                 // height, epoch_hash, extended_metadata_hash, and size - matching what
@@ -775,9 +859,30 @@ async fn handle_conn(
                     &submit,
                 ) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(e) => {
                         share_stats.errored += 1;
-                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-candidate block assembly");
+                        warn!(
+                            session_id = %session_id,
+                            req_id = %req_id,
+                            worker = %submit.worker_name,
+                            job_id = %submit.job_id,
+                            error = %e,
+                            job_template_id = job.template_id,
+                            job_template_epoch = job.template_epoch,
+                            job_coinbase1_len = job.coinbase1.len(),
+                            job_coinbase2_len = job.coinbase2.len(),
+                            job_merkle_branches_count = job.merkle_branches.len(),
+                            job_prevhash = %job.prevhash,
+                            job_template_block_len = job.template_block.len(),
+                            extranonce1 = %session.extranonce1,
+                            extranonce2 = %submit.extranonce2,
+                            ntime = %submit.ntime_hex_6b,
+                            nonce = %submit.nonce_hex_8b,
+                            accepted = share_stats.accepted,
+                            rejected = share_stats.rejected,
+                            errored = share_stats.errored,
+                            "submit rejected: invalid-candidate block assembly"
+                        );
                         let err = StratumResponse::err(req_id.clone(), 20, "invalid-candidate");
                         send_json_line(&mut write_half, &err).await?;
                         continue;
@@ -786,7 +891,7 @@ async fn handle_conn(
 
                 // Validate the stratum hash against network target
                 // This hash matches what the GPU miner computed
-                let (meets_network_target, header_debug, template_debug) = {
+                let (meets_network_target, header_debug, template_debug, computed_hash_hex, header_bytes_hex) = {
                     let header_bytes = build_stratum_header(
                         &job.coinbase1,
                         &session.extranonce1,
@@ -801,11 +906,16 @@ async fn handle_conn(
                         Some(job.block_height),
                         Some(&job.epoch_hash_hex),
                         Some(&job.extended_metadata_hash_hex),
-                        None,
+                        Some(job.block_size),
                     ).map_err(|e| anyhow::anyhow!("header build error: {}", e))?;
-                    let meets = validate_header_meets_target_hex(&header_bytes, &job.network_target_hex).is_ok();
                     let header = LotusHeader::deser(&mut Bytes::from_slice(&header_bytes))
                         .map_err(|e| anyhow::anyhow!("header deser error: {}", e))?;
+                    let hash = header.calc_hash();
+                    let mut hash_be = [0u8; 32];
+                    hash_be.copy_from_slice(hash.as_ref());
+                    hash_be.reverse();
+                    let computed_hash_hex = hex::encode(&hash_be);
+                    let meets = validate_header_meets_target_hex(&header_bytes, &job.network_target_hex).is_ok();
                     let header_debug = format!(
                         "version={} nbits={:08x} timestamp={} nonce={} merkle={}",
                         header.version,
@@ -823,7 +933,7 @@ async fn handle_conn(
                         job.ntime,
                         job.network_target_hex
                     );
-                    (meets, header_debug, template_debug)
+                    (meets, header_debug, template_debug, computed_hash_hex, hex::encode(&header_bytes))
                 };
                 if !meets_network_target {
                     let dedupe_key = format!(
@@ -927,25 +1037,8 @@ async fn handle_conn(
                     continue;
                 }
 
-                let proposal = match adapter.validate_proposal(candidate_block.clone()).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        share_stats.errored += 1;
-                        warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, error = %err, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: proposal-rpc-failed");
-                        let err = StratumResponse::err(req_id.clone(), 20, "proposal-rpc-failed");
-                        send_json_line(&mut write_half, &err).await?;
-                        continue;
-                    }
-                };
-                if !proposal.valid {
-                    share_stats.rejected += 1;
-                    warn!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, reject_reason = %proposal.reject_reason, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "proposal validation rejected share");
-                    let err = StratumResponse::err(req_id.clone(), 20, "proposal-invalid");
-                    send_json_line(&mut write_half, &err).await?;
-                    continue;
-                }
-
-                let submit_result = match adapter.submit_mined_block(candidate_block).await {
+                // Submit block via HTTP RPC submitblock (performs full validation)
+                let submit_result = match adapter.submit_block(candidate_block.clone()).await {
                     Ok(v) => v,
                     Err(err) => {
                         share_stats.errored += 1;
@@ -956,19 +1049,20 @@ async fn handle_conn(
                     }
                 };
 
-                let node_result_is_share_only_high_hash =
-                    matches!(submit_result.result, MiningSubmitResult::Rejected)
-                        && submit_result
-                            .reject_reason
-                            .eq_ignore_ascii_case("high-hash");
+                // DEBUG: Log submitblock request and response
+                debug!(
+                    session_id = %session_id,
+                    job_id = %submit.job_id,
+                    stratum_hash_hex = %stratum_hash_hex,
+                    submit_block_hash = %submit_result.block_hash.to_hex_be(),
+                    reject_reason = ?submit_result.reject_reason,
+                    candidate_block_hex = %hex::encode(&candidate_block),
+                    "DEBUG: submitblock response from lotusd"
+                );
 
-                let share_accepted = matches!(
-                    submit_result.result,
-                    MiningSubmitResult::Accepted
-                        | MiningSubmitResult::Duplicate
-                        | MiningSubmitResult::DuplicateInvalid
-                        | MiningSubmitResult::DuplicateInconclusive
-                ) || node_result_is_share_only_high_hash;
+                // BIP22-style result: null means accepted, string means rejected with reason
+                let share_accepted = submit_result.reject_reason.is_none();
+                let reject_reason_opt = submit_result.reject_reason.as_ref().map(|s| s.as_str());
 
                 let dedupe_key = format!(
                     "{}:{}:{}:{}:{}:{}",
@@ -998,12 +1092,8 @@ async fn handle_conn(
                     } else {
                         "rejected"
                     },
-                    reject_reason: if share_accepted {
-                        None
-                    } else {
-                        Some(submit_result.reject_reason.as_str())
-                    },
-                    node_result: Some(&format!("{:?}", submit_result.result)),
+                    reject_reason: reject_reason_opt,
+                    node_result: Some(if share_accepted { "accepted" } else { "rejected" }),
                     low_diff_ok: Some(true),
                     network_target_ok: Some(true),
                     block_hash: Some(&submit_block_hash),
@@ -1012,7 +1102,23 @@ async fn handle_conn(
 
                 if !share_accepted {
                     share_stats.rejected += 1;
-                    warn!(session_id = %session_id, req_id = %req_id, worker_id = worker_row.id, job_id = %job.job_id, result = ?submit_result.result, reject_reason = %submit_result.reject_reason, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "share rejected by lotusd submit path");
+                    warn!(
+                        session_id = %session_id,
+                        req_id = %req_id,
+                        worker_id = worker_row.id,
+                        job_id = %job.job_id,
+                        reject_reason = %submit_result.reject_reason.as_ref().unwrap_or(&String::new()),
+                        stratum_hash_hex = %stratum_hash_hex,
+                        submit_block_hash = %submit_result.block_hash.to_hex_be(),
+                        computed_hash_hex = %computed_hash_hex,
+                        network_target_hex = %job.network_target_hex,
+                        header_bytes_hex = %header_bytes_hex,
+                        candidate_block_hex = %hex::encode(&candidate_block),
+                        accepted = share_stats.accepted,
+                        rejected = share_stats.rejected,
+                        errored = share_stats.errored,
+                        "share rejected by lotusd submit path"
+                    );
                     let err = StratumResponse::err(req_id.clone(), 20, "block-submit-rejected");
                     send_json_line(&mut write_half, &err).await?;
                     continue;
@@ -1036,11 +1142,11 @@ async fn handle_conn(
                     Some(&job.job_id),
                     Some(&submit_block_hash),
                     Some(&format!(
-                        "{{\"reject_reason\":\"{}\",\"result\":\"{:?}\"}}",
-                        submit_result.reject_reason, submit_result.result
+                        "{{\"reject_reason\":\"{}\"}}",
+                        submit_result.reject_reason.as_ref().unwrap_or(&String::new())
                     )),
                 );
-                if submit_result.accepted {
+                if share_accepted {
                     let persist = db.record_found_block(
                         &submit_block_hash,
                         job.template_id,
@@ -1065,7 +1171,16 @@ async fn handle_conn(
                     }
                 }
 
-                if node_result_is_share_only_high_hash {
+                // With RPC submitblock, we don't have the fine-grained result categories
+                // from NNG SubmitMinedBlockResult. The BIP22 response is binary:
+                // - null = accepted
+                // - string = rejected with reason
+                // For shares that meet pool difficulty but not network target, lotusd
+                // will reject with "high-hash" which we treat as an accepted share.
+                let is_high_hash_share = !share_accepted 
+                    && submit_result.reject_reason.as_ref().map(|s| s.eq_ignore_ascii_case("high-hash")).unwrap_or(false);
+
+                if is_high_hash_share {
                     info!(
                         session_id = %session_id,
                         req_id = %req_id,
@@ -1078,7 +1193,7 @@ async fn handle_conn(
                         template = %template_debug,
                         share_difficulty = share_difficulty,
                         network_difficulty = diff_cache.network_diff(),
-                        reject_reason = %submit_result.reject_reason,
+                        reject_reason = %submit_result.reject_reason.as_ref().unwrap_or(&String::new()),
                         total_accepted = share_stats.accepted,
                         total_rejected = share_stats.rejected,
                         total_errored = share_stats.errored,
@@ -1096,8 +1211,7 @@ async fn handle_conn(
                         template = %template_debug,
                         share_difficulty = share_difficulty,
                         network_difficulty = diff_cache.network_diff(),
-                        result = ?submit_result.result,
-                        accepted = submit_result.accepted,
+                        reject_reason = %submit_result.reject_reason.as_ref().unwrap_or(&String::new()),
                         total_accepted = share_stats.accepted,
                         total_rejected = share_stats.rejected,
                         total_errored = share_stats.errored,

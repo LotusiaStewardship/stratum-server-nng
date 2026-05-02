@@ -10,7 +10,7 @@ use bitcoinsuite_core::{
 };
 use bitcoinsuite_ecc_secp256k1::EccSecp256k1;
 
-use crate::nng::adapter::{BitcoindNngAdapter, NodeMiningAdapter};
+use crate::nng::adapter::{BitcoindMiningAdapter, JsonRpcClient, NodeMiningAdapter, NngAdapter};
 
 use crate::{
     accounting::AccountingDb,
@@ -36,7 +36,14 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
         .ok_or_else(|| anyhow!("missing signing key"))?;
     let seckey = parse_hex_seckey(signing_key)?;
 
-    let adapter = BitcoindNngAdapter::connect(&cfg.nng_rpc_url)?;
+    // Create separate NNG and JSON-RPC clients, then compose them
+    let nng_adapter = NngAdapter::connect(&cfg.nng_rpc_url)?;
+    let json_rpc_client = JsonRpcClient::new(
+        cfg.bitcoind_rpc.url.clone(),
+        cfg.bitcoind_rpc.rpc_user.clone(),
+        cfg.bitcoind_rpc.rpc_pass.clone(),
+    );
+    let adapter = BitcoindMiningAdapter::new(nng_adapter, json_rpc_client);
     let bitcoind = BitcoindRpcClient::new(BitcoindRpcClientConf {
         url: cfg.bitcoind_rpc.url.clone(),
         rpc_user: cfg.bitcoind_rpc.rpc_user.clone(),

@@ -18,6 +18,7 @@ pub struct MiningJob {
     pub block_height: i32,
     pub epoch_hash_hex: String,
     pub extended_metadata_hash_hex: String,
+    pub block_size: u64,
 }
 
 impl MiningJob {
@@ -38,6 +39,7 @@ impl MiningJob {
             self.block_height,
             self.epoch_hash_hex,
             self.extended_metadata_hash_hex,
+            self.block_size,
         ])
     }
 }
