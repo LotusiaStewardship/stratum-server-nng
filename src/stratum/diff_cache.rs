@@ -23,6 +23,7 @@ impl DifficultyCache {
         let old_pool_diff = self.tracker.pool_diff();
         self.tracker.update_from_template(template);
         let new_pool_diff = self.tracker.pool_diff();
+        let epoch = self.tracker.last_template_epoch();
 
         // Calculate percentage change
         let change_pct = if old_pool_diff > 0.0 {
@@ -37,6 +38,22 @@ impl DifficultyCache {
         if significant {
             // Broadcast to all subscribers (miners)
             let _ = self.diff_tx.send(new_pool_diff);
+            tracing::info!(
+                old_diff = %old_pool_diff,
+                new_diff = %new_pool_diff,
+                change_pct = format!("{:.2}%", change_pct * 100.0),
+                template_id = template.template_id,
+                template_epoch = epoch,
+                "difficulty broadcast to miners"
+            );
+        } else {
+            tracing::debug!(
+                old_diff = %old_pool_diff,
+                new_diff = %new_pool_diff,
+                change_pct = format!("{:.2}%", change_pct * 100.0),
+                template_epoch = epoch,
+                "difficulty change too small to broadcast"
+            );
         }
 
         (old_pool_diff, new_pool_diff, significant)
@@ -71,14 +88,8 @@ mod tests {
 
     #[test]
     fn test_cache_broadcast_on_significant_change() {
-        let config = DynamicDiffConfig {
-            share_target_ratio: 100.0,
-            min_difficulty: 1.0,
-            max_difficulty: 1_000_000.0,
-            max_change_pct: 0.5,
-            vardiff_target_secs: 15.0,
-            vardiff_retarget_secs: 90.0,
-        };
+        // Use default config - network comes from config, not hardcoded
+        let config = DynamicDiffConfig::default();
         let tracker = NetworkDifficultyTracker::new(config);
         let cache = DifficultyCache::new(tracker);
 

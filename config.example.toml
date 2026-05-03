@@ -13,6 +13,80 @@
 
 debug = false
 
+# Network type: "mainnet", "testnet", or "regtest"
+#
+# This determines default difficulty parameters appropriate for the network.
+# Override individual vardiff parameters if you need custom tuning.
+#
+# - mainnet: Production Lotus network (highest difficulty, most stable)
+# - testnet: Public test network (lower difficulty, can be volatile)
+# - regtest: Local regression testing (very low difficulty, manual block control)
+network = "testnet"
+
+# -----------------------------------------------------------------------------
+# Network-Specific Configuration Examples
+# -----------------------------------------------------------------------------
+#
+# Copy the section below that matches your network and adjust as needed.
+#
+# MAINNET (Production)
+# --------------------
+# network = "mainnet"
+# stratum_bind = "0.0.0.0:3334"
+# nng_rpc_url = "ipc:///home/user/.lotus/rpc.pipe"
+# nng_pub_url = "ipc:///home/user/.lotus/pub.pipe"
+# bitcoind_rpc.url = "http://127.0.0.1:10604"
+# payout_address = "lotus_..." (mainnet address)
+# fee_address = "lotus_..." (mainnet address)
+# private_key = "..." (mainnet WIF)
+#
+# [vardiff]
+# share_target_ratio = 100.0
+# min_difficulty = 10.0
+# max_difficulty = 10000000.0
+# max_change_pct = 0.5
+# vardiff_target_secs = 15.0
+# vardiff_retarget_secs = 90.0
+#
+# TESTNET (Development/Staging)
+# ------------------------------
+# network = "testnet"
+# stratum_bind = "0.0.0.0:3334"
+# nng_rpc_url = "ipc:///home/user/.lotus/rpc.pipe"
+# nng_pub_url = "ipc:///home/user/.lotus/pub.pipe"
+# bitcoind_rpc.url = "http://127.0.0.1:11604"
+# payout_address = "lotusT..." (testnet address)
+# fee_address = "lotusT..." (testnet address)
+# private_key = "..." (testnet WIF)
+#
+# [vardiff]
+# share_target_ratio = 100.0
+# min_difficulty = 4.0
+# max_difficulty = 1000000.0
+# max_change_pct = 0.5
+# vardiff_target_secs = 15.0
+# vardiff_retarget_secs = 90.0
+#
+# REGTEST (Local Testing)
+# ------------------------
+# network = "regtest"
+# stratum_bind = "127.0.0.1:3334"
+# nng_rpc_url = "ipc:///home/user/.lotus/rpc.pipe"
+# nng_pub_url = "ipc:///home/user/.lotus/pub.pipe"
+# bitcoind_rpc.url = "http://127.0.0.1:18444"
+# payout_address = "lotus_regtest..." (regtest address)
+# fee_address = "lotus_regtest..." (regtest address)
+# private_key = "..." (regtest WIF)
+#
+# [vardiff]
+# share_target_ratio = 50.0
+# min_difficulty = 1.0
+# max_difficulty = 100000.0
+# max_change_pct = 0.5
+# vardiff_target_secs = 5.0
+# vardiff_retarget_secs = 30.0
+# -----------------------------------------------------------------------------
+
 # Stratum TCP listen address for miners.
 # Common defaults:
 # - 0.0.0.0:3334 for public pool ingress
@@ -71,13 +145,12 @@ nng_pub_url = "ipc://datadir/nngpub.pipe"
 # NOTE: For testnet with high network difficulty (~50M), set this to ~50,000,000
 # to achieve pool difficulty around 1.0. Adjust based on your network conditions.
 # Monitor share submission rate and adjust accordingly.
-share_target_ratio = 50000000.0  # Adjust to match network difficulty for ~1.0 pool diff
+share_target_ratio = 100.0  # Recommended default for most deployments
 
 # Minimum pool difficulty (absolute floor).
 #
 # Rationale:
 # - Prevents difficulty from crashing to near-zero on low-hashrate testnet
-# - Old default of 0.0000001 allowed difficulty to become meaningless
 # - 4.0 is a reasonable floor:
 #   - High enough to prevent abuse/spam from ultra-low-diff shares
 #   - Low enough for low-powered miners (CPU, mobile) to contribute
@@ -86,7 +159,7 @@ share_target_ratio = 50000000.0  # Adjust to match network difficulty for ~1.0 p
 #
 # DO NOT set this below 1.0 unless you have a specific reason.
 # Extremely low min_difficulty defeats the purpose of dynamic adjustment.
-min_difficulty = 1.0
+min_difficulty = 2.0
 
 # Maximum pool difficulty (absolute ceiling).
 #
@@ -96,6 +169,15 @@ min_difficulty = 1.0
 # - Protects against bugs or extreme network difficulty spikes
 # - If miners consistently hit this ceiling, increase share_target_ratio
 max_difficulty = 1000000.0
+
+# Maximum allowed pool difficulty change per update.
+#
+# Rationale:
+# - Prevents sudden difficulty jumps from destabilizing miners
+# - 0.5 = 50% max change per update (industry standard)
+# - Lower values (0.25-0.33) = more stable, slower adaptation
+# - Higher values (0.67-1.0) = faster adaptation, more volatile
+max_change_pct = 0.5
 
 # Target time between accepted shares for vardiff tuning.
 #
@@ -156,10 +238,6 @@ conn_idle_timeout_secs = 180
 
 # Bound how many jobs are kept in memory for stale-job / duplicate-request handling.
 max_jobs_cache = 512
-
-# Periodic refresh interval for fetching a fresh mining template from lotusd.
-job_refresh_secs = 15
-emit_mining_notify_compat = false
 
 [pool.mining_identity]
 # The payout destination for block subsidies and mining rewards.

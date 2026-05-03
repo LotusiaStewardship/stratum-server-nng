@@ -3,6 +3,7 @@ use bitcoinsuite_bitcoind_nng::encode_coinbase_identity_utf8;
 use bitcoinsuite_core::{ecc::SecKey, Hashed, LotusAddress, Script, Sha256};
 use clap::Parser;
 use serde::Deserialize;
+use tracing;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "stratum-server-nng")]
@@ -24,12 +25,61 @@ pub struct Config {
     pub nng_pub_url: String,
     pub bitcoind_rpc: BitcoindRpcConfig,
     pub vardiff: VarDiffConfig,
+    pub network: Network,
     pub max_request_line_bytes: usize,
     pub per_conn_req_per_sec: u32,
     pub conn_idle_timeout_secs: u64,
     pub max_jobs_cache: usize,
-    pub job_refresh_secs: u64,
     pub pool: PoolConfig,
+}
+
+/// Blockchain network type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Mainnet,
+    Testnet,
+    Regtest,
+}
+
+impl Network {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+        }
+    }
+
+    /// Get recommended VarDiffConfig defaults for this network.
+    pub fn default_vardiff_config(&self) -> VarDiffConfig {
+        match self {
+            Network::Mainnet => VarDiffConfig {
+                share_target_ratio: 100.0,
+                min_difficulty: 10.0,
+                max_difficulty: 10_000_000.0,
+                max_change_pct: 0.5,
+                vardiff_target_secs: 15.0,
+                vardiff_retarget_secs: 90.0,
+            },
+            Network::Testnet => VarDiffConfig {
+                share_target_ratio: 100.0,
+                min_difficulty: 4.0,
+                max_difficulty: 1_000_000.0,
+                max_change_pct: 0.5,
+                vardiff_target_secs: 15.0,
+                vardiff_retarget_secs: 90.0,
+            },
+            Network::Regtest => VarDiffConfig {
+                share_target_ratio: 50.0,
+                min_difficulty: 1.0,
+                max_difficulty: 100_000.0,
+                max_change_pct: 0.5,
+                vardiff_target_secs: 5.0,
+                vardiff_retarget_secs: 30.0,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,7 +197,7 @@ fn default_share_ratio() -> f64 {
     100.0
 }
 fn default_min_diff() -> f64 {
-    0.5
+    4.0
 }
 fn default_max_diff() -> f64 {
     1_000_000.0
@@ -167,6 +217,32 @@ impl VarDiffConfig {
         if self.max_change_pct <= 0.0 || self.max_change_pct > 1.0 {
             return Err(anyhow::anyhow!(
                 "max_change_pct must be between 0.0 and 1.0"
+            ));
+        }
+        if self.vardiff_retarget_secs < 6.0 * self.vardiff_target_secs {
+            return Err(anyhow::anyhow!(
+                "vardiff_retarget_secs ({}) must be >= 6 * vardiff_target_secs ({})",
+                self.vardiff_retarget_secs,
+                6.0 * self.vardiff_target_secs
+            ));
+        }
+        if self.share_target_ratio < 10.0 || self.share_target_ratio > 1000.0 {
+            return Err(anyhow::anyhow!(
+                "share_target_ratio must be between 10.0 and 1000.0 (got {})",
+                self.share_target_ratio
+            ));
+        }
+        if self.min_difficulty < 1.0 {
+            return Err(anyhow::anyhow!(
+                "min_difficulty must be >= 1.0 (got {})",
+                self.min_difficulty
+            ));
+        }
+        if self.min_difficulty >= self.max_difficulty {
+            return Err(anyhow::anyhow!(
+                "min_difficulty ({}) must be < max_difficulty ({})",
+                self.min_difficulty,
+                self.max_difficulty
             ));
         }
         bitcoinsuite_bitcoind_stratum::validate_difficulty_config(
@@ -206,6 +282,45 @@ impl Config {
         }
         let _ = self.resolve_pool_scripts()?;
         self.vardiff.validate()?;
+        self.validate_network_config()?;
+        Ok(())
+    }
+
+    /// Validate network-specific configuration.
+    fn validate_network_config(&self) -> Result<()> {
+        // Warn if min_difficulty is below recommended for the network
+        let recommended = self.network.default_vardiff_config();
+        
+        if self.vardiff.min_difficulty < recommended.min_difficulty * 0.5 {
+            // Allow 50% below recommended, but warn
+            tracing::warn!(
+                "min_difficulty ({}) is below recommended value ({}) for {}",
+                self.vardiff.min_difficulty,
+                recommended.min_difficulty,
+                self.network.as_str()
+            );
+        }
+        
+        // Validate bitcoind_rpc URL matches network expectations
+        match self.network {
+            Network::Mainnet => {
+                // Mainnet should not use testnet ports (11604)
+                if self.bitcoind_rpc.url.contains("11604") {
+                    tracing::warn!("mainnet network configured but bitcoind_rpc uses testnet port (11604)");
+                }
+            }
+            Network::Testnet => {
+                // Testnet typically uses port 11604
+                if self.bitcoind_rpc.url.contains("10604") && !self.bitcoind_rpc.url.contains("11604") {
+                    tracing::warn!("testnet network configured but bitcoind_rpc may use mainnet port (10604)");
+                }
+            }
+            Network::Regtest => {
+                // Regtest is flexible, just log
+                tracing::info!("regtest network configured - using local testing defaults");
+            }
+        }
+        
         Ok(())
     }
 
@@ -288,4 +403,144 @@ fn reject_nulldata_script(script: &[u8], label: &str) -> Result<()> {
 fn script_fingerprint(script: &[u8]) -> String {
     let digest = Sha256::digest(script.to_vec().into());
     hex::encode(&digest.as_ref()[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_retarget_too_short() {
+        let config = VarDiffConfig {
+            share_target_ratio: 100.0,
+            min_difficulty: 4.0,
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 30.0, // Too short (should be >= 90)
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Retarget window too short") || err.contains("must be >= 6 *"));
+    }
+
+    #[test]
+    fn test_validate_share_ratio_too_low() {
+        let config = VarDiffConfig {
+            share_target_ratio: 5.0, // Too low
+            min_difficulty: 4.0,
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("share_target_ratio"));
+    }
+
+    #[test]
+    fn test_validate_share_ratio_too_high() {
+        let config = VarDiffConfig {
+            share_target_ratio: 1500.0, // Too high
+            min_difficulty: 4.0,
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("share_target_ratio"));
+    }
+
+    #[test]
+    fn test_validate_min_diff_too_low() {
+        let config = VarDiffConfig {
+            share_target_ratio: 100.0,
+            min_difficulty: 0.5, // Too low
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("min_difficulty"));
+    }
+
+    #[test]
+    fn test_validate_min_max_relationship() {
+        let config = VarDiffConfig {
+            share_target_ratio: 100.0,
+            min_difficulty: 100.0,
+            max_difficulty: 50.0, // min >= max
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("min_difficulty") && err.contains("max_difficulty"));
+    }
+
+    #[test]
+    fn test_validate_max_change_pct_invalid() {
+        let config = VarDiffConfig {
+            share_target_ratio: 100.0,
+            min_difficulty: 4.0,
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 1.5, // > 1.0
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("max_change_pct"));
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = VarDiffConfig {
+            share_target_ratio: 100.0,
+            min_difficulty: 4.0,
+            max_difficulty: 1_000_000.0,
+            vardiff_target_secs: 15.0,
+            vardiff_retarget_secs: 90.0,
+            max_change_pct: 0.5,
+        };
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_network_default_vardiff_config() {
+        let mainnet_config = Network::Mainnet.default_vardiff_config();
+        assert!((mainnet_config.min_difficulty - 10.0).abs() < 0.0001);
+        assert!((mainnet_config.vardiff_target_secs - 15.0).abs() < 0.0001);
+        assert!((mainnet_config.vardiff_retarget_secs - 90.0).abs() < 0.0001);
+
+        let testnet_config = Network::Testnet.default_vardiff_config();
+        assert!((testnet_config.min_difficulty - 4.0).abs() < 0.0001);
+        assert!((testnet_config.vardiff_target_secs - 15.0).abs() < 0.0001);
+        assert!((testnet_config.vardiff_retarget_secs - 90.0).abs() < 0.0001);
+
+        let regtest_config = Network::Regtest.default_vardiff_config();
+        assert!((regtest_config.min_difficulty - 1.0).abs() < 0.0001);
+        assert!((regtest_config.vardiff_target_secs - 5.0).abs() < 0.0001);
+        assert!((regtest_config.vardiff_retarget_secs - 30.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_network_as_str() {
+        assert_eq!(Network::Mainnet.as_str(), "mainnet");
+        assert_eq!(Network::Testnet.as_str(), "testnet");
+        assert_eq!(Network::Regtest.as_str(), "regtest");
+    }
 }

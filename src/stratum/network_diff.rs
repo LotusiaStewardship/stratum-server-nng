@@ -1,5 +1,5 @@
 use bitcoinsuite_bitcoind_nng::MiningTemplate;
-use bitcoinsuite_bitcoind_stratum::{calculate_pool_difficulty, network_target_to_difficulty};
+use bitcoinsuite_bitcoind_stratum::{calculate_pool_difficulty, network_target_to_difficulty, LotusNetwork};
 use bitcoinsuite_core::Hashed;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -33,17 +33,23 @@ pub struct DynamicDiffConfig {
     /// How often vardiff is allowed to retarget per miner.
     /// Default: 90.0 seconds
     pub vardiff_retarget_secs: f64,
+
+    /// Blockchain network type for difficulty calculation.
+    /// Determines which powLimit to use when converting network target to difficulty.
+    /// Default: LotusNetwork::Testnet
+    pub network: LotusNetwork,
 }
 
 impl Default for DynamicDiffConfig {
     fn default() -> Self {
         Self {
             share_target_ratio: 100.0,
-            min_difficulty: 1.0,
+            min_difficulty: 4.0,
             max_difficulty: 1_000_000.0,
             max_change_pct: 0.5,
             vardiff_target_secs: 15.0,
             vardiff_retarget_secs: 90.0,
+            network: LotusNetwork::Testnet,
         }
     }
 }
@@ -92,7 +98,12 @@ impl NetworkDifficultyTracker {
             .try_into()
             .expect("template target must be 32 bytes");
 
-        let network_diff = network_target_to_difficulty(&target_bytes).unwrap_or(1.0); // Fallback on error
+        // Use configured network for difficulty calculation
+        let network = {
+            let inner = self.inner.read();
+            inner.config.network
+        };
+        let network_diff = network_target_to_difficulty(&target_bytes, network).unwrap_or(1.0); // Fallback on error
 
         let inner = self.inner.read();
         let previous_pool_diff = inner.current_pool_diff;
@@ -159,14 +170,8 @@ mod tests {
 
     #[test]
     fn test_pool_diff_clamping() {
-        let config = DynamicDiffConfig {
-            share_target_ratio: 100.0,
-            min_difficulty: 4.0,
-            max_difficulty: 1_000_000.0,
-            max_change_pct: 0.5,
-            vardiff_target_secs: 15.0,
-            vardiff_retarget_secs: 90.0,
-        };
+        // Use default config which has a network set
+        let config = DynamicDiffConfig::default();
         let tracker = NetworkDifficultyTracker::new(config);
 
         // Initial pool diff should be min_difficulty (placeholder network diff = 1.0)

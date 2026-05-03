@@ -188,7 +188,13 @@ pub async fn run_stratum_server(
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
         let adapter_events_inner = adapter_events.clone();
+        let diff_cache_for_epoch = diff_cache_events.clone();
         tokio::spawn(async move {
+            // Exponential backoff state for template fetch failures
+            let mut backoff_secs: f64 = 1.0;
+            let max_backoff_secs: f64 = 300.0; // 5 minutes max
+            let mut consecutive_failures: u32 = 0;
+
             while let Some(event) = rx.recv().await {
                 // All events trigger clean job replacement
                 let clean = true;
@@ -197,6 +203,12 @@ pub async fn run_stratum_server(
                     NodeEvent::MempoolRefresh => "mempool",
                     NodeEvent::BlockDisconnected => "blkdisconctd",
                 };
+
+                // Set template epoch on difficulty tracker for observability
+                // Epoch increments with each NNG event, allowing correlation
+                let event_epoch = runtime_events.next_template_epoch();
+                diff_cache_for_epoch.tracker().set_template_epoch(event_epoch);
+
                 if matches!(event, NodeEvent::BlockDisconnected) {
                     match db_events.mark_pending_blocks_orphaned() {
                         Ok(orphaned) if orphaned > 0 => {
@@ -225,7 +237,18 @@ pub async fn run_stratum_server(
                         }
                     }
                 }
-                if let Err(err) = refresh_job_from_node(
+
+                // Apply exponential backoff on template fetch failures
+                if consecutive_failures > 0 {
+                    info!(
+                        backoff_secs = backoff_secs,
+                        consecutive_failures,
+                        "waiting before template fetch retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs_f64(backoff_secs)).await;
+                }
+
+                match refresh_job_from_node(
                     &runtime_events,
                     adapter_events_inner.clone(),
                     &pool_scripts_events,
@@ -237,7 +260,31 @@ pub async fn run_stratum_server(
                 )
                 .await
                 {
-                    warn!(error = %err, reason, "template refresh failed after event");
+                    Ok(()) => {
+                        // Success: reset backoff
+                        if consecutive_failures > 0 {
+                            info!(
+                                consecutive_failures,
+                                "template fetch recovered after {} failures",
+                                consecutive_failures
+                            );
+                        }
+                        consecutive_failures = 0;
+                        backoff_secs = 1.0;
+                    }
+                    Err(err) => {
+                        // Failure: increment backoff
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        warn!(
+                            error = %err,
+                            reason,
+                            consecutive_failures,
+                            next_backoff_secs = backoff_secs,
+                            "template refresh failed after event; will retry with backoff"
+                        );
+                        // Exponential backoff: double the wait time, capped at max
+                        backoff_secs = (backoff_secs * 2.0).min(max_backoff_secs);
+                    }
                 }
             }
         });

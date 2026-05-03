@@ -2,11 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 use stratum_server_nng::accounting::{AccountingDb, PayoutMethod};
 use stratum_server_nng::api::start_operator_api;
-use stratum_server_nng::config::{CliArgs, Config};
+use stratum_server_nng::config::{CliArgs, Config, Network};
 use stratum_server_nng::payout::scheduler::run_payout_scheduler;
 use stratum_server_nng::stratum::diff_cache::DifficultyCache;
 use stratum_server_nng::stratum::network_diff::{DynamicDiffConfig, NetworkDifficultyTracker};
 use stratum_server_nng::stratum::server::{run_stratum_server, RuntimeStats};
+use bitcoinsuite_bitcoind_stratum::LotusNetwork;
 use tracing::info;
 
 #[tokio::main]
@@ -51,6 +52,11 @@ async fn main() -> Result<()> {
         max_change_pct: cfg.vardiff.max_change_pct,
         vardiff_target_secs: cfg.vardiff.vardiff_target_secs,
         vardiff_retarget_secs: cfg.vardiff.vardiff_retarget_secs,
+        network: match cfg.network {
+            Network::Mainnet => LotusNetwork::Mainnet,
+            Network::Testnet => LotusNetwork::Testnet,
+            Network::Regtest => LotusNetwork::Regtest,
+        },
     };
     let tracker = NetworkDifficultyTracker::new(diff_config);
     let diff_cache = DifficultyCache::new(tracker);
