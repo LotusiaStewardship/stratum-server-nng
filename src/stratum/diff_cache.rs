@@ -18,15 +18,15 @@ impl DifficultyCache {
     }
 
     /// Update from mining template.
-    /// Returns the new pool difficulty and whether it changed significantly.
+    /// Returns the new network difficulty and whether it changed significantly.
     pub fn update_template(&self, template: &MiningTemplate) -> (f64, f64, bool) {
-        let old_pool_diff = self.tracker.pool_diff();
+        let old_network_diff = self.tracker.network_diff();
         self.tracker.update_from_template(template);
-        let new_pool_diff = self.tracker.pool_diff();
+        let new_network_diff = self.tracker.network_diff();
 
         // Calculate percentage change
-        let change_pct = if old_pool_diff > 0.0 {
-            (new_pool_diff - old_pool_diff).abs() / old_pool_diff
+        let change_pct = if old_network_diff > 0.0 {
+            (new_network_diff - old_network_diff).abs() / old_network_diff
         } else {
             1.0 // Treat as significant if old was zero
         };
@@ -36,15 +36,10 @@ impl DifficultyCache {
 
         if significant {
             // Broadcast to all subscribers (miners)
-            let _ = self.diff_tx.send(new_pool_diff);
+            let _ = self.diff_tx.send(new_network_diff);
         }
 
-        (old_pool_diff, new_pool_diff, significant)
-    }
-
-    /// Get current pool difficulty.
-    pub fn pool_diff(&self) -> f64 {
-        self.tracker.pool_diff()
+        (old_network_diff, new_network_diff, significant)
     }
 
     /// Get current network difficulty.
@@ -71,19 +66,12 @@ mod tests {
 
     #[test]
     fn test_cache_broadcast_on_significant_change() {
-        let config = DynamicDiffConfig {
-            share_target_ratio: 100.0,
-            min_difficulty: 1.0,
-            max_difficulty: 1_000_000.0,
-            max_change_pct: 0.5,
-            vardiff_target_secs: 15.0,
-            vardiff_retarget_secs: 90.0,
-        };
+        let config = DynamicDiffConfig::default();
         let tracker = NetworkDifficultyTracker::new(config);
         let cache = DifficultyCache::new(tracker);
 
         // Initial state
-        assert!(cache.pool_diff() >= 1.0);
+        assert!((cache.network_diff() - 1.0).abs() < 0.0001);
 
         // Verify subscription works
         let mut rx = cache.subscribe();

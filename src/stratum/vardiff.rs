@@ -72,6 +72,16 @@ impl VarDiff {
 
         Some(new_diff)
     }
+
+    /// Update the maximum difficulty (network difficulty ceiling).
+    /// Also clamps current difficulty if it exceeds the new max.
+    pub fn update_max(&mut self, network_diff: f64) {
+        self.max = network_diff;
+        // Clamp current to new max if needed
+        if self.current > self.max {
+            self.current = self.max;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -98,5 +108,80 @@ mod tests {
         }
         let d2 = vd.maybe_retarget(180).unwrap();
         assert!((d2 - d1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vardiff_with_network_diff_ceiling() {
+        let network_diff = 72.34;
+        let mut vd = VarDiff::new(
+            network_diff,  // Start at network diff
+            0.001,         // Absolute floor
+            network_diff,  // Ceiling = network diff
+            15.0,
+            90.0,
+        );
+        
+        // Verify initial state
+        assert!((vd.current - network_diff).abs() < 0.0001);
+        assert!((vd.max - network_diff).abs() < 0.0001);
+        assert!((vd.min - 0.001).abs() < 0.0001);
+        
+        // Test update_max
+        vd.update_max(100.0);
+        assert!((vd.max - 100.0).abs() < 0.0001);
+        assert!((vd.current - network_diff).abs() < 0.0001); // current unchanged
+        
+        // Test update_max with lower value (should clamp current)
+        vd.update_max(50.0);
+        assert!((vd.max - 50.0).abs() < 0.0001);
+        assert!((vd.current - 50.0).abs() < 0.0001); // current clamped to new max
+    }
+
+    #[test]
+    fn vardiff_ramps_up_from_low_start() {
+        // Simulates a new miner starting at 1% of network difficulty.
+        // VarDiff should ramp up as fast shares arrive.
+        let network_diff = 72.34;
+        let initial_diff = network_diff * 0.01;
+
+        let mut vd = VarDiff::new(
+            initial_diff,    // Start at 1% of network diff
+            0.001,           // Absolute floor
+            network_diff,    // Ceiling = network diff
+            15.0,
+            90.0,
+        );
+
+        // Verify initial state: starts low, not at network diff
+        assert!((vd.current - initial_diff).abs() < 1e-9);
+        assert!(vd.current < network_diff);
+        assert!((vd.max - network_diff).abs() < 1e-9);
+
+        // Fast shares arrive (every 3s, target is 15s) — should ramp up
+        for t in [0, 3, 6, 9, 12] {
+            vd.record_share(t);
+        }
+        let d1 = vd.maybe_retarget(90).unwrap();
+        assert!(d1 > initial_diff, "difficulty should ramp up from low start");
+        assert!(d1 < network_diff, "difficulty should not exceed network diff");
+
+        // Continue fast shares — should keep ramping up toward network diff
+        for round in 0..20 {
+            let base = 90 + round * 30;
+            for t in [base, base + 3, base + 6, base + 9, base + 12] {
+                vd.record_share(t);
+            }
+            if let Some(d) = vd.maybe_retarget(base + 120) {
+                if d >= network_diff * 0.99 {
+                    break; // reached near ceiling
+                }
+            }
+        }
+
+        // After sustained fast shares, difficulty should approach the ceiling
+        assert!(
+            vd.current > initial_diff * 2.0,
+            "difficulty should have ramped up significantly from low start"
+        );
     }
 }

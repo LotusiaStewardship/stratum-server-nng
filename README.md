@@ -39,34 +39,34 @@ The Stratum server uses a **pub/sub notification + RPC fetch** pattern for minin
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        stratum-server-nng                        │
+│                        stratum-server-nng                       │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │   Stratum    │  │  Operator    │  │   Payout     │          │
-│  │    Server    │  │     API      │  │  Scheduler   │          │
-│  │  (TCP:3334)  │  │ (TCP:18080)  │  │  (Hourly)    │          │
-│  └──────┬───────┘  └──────────────┘  └──────┬───────┘          │
-│         │                                    │                   │
-│  ┌──────▼────────────────────────────────────▼───────┐          │
-│  │              Accounting Database                   │          │
-│  │         (SQLite: stratum-accounting)              │          │
-│  │  - workers, shares, rounds, found_blocks          │          │
-│  │  - payout_batches, schema_migrations              │          │
-│  └──────┬────────────────────────────────────┬───────┘          │
-│         │                                    │                   │
-│  ┌──────▼───────────┐              ┌─────────▼────────┐         │
-│  │  NNG Adapter     │              │  Bitcoind RPC    │         │
-│  │  - RPC (ipc/tcp) │              │  - sendrawtx     │         │
-│  │  - Pub/Sub       │              │  - getrawtx      │         │
-│  │                  │              │                  │         │
-│  │  Pub/Sub events: │              │                  │         │
-│  │  • updateblktip  │              │                  │         │
-│  │  • miningwrkchg  │──fetches──►  │  MiningTemplate  │         │
-│  │  • mempooltxadd  │  template    │  (full payload)  │         │
-│  │  • blkdisconctd  │              │                  │         │
-│  └──────────────────┘              └──────────────────┘         │
-│                                                                  │
+│                                                                 │
+│      ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│      │   Stratum    │  │  Operator    │  │    Payout    │       │
+│      │    Server    │  │     API      │  │   Scheduler  │       │
+│      │  (TCP:3334)  │  │ (TCP:18080)  │  │   (Hourly)   │       │
+│      └──────┬───────┘  └──────────────┘  └──────┬───────┘       │
+│             │                                    │              │
+│      ┌──────▼────────────────────────────────────▼───────┐      │
+│      │              Accounting Database                  │      │
+│      │         (SQLite: stratum-accounting)              │      │
+│      │     - workers, shares, rounds, found_blocks       │      │
+│      │     - payout_batches, schema_migrations           │      │
+│      └──────┬────────────────────────────────────┬───────┘      │
+│             │                                    │              │
+│      ┌──────▼───────────┐              ┌─────────▼────────┐     │
+│      │  NNG Adapter     │              │  Bitcoind RPC    │     │
+│      │  - RPC (ipc/tcp) │              │  - sendrawtx     │     │
+│      │  - Pub/Sub       │              │  - getrawtx      │     │
+│      │                  │              │                  │     │
+│      │  Pub/Sub events: │              │                  │     │
+│      │  • updateblktip  │              │                  │     │
+│      │  • miningwrkchg  │──fetches──►  │  MiningTemplate  │     │
+│      │  • mempooltxadd  │  template    │  (full payload)  │     │
+│      │  • blkdisconctd  │              │                  │     │
+│      └──────────────────┘              └──────────────────┘     │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
          │                                    │
          ▼                                    ▼
@@ -142,21 +142,26 @@ Copy `config.example.toml` to `config.toml` and adjust for your environment.
 
 ### VarDiff Configuration (`[vardiff]`)
 
-Dynamic difficulty adjustment parameters:
+**Network-Aware Dynamic Difficulty** — Pool difficulty automatically tracks network difficulty from lotusd. Miners start at a percentage of network difficulty and VarDiff fine-tunes per-miner based on share rate.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `share_target_ratio` | float | `100.0` | Ratio of network difficulty to pool difficulty. Higher = easier shares. Typical range: 50-200 |
-| `min_difficulty` | float | `4.0` | Minimum pool difficulty (absolute floor). Prevents crash to near-zero |
-| `max_difficulty` | float | `1000000.0` | Maximum pool difficulty (ceiling). Protects against extreme spikes |
+| `vardiff_min_floor` | float | `0.001` | Absolute minimum difficulty floor (safety only). Prevents crash to near-zero on edge cases |
+| `vardiff_initial_pct` | float | `0.01` | Initial difficulty for new miners as fraction of network difficulty (1% = 0.01) |
 | `vardiff_target_secs` | float | `15.0` | Target time between accepted shares. Lower = more shares, more precision |
-| `vardiff_retarget_secs` | float | `90.0` | How often vardiff adjusts per miner. Should be > vardiff_target_secs |
+| `vardiff_retarget_secs` | float | `90.0` | How often vardiff adjusts per miner. Should be ≥ 6× vardiff_target_secs |
 
 **Rationale for defaults:**
-- `share_target_ratio: 100.0` means pool shares are 100x easier than network blocks
-- `min_difficulty: 4.0` prevents the difficulty crash that occurred with the old 0.0000001 default
+- `vardiff_min_floor: 0.001` is a safety floor only — VarDiff operates within `[floor, network_diff]`
+- `vardiff_initial_pct: 0.01` means miners start at 1% of network diff, then ramp up based on share rate
 - `vardiff_target_secs: 15.0` provides a good balance between precision and server load
 - `vardiff_retarget_secs: 90.0` allows ~6 samples for stable statistical adjustment
+
+**Network-Aware Scaling Benefits:**
+- No stale config: Pool difficulty tracks network difficulty automatically from lotusd templates
+- Simpler mental model: Network difficulty = ground truth, no manual `max_difficulty` tuning
+- Automatic adaptation: When network diff changes 10×, pool scales without config changes
+- Per-miner optimization: VarDiff tunes each miner individually within the network-aware bounds
 
 ### Pool Configuration (`[pool]`)
 
@@ -360,27 +365,39 @@ The payout address is extracted from the authentication string. All shares are a
 
 ## Dynamic Difficulty
 
-The server implements a two-tier difficulty system:
+The server implements **network-aware dynamic difficulty** with per-miner VarDiff tuning:
 
-1. **Network Difficulty** - Tracked from lotusd mining templates, changes with network conditions
-2. **Pool Difficulty** - Calculated as `network_difficulty / share_target_ratio`, clamped to min/max
+1. **Network Difficulty** — Ground truth, tracked from lotusd mining templates via NNG pub/sub
+2. **Miner Difficulty** — Starts at `network_diff × vardiff_initial_pct`, fine-tuned per-miner by VarDiff
 
 ### How It Works
 
-1. lotusd sends template updates via NNG Pub/Sub
-2. Server extracts network target from template, converts to difficulty
-3. Pool difficulty is calculated and clamped
-4. If pool difficulty changes >10%, broadcast to all miners
-5. Each miner's VarDiff fine-tunes from the baseline based on their individual share rate
+1. lotusd publishes new mining templates via NNG pub/sub when chain state changes
+2. Server fetches template, extracts target, converts to network difficulty
+3. All miners receive `mining.set_difficulty` broadcast when network diff changes >10%
+4. Each miner's VarDiff operates independently within `[vardiff_min_floor, network_diff]`
+5. VarDiff retargets every `vardiff_retarget_secs` based on observed share rate
 
 ### VarDiff Algorithm
 
-Per-miner variable difficulty adjusts based on:
-- **Target share rate** - Configured by `vardiff_target_secs`
-- **Actual share rate** - Measured from accepted shares
-- **Retarget window** - Configured by `vardiff_retarget_secs`
+Per-miner difficulty adjusts based on:
+- **Target interval** (`vardiff_target_secs`) — Desired time between accepted shares (default: 15s)
+- **Actual interval** — Measured from timestamps of accepted shares in rolling window
+- **Retarget interval** (`vardiff_retarget_secs`) — How often adjustment occurs (default: 90s)
 
-If a miner submits shares faster than the target, their difficulty increases. If slower, it decreases.
+**Adjustment formula:**
+```
+ratio = target_secs / avg_share_interval
+ratio = clamp(ratio, 0.67, 1.5)  // ±50% max change per retarget
+new_diff = current_diff × ratio
+new_diff = clamp(new_diff, vardiff_min_floor, network_diff)
+```
+
+**Lifecycle:**
+- **Initialization:** Miner connects → starts at `network_diff × 0.01` (1%)
+- **Ramp-up:** Fast shares arrive → difficulty increases by up to 50% per retarget
+- **Plateau:** Difficulty stabilizes when share rate matches target, or hits network diff ceiling
+- **Network changes:** When network diff drops, miner difficulty is immediately clamped to new ceiling
 
 ## Payout System
 

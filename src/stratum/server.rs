@@ -552,22 +552,29 @@ async fn handle_conn(
     let mut session = SessionState::new(session_id.clone());
     session.extranonce1 = format!("{:08x}", thread_rng().r#gen::<u32>());
 
-    // Get current pool difficulty for this miner's baseline
-    let baseline_diff = diff_cache.pool_diff();
+    // Get network difficulty (this is now the pool diff baseline)
+    let network_diff = diff_cache.network_diff();
 
-    // Initialize VarDiff with dynamic baseline
+    // Start new miners at a low fraction of network difficulty so they can submit
+    // initial shares quickly. VarDiff ramps up based on observed share rate.
+    let initial_diff = (network_diff * cfg.vardiff.vardiff_initial_pct)
+        .max(cfg.vardiff.vardiff_min_floor)
+        .min(network_diff);
+
+    // Initialize VarDiff with the low starting difficulty and network diff as ceiling
     let mut vardiff = VarDiff::new(
-        baseline_diff,
-        cfg.vardiff.min_difficulty,
-        cfg.vardiff.max_difficulty,
+        initial_diff,
+        cfg.vardiff.vardiff_min_floor,    // Absolute floor
+        network_diff,                      // Dynamic ceiling = network diff
         cfg.vardiff.vardiff_target_secs,
         cfg.vardiff.vardiff_retarget_secs,
     );
 
     info!(
         session_id = %session_id,
-        baseline_diff = baseline_diff,
-        network_diff = diff_cache.network_diff(),
+        initial_diff = initial_diff,
+        network_diff = network_diff,
+        initial_pct = cfg.vardiff.vardiff_initial_pct,
         extranonce1 = %session.extranonce1,
         "stratum session started with dynamic difficulty"
     );
@@ -626,15 +633,20 @@ async fn handle_conn(
 
             // Priority 2: Difficulty update from network
             diff_result = diff_rx.recv() => {
-                let new_diff = diff_result?;
+                let new_network_diff = diff_result?;
+                
+                // Update this miner's VarDiff max to new network diff
+                vardiff.update_max(new_network_diff);
+                
                 info!(
                     session_id = %session_id,
                     old_diff = vardiff.current,
-                    new_diff = new_diff,
-                    "difficulty updated from network"
+                    new_network_diff = new_network_diff,
+                    "network difficulty updated"
                 );
-                vardiff.current = new_diff;
-                if let Err(e) = send_set_difficulty(&mut write_half, new_diff).await {
+                
+                // Send difficulty update to miner
+                if let Err(e) = send_set_difficulty(&mut write_half, new_network_diff).await {
                     warn!(session_id = %session_id, error = %e, "failed to send difficulty update");
                 }
             }

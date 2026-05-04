@@ -45,10 +45,6 @@ async fn main() -> Result<()> {
 
     // Initialize dynamic difficulty tracker
     let diff_config = DynamicDiffConfig {
-        share_target_ratio: cfg.vardiff.share_target_ratio,
-        min_difficulty: cfg.vardiff.min_difficulty,
-        max_difficulty: cfg.vardiff.max_difficulty,
-        max_change_pct: cfg.vardiff.max_change_pct,
         vardiff_target_secs: cfg.vardiff.vardiff_target_secs,
         vardiff_retarget_secs: cfg.vardiff.vardiff_retarget_secs,
     };
@@ -56,11 +52,11 @@ async fn main() -> Result<()> {
     let diff_cache = DifficultyCache::new(tracker);
 
     info!(
-        share_target_ratio = cfg.vardiff.share_target_ratio,
-        min_difficulty = cfg.vardiff.min_difficulty,
-        max_difficulty = cfg.vardiff.max_difficulty,
-        max_change_pct = cfg.vardiff.max_change_pct,
-        "dynamic pool difficulty initialized"
+        vardiff_min_floor = cfg.vardiff.vardiff_min_floor,
+        vardiff_initial_pct = cfg.vardiff.vardiff_initial_pct,
+        vardiff_target_secs = cfg.vardiff.vardiff_target_secs,
+        vardiff_retarget_secs = cfg.vardiff.vardiff_retarget_secs,
+        "dynamic pool difficulty initialized (network-aware scaling)"
     );
 
     let api_db = db.clone();
