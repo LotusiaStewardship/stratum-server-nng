@@ -1,6 +1,6 @@
 use crate::accounting::{PayoutBatch, PayoutMethod, Round, Share, Worker};
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +37,15 @@ pub struct SchedulerHealthSummary {
     pub matured_found_blocks_ready: u64,
     pub retry_ready_batches: u64,
     pub next_retry_at: Option<String>,
+}
+
+/// Information about the current scheduler lease
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseInfo {
+    pub owner: String,
+    pub expires_at: String,
+    pub is_valid: bool,
+    pub is_expired: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1228,6 +1237,125 @@ impl AccountingDb {
             }
         }
         Ok(repaired)
+    }
+
+    /// Acquire a scheduler lease for the given instance.
+    ///
+    /// Returns `Ok(true)` if lease was acquired successfully.
+    /// Returns `Ok(false)` if another instance currently holds the lease.
+    pub fn acquire_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
+        let now = Utc::now();
+        let expires = now + Duration::minutes(duration_minutes);
+        
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "INSERT INTO payout_scheduler_lease(id, owner, expires_at) 
+             VALUES(1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET 
+                 owner=excluded.owner,
+                 expires_at=excluded.expires_at
+             WHERE expires_at < ?3",
+            params![instance_id, expires.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Renew an existing scheduler lease.
+    ///
+    /// Returns `Ok(true)` if lease was renewed successfully.
+    /// Returns `Ok(false)` if this instance doesn't hold the lease.
+    pub fn renew_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
+        let now = Utc::now();
+        let expires = now + Duration::minutes(duration_minutes);
+        
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "UPDATE payout_scheduler_lease 
+             SET expires_at = ?1 
+             WHERE id = 1 AND owner = ?2",
+            params![expires.to_rfc3339(), instance_id],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Release a scheduler lease voluntarily.
+    ///
+    /// Returns `Ok(true)` if lease was released.
+    /// Returns `Ok(false)` if this instance didn't hold the lease.
+    pub fn release_scheduler_lease(&self, instance_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "DELETE FROM payout_scheduler_lease WHERE id = 1 AND owner = ?1",
+            params![instance_id],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Check if a lease is currently held and by whom.
+    ///
+    /// Returns `Ok(Some(owner))` if lease is held (not expired).
+    /// Returns `Ok(None)` if no lease exists or lease has expired.
+    pub fn check_lease_status(&self) -> Result<Option<String>> {
+        let now = Utc::now();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let owner: Option<String> = conn.query_row(
+            "SELECT owner FROM payout_scheduler_lease 
+             WHERE id = 1 AND expires_at > ?1",
+            params![now.to_rfc3339()],
+            |r| r.get(0),
+        ).optional()?;
+        
+        Ok(owner)
+    }
+
+    #[cfg(test)]
+    pub fn expire_lease_for_test(&self) -> Result<()> {
+        let now = Utc::now();
+        let past = (now - Duration::minutes(5)).to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE payout_scheduler_lease SET expires_at = ?1 WHERE id = 1",
+            params![past],
+        )?;
+        Ok(())
+    }
+
+    /// Get detailed lease information including expiration time.
+    pub fn get_lease_info(&self) -> Result<Option<LeaseInfo>> {
+        let now = Utc::now();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let row: Option<(String, String)> = conn.query_row(
+            "SELECT owner, expires_at FROM payout_scheduler_lease WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        
+        match row {
+            Some((owner, expires_str)) => {
+                let expires_at_dt = DateTime::parse_from_rfc3339(&expires_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                
+                let is_expired = expires_at_dt < now;
+                let is_valid = !is_expired;
+                
+                Ok(Some(LeaseInfo {
+                    owner,
+                    expires_at: expires_str,
+                    is_valid,
+                    is_expired,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }
 

@@ -61,6 +61,13 @@ pub struct PplnsConfig {
     pub min_payout_sat: i64,
     pub payout_interval_secs: u64,
     pub min_confirmations: u32,
+    /// Unique identifier for this pool instance (used for scheduler lease)
+    #[serde(default = "default_instance_id")]
+    pub instance_id: String,
+}
+
+fn default_instance_id() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

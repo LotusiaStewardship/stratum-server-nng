@@ -1,9 +1,10 @@
 use crate::accounting::{
-    AccountingDb, FoundBlockStateSummary, MissingFoundBlock, PayoutBatchStateSummary,
+    AccountingDb, FoundBlockStateSummary, LeaseInfo, MissingFoundBlock, PayoutBatchStateSummary,
     RejectedReasonSummary, SchedulerHealthSummary, WorkerAccountingSummary,
 };
 use crate::stratum::server::RuntimeStats;
 use anyhow::Result;
+use tracing::error;
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -52,6 +53,18 @@ struct WorkerSummaryResp {
 #[derive(Serialize)]
 struct RejectedReasonResp {
     reasons: Vec<RejectedReasonSummary>,
+}
+
+#[derive(Serialize)]
+struct PayoutSchedulerHealthResp {
+    status: String,
+    instance_id: String,
+    lease_held: bool,
+    lease_info: Option<LeaseInfo>,
+    pending_blocks: u64,
+    failed_batches: u64,
+    last_run: Option<String>,
+    last_success: Option<String>,
 }
 
 fn check_auth(headers: &HeaderMap, token: &str) -> bool {
@@ -218,6 +231,60 @@ async fn reconciliation_missing_found_blocks(
     }
 }
 
+async fn payout_scheduler_health(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    
+    // Get lease information
+    let lease_info = match state.db.get_lease_info() {
+        Ok(info) => info,
+        Err(err) => {
+            error!(error = %err, "failed to get lease info");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to get lease info").into_response();
+        }
+    };
+    
+    let lease_held = lease_info.as_ref().map(|i| i.is_valid).unwrap_or(false);
+    let instance_id = lease_info.as_ref().map(|i| i.owner.clone()).unwrap_or_else(|| "unknown".to_string());
+    
+    // Get pending blocks count
+    let pending_blocks = match state.db.found_block_state_summary() {
+        Ok(summary) => summary.matured,
+        Err(_) => 0,
+    };
+    
+    // Get failed batches count
+    let failed_batches = match state.db.payout_batch_state_summary() {
+        Ok(summary) => summary.failed,
+        Err(_) => 0,
+    };
+    
+    // Determine overall status
+    let status = if failed_batches > 0 {
+        "degraded".to_string()
+    } else if lease_held || pending_blocks == 0 {
+        "healthy".to_string()
+    } else {
+        "unhealthy".to_string()
+    };
+    
+    Json(PayoutSchedulerHealthResp {
+        status,
+        instance_id,
+        lease_held,
+        lease_info,
+        pending_blocks,
+        failed_batches,
+        last_run: None, // Would need to track this in scheduler
+        last_success: None, // Would need to track this in scheduler
+    })
+    .into_response()
+}
+
 pub async fn start_operator_api(
     bind: String,
     token: String,
@@ -238,6 +305,10 @@ pub async fn start_operator_api(
         .route(
             "/reconciliation/missing-found-blocks",
             get(reconciliation_missing_found_blocks),
+        )
+        .route(
+            "/health/payout-scheduler",
+            get(payout_scheduler_health),
         )
         .with_state(state);
 

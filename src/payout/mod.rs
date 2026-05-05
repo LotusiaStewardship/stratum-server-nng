@@ -1,4 +1,5 @@
 pub mod scheduler;
+pub mod scheduler_lease;
 
 use std::collections::HashMap;
 
