@@ -19,7 +19,10 @@ pub struct Config {
     pub stratum_bind: String,
     pub api_bind: String,
     pub api_token: String,
+    #[serde(default)]
     pub sqlite_path: String,
+    #[serde(default)]
+    pub network: String,
     pub nng_rpc_url: String,
     pub nng_pub_url: String,
     pub bitcoind_rpc: BitcoindRpcConfig,
@@ -154,6 +157,27 @@ impl Config {
         if let Ok(token) = std::env::var("STRATUM_API_TOKEN") {
             cfg.api_token = token;
         }
+
+        // Auto-detect network from RPC port if not explicitly set
+        if cfg.network.is_empty() {
+            cfg.network = detect_network_from_rpc_port(&cfg.bitcoind_rpc.url)?.to_string();
+        }
+
+        // Auto-set database path if using default pattern or not explicitly set
+        let should_override_db_path = cfg.sqlite_path.contains("stratum-accounting")
+            || cfg.sqlite_path.is_empty();
+        
+        if should_override_db_path {
+            cfg.sqlite_path = default_db_path_for_network(&cfg.network);
+        }
+
+        // Ensure parent directory exists for database path
+        if let Some(parent) = std::path::Path::new(&cfg.sqlite_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
         cfg.validate()?;
         Ok(cfg)
     }
@@ -161,6 +185,13 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.api_token.is_empty() {
             anyhow::bail!("api_token required")
+        }
+        if self.network.is_empty() {
+            anyhow::bail!("network required (auto-detected from RPC port or set explicitly)")
+        }
+        // Validate network is known value
+        if !["mainnet", "testnet", "regtest"].contains(&self.network.as_str()) {
+            anyhow::bail!("network must be one of: mainnet, testnet, regtest (got: {})", self.network);
         }
         let _ = self.resolve_pool_scripts()?;
         self.vardiff.validate()?;
@@ -246,4 +277,43 @@ fn reject_nulldata_script(script: &[u8], label: &str) -> Result<()> {
 fn script_fingerprint(script: &[u8]) -> String {
     let digest = Sha256::digest(script.to_vec().into());
     hex::encode(&digest.as_ref()[..6])
+}
+
+/// Extracts the network name from an RPC URL by parsing the port.
+///
+/// Returns:
+/// - "mainnet" for port 10604
+/// - "testnet" for port 11604
+/// - "regtest" for port 12604
+/// - Err for unknown ports or parse failures
+fn detect_network_from_rpc_port(rpc_url: &str) -> Result<&'static str> {
+    // Parse port from URL like "http://127.0.0.1:10604" or "tcp://host:10604"
+    let port = url::Url::parse(rpc_url)
+        .ok()
+        .and_then(|u| u.port())
+        .or_else(|| {
+            // Fallback: manually extract port if URL parsing fails
+            rpc_url
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+        })
+        .ok_or_else(|| anyhow!("failed to parse port from rpc_url: {}", rpc_url))?;
+
+    match port {
+        10604 => Ok("mainnet"),
+        11604 => Ok("testnet"),
+        12604 => Ok("regtest"),
+        _ => Err(anyhow!(
+            "unknown network for RPC port {}: expected 10604 (mainnet), 11604 (testnet), or 12604 (regtest)",
+            port
+        )),
+    }
+}
+
+/// Returns the default database path for a given network.
+///
+/// Convention: ./dbs/{network}/stratum-accounting.sqlite3
+fn default_db_path_for_network(network: &str) -> String {
+    format!("./dbs/{}/stratum-accounting.sqlite3", network)
 }

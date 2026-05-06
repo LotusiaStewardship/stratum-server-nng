@@ -39,6 +39,11 @@ async fn main() -> Result<()> {
         sqlite_path = %cfg.sqlite_path,
         "runtime configuration loaded"
     );
+    info!(
+        network = %cfg.network,
+        nng_rpc = %cfg.nng_rpc_url,
+        "network detected (auto-derived from RPC port)"
+    );
     info!(nng_rpc = %cfg.nng_rpc_url, nng_pub = %cfg.nng_pub_url, "nng endpoints configured");
 
     let stats = std::sync::Arc::new(RuntimeStats::default());

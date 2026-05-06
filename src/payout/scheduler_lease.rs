@@ -14,10 +14,23 @@ pub const DEFAULT_LEASE_DURATION_MINS: i64 = 5;
 
 /// Acquire a scheduler lease for the given instance.
 /// 
-/// Returns `Ok(true)` if lease was acquired successfully.
-/// Returns `Ok(false)` if another instance currently holds the lease.
+/// This is the entry point for an instance to claim exclusive rights to run
+/// the payout scheduler. Uses database-level locking to ensure only one
+/// instance can hold the lease at a time.
 /// 
+/// # Arguments
+/// * `db` - The accounting database connection
+/// * `instance_id` - Unique identifier for this pool instance (e.g., hostname, UUID)
+/// * `duration_minutes` - How long the lease should be valid before expiration
+/// 
+/// # Returns
+/// * `Ok(true)` - Lease was acquired successfully; this instance can run payouts
+/// * `Ok(false)` - Another instance currently holds the lease; skip this interval
+/// * `Err(...)` - Database error occurred during lease acquisition
+/// 
+/// # Lease Behavior
 /// The lease will automatically expire after `duration_minutes` if not renewed.
+/// This provides fail-safe behavior if an instance crashes without releasing.
 pub fn acquire_scheduler_lease(
     db: &AccountingDb,
     instance_id: &str,
@@ -28,8 +41,22 @@ pub fn acquire_scheduler_lease(
 
 /// Renew an existing scheduler lease.
 /// 
-/// Returns `Ok(true)` if lease was renewed successfully.
-/// Returns `Ok(false)` if this instance doesn't hold the lease (may have expired or been taken by another instance).
+/// Should be called periodically by the lease holder to extend the lease duration
+/// and prevent expiration. Typically called after completing a payout cycle.
+/// 
+/// # Arguments
+/// * `db` - The accounting database connection
+/// * `instance_id` - The instance ID that should hold the lease
+/// * `duration_minutes` - New lease duration from the time of renewal
+/// 
+/// # Returns
+/// * `Ok(true)` - Lease was renewed successfully; this instance continues to hold it
+/// * `Ok(false)` - This instance doesn't hold the lease (expired or taken by another)
+/// * `Err(...)` - Database error occurred during renewal
+/// 
+/// # Important
+/// If renewal returns `false`, the instance should stop payout processing and
+/// attempt to re-acquire the lease on the next interval.
 pub fn renew_scheduler_lease(
     db: &AccountingDb,
     instance_id: &str,
@@ -40,8 +67,18 @@ pub fn renew_scheduler_lease(
 
 /// Release a scheduler lease voluntarily.
 /// 
-/// Returns `Ok(true)` if lease was released.
-/// Returns `Ok(false)` if this instance didn't hold the lease.
+/// Called when an instance is shutting down gracefully or no longer needs to
+/// run the payout scheduler. Releases the lease immediately so another instance
+/// can acquire it without waiting for expiration.
+/// 
+/// # Arguments
+/// * `db` - The accounting database connection
+/// * `instance_id` - The instance ID that currently holds the lease
+/// 
+/// # Returns
+/// * `Ok(true)` - Lease was released successfully
+/// * `Ok(false)` - This instance didn't hold the lease (already released or expired)
+/// * `Err(...)` - Database error occurred during release
 pub fn release_scheduler_lease(
     db: &AccountingDb,
     instance_id: &str,
@@ -51,13 +88,33 @@ pub fn release_scheduler_lease(
 
 /// Check if a lease is currently held and by whom.
 /// 
-/// Returns `Ok(Some(owner))` if lease is held (not expired).
-/// Returns `Ok(None)` if no lease exists or lease has expired.
+/// Queries the database to determine the current lease status. Useful for
+/// monitoring, debugging, or deciding whether to attempt lease acquisition.
+/// 
+/// # Arguments
+/// * `db` - The accounting database connection
+/// 
+/// # Returns
+/// * `Ok(Some(owner))` - Lease is held by the given instance ID (not expired)
+/// * `Ok(None)` - No lease exists or the existing lease has expired
+/// * `Err(...)` - Database error occurred during status check
 pub fn check_lease_status(db: &AccountingDb) -> Result<Option<String>> {
     db.check_lease_status()
 }
 
 /// Get detailed lease information including expiration time.
+/// 
+/// Returns comprehensive lease metadata including owner, expiration timestamp,
+/// and validity status. More detailed than `check_lease_status()` which only
+/// returns the owner.
+/// 
+/// # Arguments
+/// * `db` - The accounting database connection
+/// 
+/// # Returns
+/// * `Ok(Some(LeaseInfo))` - Detailed lease information if a lease exists
+/// * `Ok(None)` - No lease exists in the database
+/// * `Err(...)` - Database error occurred
 pub fn get_lease_info(db: &AccountingDb) -> Result<Option<LeaseInfo>> {
     db.get_lease_info()
 }
@@ -67,6 +124,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Helper to create a fresh in-memory database for testing.
+    /// 
+    /// Returns a tuple of (TempDir, AccountingDb). The TempDir is kept alive
+    /// to prevent the temporary database file from being deleted.
     fn create_test_db() -> (TempDir, AccountingDb) {
         let tmp_dir = TempDir::new().expect("failed to create temp dir");
         let db_path = tmp_dir.path().join("test.db");
@@ -78,6 +139,9 @@ mod tests {
         (tmp_dir, db)
     }
 
+    /// Test: Acquiring a lease when no lease exists should succeed.
+    /// 
+    /// Verifies that the first instance to request a lease gets it.
     #[test]
     fn test_acquire_lease_when_no_lease_exists() {
         let (_tmp, db) = create_test_db();
@@ -96,6 +160,9 @@ mod tests {
         assert!(!info.is_expired);
     }
 
+    /// Test: Acquiring a lease when another instance already holds it should fail.
+    /// 
+    /// Verifies mutual exclusion - only one instance can hold the lease at a time.
     #[test]
     fn test_acquire_lease_when_another_instance_holds_it() {
         let (_tmp, db) = create_test_db();
@@ -116,6 +183,9 @@ mod tests {
         assert_eq!(info.unwrap().owner, "instance-1");
     }
 
+    /// Test: Acquiring a lease after the previous one has expired should succeed.
+    /// 
+    /// Verifies that expired leases don't block new acquisitions.
     #[test]
     fn test_acquire_lease_after_expiration() {
         let (_tmp, db) = create_test_db();
@@ -139,6 +209,9 @@ mod tests {
         assert_eq!(info.unwrap().owner, "instance-2");
     }
 
+    /// Test: Renewing a lease should extend the expiration time.
+    /// 
+    /// Verifies that the lease holder can extend their lease duration.
     #[test]
     fn test_renew_lease_success() {
         let (_tmp, db) = create_test_db();
@@ -161,6 +234,9 @@ mod tests {
         assert_eq!(info2.owner, "instance-1");
     }
 
+    /// Test: Renewing a lease with the wrong instance ID should fail.
+    /// 
+    /// Verifies that only the lease holder can renew it.
     #[test]
     fn test_renew_lease_wrong_instance() {
         let (_tmp, db) = create_test_db();
@@ -178,6 +254,9 @@ mod tests {
         assert_eq!(info.unwrap().owner, "instance-1");
     }
 
+    /// Test: Releasing a lease should remove it from the database.
+    /// 
+    /// Verifies that the lease holder can voluntarily release the lease.
     #[test]
     fn test_release_lease_success() {
         let (_tmp, db) = create_test_db();
@@ -195,6 +274,9 @@ mod tests {
         assert!(info.is_none());
     }
 
+    /// Test: Releasing a lease with the wrong instance ID should fail.
+    /// 
+    /// Verifies that only the lease holder can release it.
     #[test]
     fn test_release_lease_wrong_instance() {
         let (_tmp, db) = create_test_db();
@@ -212,6 +294,9 @@ mod tests {
         assert_eq!(info.unwrap().owner, "instance-1");
     }
 
+    /// Test: check_lease_status should return the current lease owner.
+    /// 
+    /// Verifies basic status reporting functionality.
     #[test]
     fn test_check_lease_status() {
         let (_tmp, db) = create_test_db();
@@ -228,6 +313,9 @@ mod tests {
         assert_eq!(status, Some("instance-1".to_string()));
     }
 
+    /// Test: check_lease_status should return None for an expired lease.
+    /// 
+    /// Verifies that expired leases are treated as non-existent.
     #[test]
     fn test_check_lease_status_expired() {
         let (_tmp, db) = create_test_db();
@@ -243,6 +331,9 @@ mod tests {
         assert!(status.is_none());
     }
 
+    /// Test: Multiple instances competing for a lease should result in exactly one winner.
+    /// 
+    /// Verifies that lease acquisition is atomic and prevents race conditions.
     #[test]
     fn test_lease_contention_multiple_instances() {
         let (_tmp, db) = create_test_db();
@@ -268,6 +359,9 @@ mod tests {
         assert_eq!(info.owner, "instance-1");
     }
 
+    /// Test: Full lifecycle of acquire → renew → release should work correctly.
+    /// 
+    /// Verifies the complete lease management workflow.
     #[test]
     fn test_acquire_renew_release_lifecycle() {
         let (_tmp, db) = create_test_db();
