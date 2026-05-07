@@ -1,4 +1,4 @@
-use crate::accounting::{PayoutBatch, PayoutMethod, Round, Share, Worker};
+use crate::accounting::{FoundBlock, PayoutBatch, PayoutMethod, Round, Share, Worker};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,7 +16,7 @@ pub struct MissingFoundBlock {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FoundBlockStateSummary {
-    pub pending: u64,
+    pub confirmed: u64,
     pub matured: u64,
     pub orphaned: u64,
     pub paid: u64,
@@ -148,7 +148,7 @@ impl AccountingDb {
                     round_id INTEGER NOT NULL,
                     block_hash TEXT NOT NULL UNIQUE,
                     height INTEGER,
-                    status TEXT NOT NULL DEFAULT 'pending',
+                    status TEXT NOT NULL DEFAULT 'confirmed',
                     confirmations INTEGER NOT NULL DEFAULT 0,
                     template_id INTEGER,
                     worker_id INTEGER,
@@ -199,7 +199,7 @@ impl AccountingDb {
             &tx,
             "found_blocks",
             "status",
-            "TEXT NOT NULL DEFAULT 'pending'",
+            "TEXT NOT NULL DEFAULT 'confirmed'",
         )?;
         Self::ensure_column(
             &tx,
@@ -223,8 +223,8 @@ impl AccountingDb {
         Self::ensure_column(
             &tx,
             "found_blocks",
-            "chain_state",
-            "TEXT NOT NULL DEFAULT 'pending'",
+            "orphan_reason",
+            "TEXT",
         )?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS payout_scheduler_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
@@ -347,6 +347,14 @@ impl AccountingDb {
         Self::ensure_column(&tx, "rounds", "status", "TEXT NOT NULL DEFAULT 'open'")?;
         Self::ensure_column(&tx, "rounds", "close_reason", "TEXT")?;
         Self::ensure_column(&tx, "rounds", "closed_at", "TEXT")?;
+
+        // Add indexes for found_blocks
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_found_blocks_status_height 
+                ON found_blocks(status, height);
+             CREATE INDEX IF NOT EXISTS idx_found_blocks_height_hash 
+                ON found_blocks(height, block_hash);",
+        )?;
 
         tx.commit()?;
         Ok(())
@@ -574,8 +582,8 @@ impl AccountingDb {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
 
         conn.execute(
-            "INSERT INTO found_blocks(round_id, block_hash, height, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 100, 'pending', 'pending', 0, ?9)
+            "INSERT INTO found_blocks(round_id, block_hash, height, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 100, 'confirmed', ?9)
              ON CONFLICT(block_hash) DO UPDATE SET
                 round_id=excluded.round_id,
                 height=excluded.height,
@@ -692,13 +700,201 @@ impl AccountingDb {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let row = conn
             .query_row(
-                "SELECT id, block_hash FROM found_blocks WHERE chain_state='matured' AND status='matured' ORDER BY id ASC LIMIT 1",
+                "SELECT id, block_hash FROM found_blocks WHERE status='matured' ORDER BY id ASC LIMIT 1",
                 [],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
         Ok(row)
     }
+
+    /// Find latest found_block by height (for reconciliation)
+    pub fn find_latest_found_block(&self) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 ORDER BY height DESC 
+                 LIMIT 1",
+                [],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Find found_block by exact height
+    pub fn find_found_block_by_height(&self, height: i64) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 WHERE height = ?1",
+                params![height],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Find found_block by height AND hash (for precise orphan detection)
+    pub fn find_found_block_by_height_and_hash(
+        &self,
+        height: i64,
+        hash: &str,
+    ) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 WHERE height = ?1 AND block_hash = ?2",
+                params![height, hash],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark found_block as confirmed (status only; confirmations computed on-demand)
+    pub fn mark_found_block_confirmed(
+        &self,
+        block_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks 
+             SET status = 'confirmed' 
+             WHERE block_hash = ?1 AND status = 'pending'",
+            params![block_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Mark found_block as orphaned with reason
+    pub fn mark_found_block_orphaned(
+        &self,
+        block_hash: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks 
+             SET status = 'orphaned', 
+                 disconnected_at = ?1, 
+                 orphan_reason = ?2 
+             WHERE block_hash = ?3",
+            params![now, reason, block_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Mark matured blocks based on tip height and coinbase maturity.
+    /// Formula: confirmations = tip_height - height + 1
+    /// DEPRECATED: Confirmations are now computed on-demand. Use mark_blocks_matured instead.
+    #[deprecated(since = "0.3.0", note = "Use mark_blocks_matured which uses computed confirmations")]
+    pub fn sync_found_block_confirmations(
+        &self,
+        _tip_height: i64,
+        _min_confirmations: u32,
+    ) -> Result<()> {
+        // No-op: confirmations are computed on-demand via FoundBlock::confirmations()
+        Ok(())
+    }
+
+    /// Mark blocks as matured based on tip height.
+    /// Uses computed confirmations: tip_height - height + 1
+    pub fn mark_blocks_matured(
+        &self,
+        tip_height: i64,
+        coinbase_maturity: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        // Blocks where (tip_height - height + 1) >= coinbase_maturity
+        // → height <= tip_height - coinbase_maturity + 1
+        let max_height = tip_height - coinbase_maturity + 1;
+        conn.execute(
+            "UPDATE found_blocks
+             SET status = 'matured', 
+                 matured_at = ?1
+             WHERE status = 'confirmed' 
+               AND height <= ?2",
+            params![now, max_height],
+        )?;
+        Ok(())
+    }
+
+
 
     pub fn mark_found_block_payout_submitted(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
@@ -803,89 +999,20 @@ impl AccountingDb {
         Ok(())
     }
 
-    pub fn sync_found_block_confirmations(
-        &self,
-        tip_height: i64,
-        min_confirmations: u32,
-    ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        conn.execute(
-            "UPDATE found_blocks
-             SET confirmations = CASE
-                WHEN height IS NULL THEN confirmations
-                WHEN ?1 - height + 1 < 0 THEN 0
-                ELSE (?1 - height + 1)
-             END
-             WHERE chain_state='pending'",
-            params![tip_height],
-        )?;
-        conn.execute(
-            "UPDATE found_blocks
-             SET chain_state='matured', status='matured', matured_at=?1
-             WHERE chain_state='pending' AND confirmations >= CASE
-                WHEN coinbase_maturity_blocks > ?2 THEN coinbase_maturity_blocks ELSE ?2 END",
-            params![now, min_confirmations as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_pending_blocks_orphaned(&self) -> Result<u64> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let mut rounds = Vec::new();
-        {
-            let mut stmt = conn.prepare("SELECT DISTINCT round_id, block_hash, template_id FROM found_blocks WHERE chain_state='pending'")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                rounds.push(row?);
-            }
-        }
-        let changed = conn.execute(
-            "UPDATE found_blocks
-             SET chain_state='orphaned', status='orphaned', disconnected_at=?1
-             WHERE chain_state='pending'",
-            params![now],
-        )?;
-        conn.execute(
-            "UPDATE payout_batches
-             SET status='invalidated_orphan', last_error='found block orphaned'
-             WHERE status IN ('planned','signed','submitted')
-               AND found_block_id IN (SELECT id FROM found_blocks WHERE chain_state='orphaned')",
-            [],
-        )?;
-        drop(conn);
-        for (round_id, block_hash, template_id) in rounds {
-            let _ = self.close_round(
-                round_id,
-                template_id.map(|v| v as u64),
-                "round_closed_orphaned",
-                Some(&block_hash),
-            );
-        }
-        Ok(changed as u64)
-    }
-
     pub fn found_block_state_summary(&self) -> Result<FoundBlockStateSummary> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let pending: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='pending'",
+        let confirmed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM found_blocks WHERE status='confirmed'",
             [],
             |r| r.get(0),
         )?;
         let matured: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='matured'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='matured'",
             [],
             |r| r.get(0),
         )?;
         let orphaned: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='orphaned'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='orphaned'",
             [],
             |r| r.get(0),
         )?;
@@ -895,7 +1022,7 @@ impl AccountingDb {
             |r| r.get(0),
         )?;
         Ok(FoundBlockStateSummary {
-            pending: pending as u64,
+            confirmed: confirmed as u64,
             matured: matured as u64,
             orphaned: orphaned as u64,
             paid: paid as u64,
@@ -1000,7 +1127,7 @@ impl AccountingDb {
     pub fn scheduler_health_summary(&self) -> Result<SchedulerHealthSummary> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let matured_found_blocks_ready: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='matured' AND status='matured'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='matured'",
             [],
             |r| r.get(0),
         )?;
@@ -1444,7 +1571,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "pending");
+        assert_eq!(status, "confirmed");
     }
 
     #[test]
@@ -1464,7 +1591,8 @@ mod tests {
             "submit_flow",
         )
         .unwrap();
-        assert_eq!(db.mark_pending_blocks_orphaned().unwrap(), 1);
+        db.mark_found_block_orphaned("bh2", "test_orphan").unwrap();
+        
         db.record_found_block(
             "bh3",
             11,
@@ -1475,9 +1603,9 @@ mod tests {
             "submit_flow",
         )
         .unwrap();
-        for _ in 0..100 {
-            db.sync_found_block_confirmations(220, 100).unwrap();
-        }
+        // Mark as matured (tip=220, height=120 => confirmations=101 >= 100)
+        db.mark_blocks_matured(220, 100).unwrap();
+        
         let conn = db.conn.lock().unwrap();
         let status: String = conn
             .query_row(
@@ -1487,5 +1615,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "matured");
+        
+        // Verify orphaned block returns -1 confirmations
+        let orphaned = db.find_found_block_by_height(10).unwrap().unwrap();
+        assert_eq!(orphaned.confirmations(220), -1);
+        
+        // Verify matured block has correct confirmations
+        let matured = db.find_found_block_by_height(11).unwrap().unwrap();
+        assert_eq!(matured.confirmations(220), 101);
     }
 }

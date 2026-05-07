@@ -61,7 +61,7 @@ struct PayoutSchedulerHealthResp {
     instance_id: String,
     lease_held: bool,
     lease_info: Option<LeaseInfo>,
-    pending_blocks: u64,
+    confirmed_blocks: u64,
     failed_batches: u64,
     last_run: Option<String>,
     last_success: Option<String>,
@@ -99,7 +99,7 @@ async fn status(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoR
         .db
         .found_block_state_summary()
         .unwrap_or(FoundBlockStateSummary {
-            pending: 0,
+            confirmed: 0,
             matured: 0,
             orphaned: 0,
             paid: 0,
@@ -251,8 +251,8 @@ async fn payout_scheduler_health(
     let lease_held = lease_info.as_ref().map(|i| i.is_valid).unwrap_or(false);
     let instance_id = lease_info.as_ref().map(|i| i.owner.clone()).unwrap_or_else(|| "unknown".to_string());
     
-    // Get pending blocks count
-    let pending_blocks = match state.db.found_block_state_summary() {
+    // Get confirmed blocks count
+    let confirmed_blocks = match state.db.found_block_state_summary() {
         Ok(summary) => summary.matured,
         Err(_) => 0,
     };
@@ -266,7 +266,7 @@ async fn payout_scheduler_health(
     // Determine overall status
     let status = if failed_batches > 0 {
         "degraded".to_string()
-    } else if lease_held || pending_blocks == 0 {
+    } else if lease_held || confirmed_blocks == 0 {
         "healthy".to_string()
     } else {
         "unhealthy".to_string()
@@ -277,7 +277,7 @@ async fn payout_scheduler_health(
         instance_id,
         lease_held,
         lease_info,
-        pending_blocks,
+        confirmed_blocks,
         failed_batches,
         last_run: None, // Would need to track this in scheduler
         last_success: None, // Would need to track this in scheduler

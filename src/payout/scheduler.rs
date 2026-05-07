@@ -117,16 +117,16 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 continue;
             }
         };
-        // Sync confirmation counts for all found blocks in the database
-        // Marks blocks as matured once they have enough confirmations
-        if let Err(err) = db.sync_found_block_confirmations(
+        // Mark matured blocks based on tip height
+        // Blocks are matured when: tip_height - block.height + 1 >= coinbase_maturity
+        if let Err(err) = db.mark_blocks_matured(
             tip_height,
             cfg.pool
                 .pplns
                 .min_confirmations
-                .max(COINBASE_MATURITY_BLOCKS),
+                .max(COINBASE_MATURITY_BLOCKS) as i64,
         ) {
-            error!(error = %err, "failed syncing found block confirmations");
+            error!(error = %err, "failed marking matured blocks");
             continue;
         }
 

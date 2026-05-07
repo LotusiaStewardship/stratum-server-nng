@@ -1,9 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bitcoinsuite_bitcoind_nng::{
-    Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
+    OptionExt, Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
 };
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, Sha256d};
+use flatbuffers::VerifierOptions;
 use tracing::{debug, info, warn};
 
 /// Result of submitting a block via JSON-RPC submitblock
@@ -98,9 +99,17 @@ impl JsonRpcClient {
 
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
-    UpdateBlkTip,
     MempoolRefresh,
-    BlockDisconnected,
+    BlockConnected {
+        height: i64,
+        hash: String,
+        prev_hash: String,
+    },
+    BlockDisconnected {
+        height: i64,
+        hash: String,
+        prev_hash: String,
+    },
 }
 
 // ============================================================================
@@ -133,19 +142,19 @@ impl NngAdapter {
 
         // Subscribe to template-affecting topics
         pubif
-            .subscribe("updateblktip")
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        pubif
             .subscribe("mempooltxadd")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         pubif
             .subscribe("mempooltxrem")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         pubif
+            .subscribe("blkconnected")
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        pubif
             .subscribe("blkdisconctd")
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        info!("NNG pub subscriptions active: updateblktip,mempooltxadd,mempooltxrem,blkdisconctd");
+        info!("NNG pub subscriptions active: mempooltxadd,mempooltxrem,blkconnected,blkdisconctd");
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             loop {
@@ -159,9 +168,73 @@ impl NngAdapter {
                     "NNG pub message received"
                 );
                 match topic {
-                    "updateblktip" => on_event(NodeEvent::UpdateBlkTip),
                     "mempooltxadd" | "mempooltxrem" => on_event(NodeEvent::MempoolRefresh),
-                    "blkdisconctd" => on_event(NodeEvent::BlockDisconnected),
+                    "blkconnected" => {
+                        // Parse the BlockConnected flatbuffer to extract height, hash, prev_hash
+                        use bitcoinsuite_bitcoind_nng::nng_interface_generated::nng_interface::BlockConnected;
+                        
+                        let fbb_opts = VerifierOptions {
+                            max_tables: 0xffff_ffff,
+                            ..Default::default()
+                        };
+                        match flatbuffers::root_with_opts::<BlockConnected>(&fbb_opts, &payload) {
+                            Ok(msg) => {
+                                let block = msg.block().field("BlockConnected.block").ok();
+                                if let Some(block) = block {
+                                    let header = block.header().field("Block.header").ok();
+                                    if let Some(header) = header {
+                                        let height = get_raw_block_height(header.raw().field("BlockHeader.raw").map(|r| r.bytes()).unwrap_or(&[])).unwrap_or(0);
+                                        let hash = header.block_hash().field("BlockHeader.block_hash").ok()
+                                            .and_then(|bh| bh.hash().field("BlockHash.hash").ok())
+                                            .map(|h| hex::encode(h.0.iter().rev().copied().collect::<Vec<_>>()))
+                                            .unwrap_or_default();
+                                        let prev_hash = header.prev_block_hash().field("BlockHeader.prev_block_hash").ok()
+                                            .and_then(|bh| bh.hash().field("BlockHash.hash").ok())
+                                            .map(|h| hex::encode(h.0.iter().rev().copied().collect::<Vec<_>>()))
+                                            .unwrap_or_default();
+                                        on_event(NodeEvent::BlockConnected { height, hash, prev_hash });
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "failed parsing blkconnected flatbuffer"),
+                        }
+                        // Fallback: emit event without data if parsing fails
+                        on_event(NodeEvent::BlockConnected { height: 0, hash: String::new(), prev_hash: String::new() });
+                    }
+                    "blkdisconctd" => {
+                        // Parse the BlockDisconnected flatbuffer to extract height, hash, prev_hash
+                        use bitcoinsuite_bitcoind_nng::nng_interface_generated::nng_interface::BlockDisconnected;
+                        
+                        let fbb_opts = VerifierOptions {
+                            max_tables: 0xffff_ffff,
+                            ..Default::default()
+                        };
+                        match flatbuffers::root_with_opts::<BlockDisconnected>(&fbb_opts, &payload) {
+                            Ok(msg) => {
+                                let block = msg.block().field("BlockDisconnected.block").ok();
+                                if let Some(block) = block {
+                                    let header = block.header().field("Block.header").ok();
+                                    if let Some(header) = header {
+                                        let height = get_raw_block_height(header.raw().field("BlockHeader.raw").map(|r| r.bytes()).unwrap_or(&[])).unwrap_or(0);
+                                        let hash = header.block_hash().field("BlockHeader.block_hash").ok()
+                                            .and_then(|bh| bh.hash().field("BlockHash.hash").ok())
+                                            .map(|h| hex::encode(h.0.iter().rev().copied().collect::<Vec<_>>()))
+                                            .unwrap_or_default();
+                                        let prev_hash = header.prev_block_hash().field("BlockHeader.prev_block_hash").ok()
+                                            .and_then(|bh| bh.hash().field("BlockHash.hash").ok())
+                                            .map(|h| hex::encode(h.0.iter().rev().copied().collect::<Vec<_>>()))
+                                            .unwrap_or_default();
+                                        on_event(NodeEvent::BlockDisconnected { height, hash, prev_hash });
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "failed parsing blkdisconctd flatbuffer"),
+                        }
+                        // Fallback: emit event without data if parsing fails
+                        on_event(NodeEvent::BlockDisconnected { height: 0, hash: String::new(), prev_hash: String::new() });
+                    }
                     _ => warn!(topic, "unknown NNG topic ignored"),
                 }
             }
@@ -195,6 +268,20 @@ impl BitcoindMiningAdapter {
     }
 }
 
+/// Extract block height from raw header bytes (little-endian u32 at offset 60-64)
+/// Per Lotus block header format: https://lotusia.org/docs/specs/blockheader
+pub fn get_raw_block_height(header_raw: &[u8]) -> Option<i64> {
+    if header_raw.len() < 64 {
+        return None;
+    }
+    Some(i64::from(i32::from_le_bytes([
+        header_raw[60],
+        header_raw[61],
+        header_raw[62],
+        header_raw[63],
+    ])))
+}
+
 /// High-level mining adapter trait used by stratum server.
 /// Combines NNG operations (templates, blocks, pubsub) with JSON-RPC operations (submitblock).
 #[async_trait]
@@ -205,6 +292,7 @@ pub trait NodeMiningAdapter: Send + Sync {
         coinbase_identity: Option<Vec<u8>>,
     ) -> Result<MiningTemplate>;
     async fn get_block_by_hash(&self, block_hash_hex_be: &str) -> Result<Block>;
+    async fn get_block_by_height(&self, height: i64) -> Result<Block>;
     async fn submit_block(&self, block: Vec<u8>) -> Result<SubmitBlockRpcResult>;
 }
 
@@ -232,6 +320,13 @@ impl NodeMiningAdapter for BitcoindMiningAdapter {
         self.nng
             .rpc
             .get_block(BlockIdentifier::Hash(hash))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    async fn get_block_by_height(&self, height: i64) -> Result<Block> {
+        self.nng
+            .rpc
+            .get_block(BlockIdentifier::Height(height as i32))
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 

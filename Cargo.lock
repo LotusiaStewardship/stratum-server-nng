@@ -2295,6 +2295,7 @@ dependencies = [
  "bitcoinsuite-ecc-secp256k1",
  "chrono",
  "clap",
+ "flatbuffers",
  "hex",
  "parking_lot",
  "primitive-types",
