@@ -82,11 +82,12 @@ pub struct FoundBlock {
 impl FoundBlock {
     /// Compute confirmations from authoritative tip height.
     /// Returns -1 for orphaned blocks (per lotusd parlance).
+    /// Returns 0 for non-orphaned blocks when tip is behind block height.
     pub fn confirmations(&self, tip_height: i64) -> i64 {
         if self.status == "orphaned" {
             return -1;
         }
-        tip_height - self.height + 1
+        (tip_height - self.height + 1).max(0)
     }
 
     /// Check if block is matured based on confirmations.

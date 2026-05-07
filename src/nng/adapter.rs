@@ -91,6 +91,41 @@ impl JsonRpcClient {
             block_hash,
         })
     }
+
+    /// Get current blockchain tip height via JSON-RPC getblockcount
+    pub async fn get_block_count(&self) -> Result<i64> {
+        let rpc_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "stratum-getblockcount",
+            "method": "getblockcount",
+            "params": []
+        });
+
+        let response = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.rpc_user, Some(&self.rpc_pass))
+            .json(&rpc_request)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP RPC request failed: {}", e))?;
+
+        let rpc_response: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP RPC response parse failed: {}", e))?;
+
+        // Parse JSON-RPC error field
+        if let Some(error) = rpc_response.get("error") {
+            if !error.is_null() {
+                anyhow::bail!("RPC error: {}", error);
+            }
+        }
+
+        rpc_response["result"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("getblockcount returned non-integer result"))
+    }
 }
 
 // ============================================================================
@@ -294,6 +329,7 @@ pub trait NodeMiningAdapter: Send + Sync {
     async fn get_block_by_hash(&self, block_hash_hex_be: &str) -> Result<Block>;
     async fn get_block_by_height(&self, height: i64) -> Result<Block>;
     async fn submit_block(&self, block: Vec<u8>) -> Result<SubmitBlockRpcResult>;
+    async fn get_block_count(&self) -> Result<i64>;
 }
 
 #[async_trait]
@@ -324,6 +360,10 @@ impl NodeMiningAdapter for BitcoindMiningAdapter {
     }
 
     async fn get_block_by_height(&self, height: i64) -> Result<Block> {
+        // Validate height fits in i32 range to prevent silent truncation
+        if height < i32::MIN as i64 || height > i32::MAX as i64 {
+            anyhow::bail!("block height {} out of valid range [{}, {}]", height, i32::MIN, i32::MAX);
+        }
         self.nng
             .rpc
             .get_block(BlockIdentifier::Height(height as i32))
@@ -332,5 +372,9 @@ impl NodeMiningAdapter for BitcoindMiningAdapter {
 
     async fn submit_block(&self, block: Vec<u8>) -> Result<SubmitBlockRpcResult> {
         self.json_rpc.submit_block(block).await
+    }
+
+    async fn get_block_count(&self) -> Result<i64> {
+        self.json_rpc.get_block_count().await
     }
 }

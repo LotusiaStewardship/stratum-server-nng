@@ -287,12 +287,16 @@ pub async fn run_stratum_server(
     let pool_scripts = cfg.resolve_pool_scripts()?;
     info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
     
+    // Fetch actual chain tip from node via RPC
+    let node_tip = adapter.get_block_count().await?;
+    info!(node_tip, "fetched chain tip from node");
+    
     // Reconcile found_blocks with node on startup
-    let reconciled_height = reconcile_found_blocks(&db, &adapter).await?;
-    info!(reconciled_height, "found_blocks reconciled on startup");
+    let _reconciled_height = reconcile_found_blocks(&db, &adapter).await?;
     
     // Track tip height from blkconnected events for confirmation computation
-    let tip_height = Arc::new(AtomicI64::new(reconciled_height));
+    // Initialize from node's actual tip, not reconciliation result
+    let tip_height = Arc::new(AtomicI64::new(node_tip));
     
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
     refresh_job_from_node(
@@ -320,6 +324,7 @@ pub async fn run_stratum_server(
     let diff_cache_events = diff_cache.clone();
     let debug = cfg.debug;
     let tip_height_events = tip_height.clone();
+    let min_confirmations = cfg.pool.pplns.min_confirmations as i64;
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
@@ -334,10 +339,10 @@ pub async fn run_stratum_server(
                         // Update tip height tracker
                         tip_height_events.store(*height, Ordering::SeqCst);
                         
-                        // Mark matured blocks based on new tip
+                        // Mark matured blocks based on new tip using configured min_confirmations
                         if let Err(err) = db_events.mark_blocks_matured(
                             *height,
-                            100, // coinbase_maturity (will be refined in payout scheduler)
+                            min_confirmations,
                         ) {
                             error!(error = %err, "failed marking matured blocks after blkconnected");
                         }
@@ -389,10 +394,10 @@ pub async fn run_stratum_server(
                         // Update tip height tracker (reorg: tip goes back to prev block)
                         tip_height_events.store(height - 1, Ordering::SeqCst);
                         
-                        // Mark matured blocks based on new tip
+                        // Mark matured blocks based on new tip using configured min_confirmations
                         if let Err(err) = db_events.mark_blocks_matured(
                             height - 1,
-                            100, // coinbase_maturity (will be refined in payout scheduler)
+                            min_confirmations,
                         ) {
                             error!(error = %err, "failed marking matured blocks after reorg");
                         }
@@ -419,8 +424,14 @@ pub async fn run_stratum_server(
 
         if let Err(err) = rpc_adapter
             .run_pub_loop(&nng_pub_url, move |ev| {
+                // Log event type for debugging drops
+                let event_type = match &ev {
+                    NodeEvent::MempoolRefresh => "mempool".to_string(),
+                    NodeEvent::BlockConnected { height, .. } => format!("blkconnected@{}", height),
+                    NodeEvent::BlockDisconnected { height, .. } => format!("blkdisconctd@{}", height),
+                };
                 if tx.send(ev).is_err() {
-                    warn!("NNG event queue dropped; stratum event consumer not running");
+                    warn!(event_type, "NNG event dropped; stratum event consumer not running");
                 }
             })
             .await
