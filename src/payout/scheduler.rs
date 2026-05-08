@@ -23,8 +23,11 @@ use crate::{
 const COINBASE_MATURITY_BLOCKS: u32 = 100;
 
 /// Default gross reward in satoshis used for payout calculation.
-/// This is the expected block reward (13 LTC = 1,300,000,000 satoshis).
-const DEFAULT_GROSS_REWARD_SAT: i64 = 1_300_000_000;
+/// Lotus block subsidy is 260 XPI (260,000,000 satoshis), split 50/50:
+/// - vout[1]: pool payout output (130,000,000 sats)
+/// - vout[2]: minerfund/dev fund (130,000,000 sats)
+/// This constant represents the pool's payout output (vout[1]).
+const DEFAULT_GROSS_REWARD_SAT: i64 = 130_000_000;
 
 /// Main entry point for the payout scheduler background task.
 /// 
@@ -51,7 +54,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
         return Ok(());
     }
 
-    // Load the pool's payout script (used to identify coinbase outputs and for change)
+    // Load the pool's payout script (used to identify coinbase outputs and for signing)
     let payout_script = cfg.resolve_pool_scripts()?.payout_script;
     // Load the signing private key from configuration
     let signing_key = cfg
@@ -171,17 +174,17 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
 
             // Get fee configuration for payout calculation
             let fee_address = cfg.pool.fee.fee_address.as_deref();
+            let fee_enabled = cfg.pool.fee.enabled;
+            let fee_bps = if fee_enabled { cfg.pool.fee.fee_bps } else { 0 };
+            let min_payout_sat = cfg.pool.pplns.min_payout_sat;
             // Build initial payout plan using default gross reward (will be corrected below)
             let mut plan = build_pplns_payout_plan(
                 DEFAULT_GROSS_REWARD_SAT,
-                if cfg.pool.fee.enabled {
-                    cfg.pool.fee.fee_bps
-                } else {
-                    0
-                },
+                fee_bps,
                 fee_address,
                 &shares,
-                cfg.pool.pplns.min_payout_sat,
+                min_payout_sat,
+            );
             );
 
             // Fetch the actual found block to extract the real coinbase reward
@@ -222,15 +225,13 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 continue;
             }
             // Update payout plan with actual coinbase reward value (not the default)
-            plan.gross_reward_sat = payout_output.value;
+            let actual_coinbase_value = payout_output.value;
+            let default_diff = actual_coinbase_value - DEFAULT_GROSS_REWARD_SAT;
+            plan.gross_reward_sat = actual_coinbase_value;
             // Recalculate fee based on actual gross reward
             plan.fee_sat = crate::payout::compute_fee(
                 plan.gross_reward_sat,
-                if cfg.pool.fee.enabled {
-                    cfg.pool.fee.fee_bps
-                } else {
-                    0
-                },
+                fee_bps,
             );
             plan.net_reward_sat = plan.gross_reward_sat - plan.fee_sat;
 
@@ -250,12 +251,34 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             )?;
 
             // Build and sign the payout transaction using the coinbase as input
+            let coinbase_txid_hex = coinbase.tx.txid.to_hex_be();
+            let coinbase_input_value = payout_output.value;
+            
+            // Separate worker outputs from fee output for transaction construction
+            // plan.outputs includes fee for accounting, but TxBuilder handles fee as Leftover
+            let fee_addr_str = cfg.pool.fee.fee_address.as_deref();
+            let worker_outputs: Vec<(String, i64)> = if fee_addr_str.is_some() && !plan.outputs.is_empty() {
+                // Fee output is appended last by build_pplns_payout_plan
+                plan.outputs.iter().take(plan.outputs.len() - 1).cloned().collect()
+            } else {
+                plan.outputs.clone()
+            };
+            
+            // Build fee script for Leftover output
+            let fee_script = if let Some(fee_addr) = fee_addr_str {
+                fee_addr.parse::<LotusAddress>()?.script().clone()
+            } else {
+                // Fallback to payout script if no fee address configured
+                Script::from_slice(&payout_script)
+            };
+            
             let signed_tx = match build_and_sign_payout_tx(
-                &plan.outputs,
+                &worker_outputs,
+                &fee_script,
                 &payout_script,
                 &seckey,
                 coinbase.tx.txid.clone(),
-                payout_output.value,
+                coinbase_input_value,
             ) {
                 Ok(tx) => tx,
                 Err(err) => {
@@ -369,14 +392,15 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
 /// 
 /// Creates a transaction with:
 /// - Input: coinbase vout[1] (the payout output from the found block)
-/// - Outputs: one output per miner in the payout plan, plus optional change
+/// - Outputs: one output per miner (fixed amounts), pool fee receives the leftover
 /// 
 /// Uses P2PKH signing with the pool's private key. The sequence number is set
 /// to 0xffff_fffe to enable Replace-By-Fee (RBF) if needed.
 /// 
 /// # Arguments
-/// * `outputs` - List of (address, amount) pairs to pay to miners
-/// * `payout_script_bytes` - Pool's payout script (used for change output)
+/// * `outputs` - List of (address, amount) pairs to pay to miners (excludes pool fee)
+/// * `fee_script` - Pool's fee address script (receives leftover after network fee)
+/// * `payout_script_bytes` - Pool's payout script (used for signing the input)
 /// * `seckey` - Pool's private key for signing
 /// * `prev_txid` - Transaction ID of the coinbase transaction
 /// * `prev_value` - Value of the coinbase payout output in satoshis
@@ -385,11 +409,12 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
 /// * `Ok(UnhashedTx)` - Signed payout transaction ready for serialization
 /// * `Err(...)` - If signing fails, outputs exceed input, or script is not P2PKH
 /// 
-/// # Change Handling
-/// If total outputs < prev_value, leftover satoshis are sent back to the pool
-/// payout script as a change output (deterministic, no fee calculation).
+/// # Fee Handling
+/// Network fee is automatically calculated at 2 sat/byte by TxBuilder::sign().
+/// The pool fee output receives: prev_value - worker_outputs - network_fee.
 fn build_and_sign_payout_tx(
     outputs: &[(String, i64)],
+    fee_script: &Script,
     payout_script_bytes: &[u8],
     seckey: &SecKey,
     prev_txid: bitcoinsuite_core::Sha256d,
@@ -399,7 +424,7 @@ fn build_and_sign_payout_tx(
     let ecc = EccSecp256k1::default();
     // Derive public key from the secret key
     let pubkey = ecc.derive_pubkey(seckey);
-    // Load the payout script for validation and change output
+    // Load the payout script for input signing validation
     let payout_script = Script::from_slice(payout_script_bytes);
     // Verify the payout script is P2PKH (only supported type for internal signing)
     if !matches!(
@@ -409,8 +434,22 @@ fn build_and_sign_payout_tx(
         anyhow::bail!("internal signing currently supports only P2PKH payout script")
     }
 
-    // Build the transaction with one input (coinbase) and multiple outputs (miners)
-    let mut tx_builder = TxBuilder {
+    // Build worker outputs (fixed amounts) + pool fee (leftover after network fee)
+    let mut builder_outputs: Vec<TxBuilderOutput> = outputs
+        .iter()
+        .map(|(address, amount)| {
+            let addr: LotusAddress = address.parse()?;
+            Ok(TxBuilderOutput::Fixed(TxOutput {
+                value: *amount,
+                script: addr.script().clone(),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Pool fee receives whatever remains after worker payouts and network fee
+    builder_outputs.push(TxBuilderOutput::Leftover(fee_script.clone()));
+
+    // Build the transaction with one input (coinbase) and the outputs above
+    let tx_builder = TxBuilder {
         version: 2,
         // Single input: coinbase vout[1] (payout output)
         inputs: vec![TxBuilderInput::new(
@@ -433,36 +472,11 @@ fn build_and_sign_payout_tx(
                 sig_hash_type: SigHashType::ALL_BIP143, // BIP143 segwit-style sighash
             }),
         )],
-        // One output per miner payout address
-        outputs: outputs
-            .iter()
-            .map(|(address, amount)| {
-                let addr: LotusAddress = address.parse()?;
-                Ok(TxBuilderOutput::Fixed(TxOutput {
-                    value: *amount,
-                    script: addr.script().clone(),
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?,
+        outputs: builder_outputs,
         lock_time: 0,
     };
 
-    // Calculate total output value to check against input value
-    let total_out: i64 = outputs.iter().map(|(_, amount)| *amount).sum();
-    // Sanity check: outputs cannot exceed the coinbase input value
-    if total_out > prev_value {
-        anyhow::bail!("payout outputs exceed available coinbase payout value")
-    }
-    // If there's leftover value, add a change output back to the pool
-    // This handles satoshi rounding differences and ensures exact balance
-    if total_out < prev_value {
-        // Keep change deterministic by returning leftovers to pool payout script.
-        tx_builder.outputs.push(TxBuilderOutput::Fixed(TxOutput {
-            value: prev_value - total_out,
-            script: Script::from_slice(payout_script_bytes),
-        }));
-    }
-
-    // Sign the transaction using the ECC context and input index 0
-    Ok(tx_builder.sign(&ecc, 0, 0)?)
+    // Sign with 2 sat/byte fee rate (2000 sat/kB) and standard dust limit (546 sats)
+    // TxBuilder automatically calculates network fee and sets pool fee to the leftover
+    Ok(tx_builder.sign(&ecc, 2000, 546)?)
 }
