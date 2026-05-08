@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use bitcoinsuite_bitcoind::rpc_client::{BitcoindRpcClient, BitcoindRpcClientConf};
 use bitcoinsuite_core::{
@@ -21,13 +21,6 @@ use crate::{
 /// Number of blocks required before a coinbase transaction can be spent.
 /// Per Bitcoin consensus rules, coinbase rewards mature after 100 blocks.
 const COINBASE_MATURITY_BLOCKS: u32 = 100;
-
-/// Default gross reward in satoshis used for payout calculation.
-/// Lotus block subsidy is 260 XPI (260,000,000 satoshis), split 50/50:
-/// - vout[1]: pool payout output (130,000,000 sats)
-/// - vout[2]: minerfund/dev fund (130,000,000 sats)
-/// This constant represents the pool's payout output (vout[1]).
-const DEFAULT_GROSS_REWARD_SAT: i64 = 130_000_000;
 
 /// Main entry point for the payout scheduler background task.
 /// 
@@ -172,19 +165,31 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
 
-            // Get fee configuration for payout calculation
-            let fee_address = cfg.pool.fee.fee_address.as_deref();
-            let fee_enabled = cfg.pool.fee.enabled;
-            let fee_bps = if fee_enabled { cfg.pool.fee.fee_bps } else { 0 };
-            let min_payout_sat = cfg.pool.pplns.min_payout_sat;
-            // Build initial payout plan using default gross reward (will be corrected below)
-            let mut plan = build_pplns_payout_plan(
-                DEFAULT_GROSS_REWARD_SAT,
-                fee_bps,
-                fee_address,
-                &shares,
-                min_payout_sat,
+            // Debug: Log PPLNS window details
+            let total_work_units: f64 = shares.iter().map(|s| s.work_units).sum();
+            let num_shares = shares.len();
+            let unique_addresses: std::collections::HashSet<&String> =
+                shares.iter().map(|s| &s.payout_address).collect();
+            let num_unique_addresses = unique_addresses.len();
+            debug!(
+                found_block_id,
+                block_hash,
+                target_work_units,
+                actual_work_units = total_work_units,
+                num_shares,
+                num_unique_addresses,
+                "PPLNS window details"
             );
+            // Debug: Log top 10 shares by work units
+            let mut shares_sorted = shares.clone();
+            shares_sorted.sort_by(|a, b| b.work_units.partial_cmp(&a.work_units).unwrap_or(std::cmp::Ordering::Equal));
+            let top_shares: Vec<_> = shares_sorted.iter().take(10).map(|s| {
+                format!("{}:{:.4}", s.payout_address, s.work_units)
+            }).collect();
+            debug!(
+                found_block_id,
+                top_shares = top_shares.join(", "),
+                "top 10 shares by work units"
             );
 
             // Fetch the actual found block to extract the real coinbase reward
@@ -224,16 +229,50 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 );
                 continue;
             }
-            // Update payout plan with actual coinbase reward value (not the default)
+            // Build payout plan with actual coinbase reward value
             let actual_coinbase_value = payout_output.value;
-            let default_diff = actual_coinbase_value - DEFAULT_GROSS_REWARD_SAT;
-            plan.gross_reward_sat = actual_coinbase_value;
-            // Recalculate fee based on actual gross reward
-            plan.fee_sat = crate::payout::compute_fee(
-                plan.gross_reward_sat,
+            let fee_address = cfg.pool.fee.fee_address.as_deref();
+            let fee_enabled = cfg.pool.fee.enabled;
+            let fee_bps = if fee_enabled { cfg.pool.fee.fee_bps } else { 0 };
+            let min_payout_sat = cfg.pool.pplns.min_payout_sat;
+            let plan = build_pplns_payout_plan(
+                actual_coinbase_value,
                 fee_bps,
+                fee_address,
+                &shares,
+                min_payout_sat,
             );
-            plan.net_reward_sat = plan.gross_reward_sat - plan.fee_sat;
+
+            // Debug: Log payout plan
+            debug!(
+                found_block_id,
+                block_hash,
+                actual_coinbase_value,
+                gross_reward_sat = plan.gross_reward_sat,
+                fee_sat = plan.fee_sat,
+                net_reward_sat = plan.net_reward_sat,
+                outputs_count = plan.outputs.len(),
+                dust_count = plan.dust.len(),
+                fee_enabled,
+                fee_bps,
+                min_payout_sat,
+                "payout plan built from actual coinbase value"
+            );
+            // Debug: Log payout outputs summary (top 10 by amount)
+            let mut outputs_sorted = plan.outputs.clone();
+            outputs_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let top_outputs: Vec<_> = outputs_sorted.iter().take(10).map(|(addr, amt)| {
+                format!("{}:{}", addr, amt)
+            }).collect();
+            let total_outputs_sat: i64 = plan.outputs.iter().map(|(_, amt)| *amt).sum();
+            let total_dust_sat: i64 = plan.dust.iter().map(|(_, amt)| *amt).sum();
+            debug!(
+                found_block_id,
+                total_outputs_sat,
+                total_dust_sat,
+                top_outputs = top_outputs.join(", "),
+                "payout outputs summary (top 10 by amount)"
+            );
 
             // Create unique retry key to prevent duplicate payouts on retry
             // Format: block_hash:number_of_outputs
@@ -249,6 +288,14 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 &plan.dust,
                 &window_shares,
             )?;
+
+            // Debug: Log batch creation
+            debug!(
+                batch_id,
+                found_block_id,
+                retry_key,
+                "payout batch created in database"
+            );
 
             // Build and sign the payout transaction using the coinbase as input
             let coinbase_txid_hex = coinbase.tx.txid.to_hex_be();
@@ -290,6 +337,28 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 }
             };
 
+            // Debug: Log transaction construction details
+            let tx_serialized = signed_tx.ser();
+            let tx_size_bytes = tx_serialized.as_ref().len();
+            let worker_output_sat: i64 = worker_outputs.iter().map(|(_, amt)| *amt).sum();
+            let pool_fee_output = signed_tx.outputs.last()
+                .map(|o| o.value)
+                .unwrap_or(0);
+            let network_fee_sat = coinbase_input_value - worker_output_sat - pool_fee_output;
+            debug!(
+                batch_id,
+                found_block_id,
+                block_hash,
+                coinbase_txid = coinbase_txid_hex,
+                coinbase_input_value,
+                worker_output_sat,
+                pool_fee_output,
+                network_fee_sat,
+                tx_size_bytes,
+                num_worker_outputs = worker_outputs.len(),
+                "payout transaction construction details"
+            );
+
             // Serialize the signed transaction and compute local txid
             let raw_tx = signed_tx.ser();
             let local_txid = signed_tx.hashed().hash().to_hex_be();
@@ -301,6 +370,14 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 None,
                 None,
             )?;
+
+            // Debug: Log pre-submission state
+            debug!(
+                batch_id,
+                local_txid,
+                raw_tx_hex_len = raw_tx.as_ref().len() * 2,
+                "payout transaction signed, ready for submission"
+            );
 
             // Submit the signed transaction to bitcoind via JSON-RPC
             let submitted_txid = match bitcoind
@@ -333,6 +410,24 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 tip_height,
                 txid = %submitted_txid,
                 "payout batch signed and submitted"
+            );
+            // Debug: Full payout summary for this block
+            debug!(
+                batch_id,
+                found_block_id,
+                block_hash,
+                submitted_txid,
+                coinbase_value = actual_coinbase_value,
+                gross_reward_sat = plan.gross_reward_sat,
+                fee_sat = plan.fee_sat,
+                net_reward_sat = plan.net_reward_sat,
+                num_outputs = plan.outputs.len(),
+                num_dust = plan.dust.len(),
+                num_shares = num_shares,
+                num_unique_addresses = num_unique_addresses,
+                total_work_units = total_work_units,
+                tx_size_bytes,
+                "complete payout summary for block"
             );
 
             // Check all pending batches for confirmation and mark as paid
