@@ -330,11 +330,63 @@ pub async fn run_stratum_server(
         let runtime_events = runtime_nng.clone();
         let adapter_events_inner = adapter_events.clone();
         tokio::spawn(async move {
+            // Track last seen template_epoch for missed-event detection
+            let mut last_template_epoch: Option<u64> = None;
+            
             while let Some(event) = rx.recv().await {
-                // All events trigger clean job replacement
+                // Lotus-specific: ALL events require clean_jobs=true because the Lotus header
+                // includes both merkle_root AND block size. When mempool changes, BOTH fields
+                // change, making all in-flight work immediately stale. This differs from Bitcoin
+                // where mempool updates only change merkle_root and miners could theoretically continue.
                 let clean = true;
+                
                 let reason = match &event {
-                    NodeEvent::MempoolRefresh => "mempool",
+                    // PRIMARY: miningwrkchg event - purpose-built for stratum servers
+                    // Includes reason code and monotonically increasing template_epoch
+                    NodeEvent::MiningWorkChanged {
+                        reason,
+                        tip_height,
+                        template_epoch,
+                        ..
+                    } => {
+                        // Detect missed events (gaps in template_epoch sequence)
+                        if let Some(last_epoch) = last_template_epoch {
+                            if *template_epoch > last_epoch + 1 {
+                                let missed = template_epoch - last_epoch - 1;
+                                warn!(
+                                    last_epoch,
+                                    current_epoch = template_epoch,
+                                    missed,
+                                    "missed miningwrkchg events from lotusd"
+                                );
+                            }
+                            if *template_epoch <= last_epoch {
+                                debug!(
+                                    last_epoch,
+                                    current_epoch = template_epoch,
+                                    "duplicate or out-of-order miningwrkchg event"
+                                );
+                                // Still process - lotusd may restart and reset epoch counter
+                            }
+                        }
+                        last_template_epoch = Some(*template_epoch);
+                        
+                        // Update tip height tracker for confirmation computation
+                        tip_height_events.store(*tip_height, Ordering::SeqCst);
+                        
+                        // Mark matured blocks based on new tip using configured min_confirmations
+                        if let Err(err) = db_events.mark_blocks_matured(
+                            *tip_height,
+                            min_confirmations,
+                        ) {
+                            error!(error = %err, "failed marking matured blocks after miningwrkchg");
+                        }
+                        
+                        // Use reason code for logging (affects reason string only, NOT clean_jobs)
+                        reason.as_str()
+                    }
+                    // SECONDARY: blkconnected - for accounting only (mark blocks matured)
+                    // Template refresh handled by miningwrkchg, but we still need this for accounting
                     NodeEvent::BlockConnected { height, hash: _, prev_hash: _ } => {
                         // Update tip height tracker
                         tip_height_events.store(*height, Ordering::SeqCst);
@@ -349,6 +401,8 @@ pub async fn run_stratum_server(
                         
                         "blkconnected"
                     }
+                    // SECONDARY: blkdisconctd - for accounting only (orphan found blocks)
+                    // Template refresh handled by miningwrkchg, but we still need this for accounting
                     NodeEvent::BlockDisconnected { height, hash, prev_hash: _ } => {
                         // 1. Find OUR block at exact height+hash
                         match db_events.find_found_block_by_height_and_hash(*height, hash) {
@@ -425,8 +479,11 @@ pub async fn run_stratum_server(
         if let Err(err) = rpc_adapter
             .run_pub_loop(&nng_pub_url, move |ev| {
                 // Log event type for debugging drops
+                // Include template_epoch for miningwrkchg events to aid in missed-event detection
                 let event_type = match &ev {
-                    NodeEvent::MempoolRefresh => "mempool".to_string(),
+                    NodeEvent::MiningWorkChanged { reason, template_epoch, tip_height: _, .. } => {
+                        format!("miningwrkchg[{}@{}]", reason.as_str(), template_epoch)
+                    }
                     NodeEvent::BlockConnected { height, .. } => format!("blkconnected@{}", height),
                     NodeEvent::BlockDisconnected { height, .. } => format!("blkdisconctd@{}", height),
                 };
