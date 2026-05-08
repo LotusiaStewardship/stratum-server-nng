@@ -355,6 +355,11 @@ impl AccountingDb {
              CREATE INDEX IF NOT EXISTS idx_found_blocks_height_hash 
                 ON found_blocks(height, block_hash);",
         )?;
+        // Index for PPLNS window query (true PPLNS across round boundaries)
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_shares_created_at 
+                ON shares(created_at DESC);",
+        )?;
 
         tx.commit()?;
         Ok(())
@@ -653,6 +658,16 @@ impl AccountingDb {
         Ok(out)
     }
 
+    /// List weighted shares for PPLNS window, looking back from block find time.
+    /// 
+    /// Implements true PPLNS by querying across round boundaries. The window extends
+    /// back in time until target_work_units is reached, regardless of round boundaries.
+    /// This enforces early-leaver penalty and prevents late-joiner advantage.
+    /// 
+    /// # Arguments
+    /// * `found_block_id` - The found block to get the cutoff time from
+    /// * `target_work_units` - Target difficulty-weighted work units (N multiplier)
+    /// * `hard_limit` - Maximum number of shares to retrieve (safety limit)
     pub fn list_weighted_shares_for_pplns_window(
         &self,
         found_block_id: i64,
@@ -660,22 +675,25 @@ impl AccountingDb {
         hard_limit: u32,
     ) -> Result<Vec<PplnsWindowShare>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let (round_id, cutoff): (i64, String) = conn.query_row(
-            "SELECT round_id, created_at FROM found_blocks WHERE id=?1",
+        // Get the block find time as the cutoff point for the PPLNS window
+        let cutoff: String = conn.query_row(
+            "SELECT created_at FROM found_blocks WHERE id=?1",
             params![found_block_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
 
+        // Query shares ordered by creation time (most recent first), without round_id filter.
+        // This allows the PPLNS window to span multiple rounds, implementing true PPLNS.
         let mut stmt = conn.prepare(
             "SELECT s.id, w.payout_address, s.difficulty, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
              JOIN share_outcomes so ON so.share_id = s.id
-             WHERE s.accepted=1 AND s.stale=0 AND so.round_id = ?1 AND s.created_at <= ?2
-             ORDER BY so.id DESC
-             LIMIT ?3",
+             WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
+             ORDER BY s.created_at DESC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![round_id, cutoff, hard_limit as i64], |r| {
+        let rows = stmt.query_map(params![cutoff, hard_limit as i64], |r| {
             Ok(PplnsWindowShare {
                 share_id: r.get::<_, i64>(0)?,
                 payout_address: r.get::<_, String>(1)?,
@@ -966,6 +984,78 @@ impl AccountingDb {
         }
         tx.commit()?;
         Ok(batch_id)
+    }
+
+    /// Get accumulated dust amount for a payout address.
+    /// 
+    /// Returns the total un-paid dust amount for the given address from the dust ledger.
+    /// This is used for dust carry-forward in PPLNS payouts.
+    pub fn get_accumulated_dust(&self, address: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let total: Option<i64> = conn.query_row(
+            "SELECT COALESCE(SUM(amount_sat), 0) FROM payout_dust_ledger WHERE address=?1",
+            params![address],
+            |r| r.get(0),
+        )?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// Reduce dust ledger entries for an address after paying out accumulated dust.
+    /// 
+    /// This is called after a payout that includes previously accumulated dust.
+    /// Uses FIFO ordering (oldest entries first) to reduce dust ledger entries.
+    /// 
+    /// # Arguments
+    /// * `address` - The payout address to reduce dust for
+    /// * `amount_sat` - The amount of dust that was paid out
+    pub fn reduce_dust_ledger(&self, address: &str, amount_sat: i64) -> Result<()> {
+        if amount_sat <= 0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let tx = conn.transaction()?;
+        
+        // Get dust entries in FIFO order (oldest first)
+        // Use a block scope to ensure stmt is dropped before tx.commit()
+        let dust_entries: Vec<(i64, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, amount_sat FROM payout_dust_ledger 
+                 WHERE address=?1 AND amount_sat > 0 
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![address], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            // Collect rows into a Vec to release the borrow on tx
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        
+        let mut remaining_to_reduce = amount_sat;
+        for (entry_id, entry_amount) in dust_entries {
+            if remaining_to_reduce <= 0 {
+                break;
+            }
+            
+            if entry_amount <= remaining_to_reduce {
+                // Consume entire entry
+                tx.execute(
+                    "UPDATE payout_dust_ledger SET amount_sat=0 WHERE id=?1",
+                    params![entry_id],
+                )?;
+                remaining_to_reduce -= entry_amount;
+            } else {
+                // Partial consumption
+                let new_amount = entry_amount - remaining_to_reduce;
+                tx.execute(
+                    "UPDATE payout_dust_ledger SET amount_sat=?1 WHERE id=?2",
+                    params![new_amount, entry_id],
+                )?;
+                remaining_to_reduce = 0;
+            }
+        }
+        
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn update_payout_batch_state(

@@ -72,12 +72,15 @@ pub fn compute_fee(gross_reward_sat: i64, fee_bps: u32) -> i64 {
 /// their work units in the PPLNS window. Handles fractional satoshi remainders
 /// deterministically by distributing them to miners with largest fractional parts.
 /// 
+/// Includes accumulated dust from previous payouts (dust carry-forward).
+/// 
 /// # Arguments
 /// * `gross_reward_sat` - Total block reward in satoshis
 /// * `fee_bps` - Pool fee in basis points (e.g., 100 = 1%)
 /// * `fee_address` - Optional address to receive the pool fee
 /// * `shares` - List of weighted shares from miners in the PPLNS window
 /// * `min_payout_sat` - Minimum payout threshold; amounts below this become dust
+/// * `dust_by_address` - Map of address → accumulated dust from previous payouts
 /// 
 /// # Returns
 /// A `PayoutPlan` containing outputs, dust, and accounting information.
@@ -92,6 +95,7 @@ pub fn build_pplns_payout_plan(
     fee_address: Option<&str>,
     shares: &[WeightedShare],
     min_payout_sat: i64,
+    dust_by_address: &HashMap<String, i64>,
 ) -> PayoutPlan {
     // Calculate fee and net reward available to miners
     let fee_sat = compute_fee(gross_reward_sat, fee_bps);
@@ -123,11 +127,15 @@ pub fn build_pplns_payout_plan(
 
     // Calculate each miner's raw payout: floor(amount) + fractional remainder
     // Store (address, floored_amount, fractional_part) for remainder distribution
+    // Include accumulated dust from previous payouts (dust carry-forward)
     let mut staged: Vec<(String, i64, f64)> = work_by_address
         .into_iter()
         .map(|(addr, w)| {
             let raw = (net_reward_sat as f64) * (w / total_work);
-            (addr, raw.floor() as i64, raw.fract())
+            let floor_amount = raw.floor() as i64;
+            // Add accumulated dust from previous payouts
+            let dust_amount = dust_by_address.get(&addr).copied().unwrap_or(0);
+            (addr, floor_amount + dust_amount, raw.fract())
         })
         .collect();
     // Sort by fractional part descending (largest fractions get remainder first),
@@ -195,8 +203,9 @@ mod tests {
                 work_units: 10.0,
             },
         ];
-        let p1 = build_pplns_payout_plan(1000, 0, None, &shares, 0);
-        let p2 = build_pplns_payout_plan(1000, 0, None, &shares, 0);
+        let dust = HashMap::new();
+        let p1 = build_pplns_payout_plan(1000, 0, None, &shares, 0, &dust);
+        let p2 = build_pplns_payout_plan(1000, 0, None, &shares, 0, &dust);
         assert_eq!(p1.outputs, p2.outputs);
         assert_eq!(p1.outputs.iter().map(|(_, v)| *v).sum::<i64>(), 1000);
     }
@@ -207,7 +216,8 @@ mod tests {
             payout_address: "a".into(),
             work_units: 1.0,
         }];
-        let p = build_pplns_payout_plan(1000, 100, Some("fee"), &shares, 0);
+        let dust = HashMap::new();
+        let p = build_pplns_payout_plan(1000, 100, Some("fee"), &shares, 0, &dust);
         assert_eq!(p.fee_sat, 10);
         assert_eq!(p.net_reward_sat, 990);
     }
@@ -228,11 +238,27 @@ mod tests {
                 work_units: 1.0,
             },
         ];
-        let p = build_pplns_payout_plan(10, 0, None, &shares, 0);
+        let dust = HashMap::new();
+        let p = build_pplns_payout_plan(10, 0, None, &shares, 0, &dust);
         assert_eq!(p.outputs.iter().map(|(_, v)| *v).sum::<i64>(), 10);
         assert_eq!(
             p.outputs,
             vec![("a".into(), 4), ("b".into(), 3), ("c".into(), 3)]
         );
+    }
+
+    #[test]
+    fn dust_carry_forward_included_in_payout() {
+        let shares = vec![WeightedShare {
+            payout_address: "a".into(),
+            work_units: 1.0,
+        }];
+        let mut dust = HashMap::new();
+        dust.insert("a".to_string(), 100); // 100 sats accumulated dust
+        
+        let p = build_pplns_payout_plan(1000, 0, None, &shares, 0, &dust);
+        // Should receive 1000 (current) + 100 (dust) = 1100
+        assert_eq!(p.outputs, vec![("a".into(), 1100)]);
+        assert_eq!(p.dust, vec![]); // No new dust
     }
 }

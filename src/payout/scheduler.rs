@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 use bitcoinsuite_bitcoind::rpc_client::{BitcoindRpcClient, BitcoindRpcClientConf};
@@ -214,8 +215,10 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                     continue;
                 }
             };
-            // Coinbase structure: vout[0] = block reward to pool, vout[1] = payout output
-            // We need vout[1] which contains the reward to be distributed to miners
+            // Coinbase structure (Lotus):
+            //   vout[0]: OP_RETURN with block height encoding (nValue=0, not spendable)
+            //   vout[1]: Pool payout output (subsidy + TX fees - miner fund) ← we spend this
+            //   vout[2+]: Miner fund outputs (if enabled, ~50% of subsidy to predefined addresses)
             let Some(payout_output) = parsed_coinbase.outputs().get(1) else {
                 error!(block_hash, "coinbase tx missing payout output vout[1]");
                 continue;
@@ -235,12 +238,24 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             let fee_enabled = cfg.pool.fee.enabled;
             let fee_bps = if fee_enabled { cfg.pool.fee.fee_bps } else { 0 };
             let min_payout_sat = cfg.pool.pplns.min_payout_sat;
+            
+            // Query accumulated dust for each unique address (dust carry-forward)
+            let mut dust_by_address: HashMap<String, i64> = HashMap::new();
+            for addr in &unique_addresses {
+                if let Ok(dust) = db.get_accumulated_dust(addr) {
+                    if dust > 0 {
+                        dust_by_address.insert(addr.to_string(), dust);
+                    }
+                }
+            }
+            
             let plan = build_pplns_payout_plan(
                 actual_coinbase_value,
                 fee_bps,
                 fee_address,
                 &shares,
                 min_payout_sat,
+                &dust_by_address,
             );
 
             // Debug: Log payout plan
@@ -400,6 +415,16 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             db.update_payout_batch_state(batch_id, "submitted", None, Some(&submitted_txid), None)?;
             // Mark the found block as having a payout submitted (prevents re-processing)
             db.mark_found_block_payout_submitted(found_block_id)?;
+            
+            // Reduce dust ledger for addresses that received accumulated dust
+            // This completes the dust carry-forward cycle
+            for (addr, dust_amount) in &dust_by_address {
+                if *dust_amount > 0 {
+                    if let Err(err) = db.reduce_dust_ledger(addr, *dust_amount) {
+                        error!(error = %err, addr, "failed to reduce dust ledger after payout");
+                    }
+                }
+            }
 
             // Log successful payout submission with summary information
             info!(
@@ -483,10 +508,10 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
         .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))
 }
 
-/// Build and sign a payout transaction that spends the coinbase output.
+/// Build and sign a payout transaction that spends the coinbase payout output.
 /// 
 /// Creates a transaction with:
-/// - Input: coinbase vout[1] (the payout output from the found block)
+/// - Input: coinbase vout[1] (pool payout: subsidy + TX fees - miner fund)
 /// - Outputs: one output per miner (fixed amounts), pool fee receives the leftover
 /// 
 /// Uses P2PKH signing with the pool's private key. The sequence number is set
@@ -546,12 +571,12 @@ fn build_and_sign_payout_tx(
     // Build the transaction with one input (coinbase) and the outputs above
     let tx_builder = TxBuilder {
         version: 2,
-        // Single input: coinbase vout[1] (payout output)
+        // Single input: coinbase vout[1] (pool payout output)
         inputs: vec![TxBuilderInput::new(
             TxInput {
                 prev_out: OutPoint {
                     txid: prev_txid,
-                    out_idx: 1, // coinbase output per consensus
+                    out_idx: 1, // Lotus coinbase: vout[1] is pool payout
                 },
                 script: Script::default(), // Empty for coinbase; will be replaced by signature
                 sequence: SequenceNo::from_u32(0xffff_fffe), // RBF-enabled sequence
