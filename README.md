@@ -21,10 +21,11 @@ Production-grade Stratum V1 pool server for Lotus blockchain using NNG (Nanomsg 
 The Stratum server uses a **pub/sub notification + RPC fetch** pattern for mining template updates:
 
 1. **NNG Pub/Sub** - Subscribes to lightweight event notifications from lotusd:
-   - `updateblktip` - New block found, template must refresh
-   - `miningwrkchg` - Mining work changed (e.g., difficulty adjustment)
-   - `mempooltxadd` / `mempooltxrem` - Mempool changes affecting coinbase
-   - `blkdisconctd` - Chain reorganization, template invalid
+   - `miningwrkchg` - PRIMARY event: mining work changed (new block, reorg, mempool change, manual invalidation). Includes `template_epoch` for missed-event detection.
+   - `blkconnected` - SECONDARY: block connected (for accounting: marking blocks matured)
+   - `blkdisconctd` - SECONDARY: block disconnected (for accounting: orphaning found blocks)
+
+**Note:** `mempooltxadd` / `mempooltxrem` are explicitly NOT subscribed — lotusd consolidates these into `miningwrkchg` to avoid excessive template refreshes.
 
 2. **RPC Fetch** - On receiving any notification, the server fetches the full `MiningTemplate` via NNG RPC:
    - `prev_hash_stratum` - Previous block hash for miners
@@ -61,9 +62,8 @@ The Stratum server uses a **pub/sub notification + RPC fetch** pattern for minin
 │      │  - Pub/Sub       │              │  - getrawtx      │     │
 │      │                  │              │                  │     │
 │      │  Pub/Sub events: │              │                  │     │
-│      │  • updateblktip  │              │                  │     │
 │      │  • miningwrkchg  │──fetches──►  │  MiningTemplate  │     │
-│      │  • mempooltxadd  │  template    │  (full payload)  │     │
+│      │  • blkconnected  │  template    │  (full payload)  │     │
 │      │  • blkdisconctd  │              │                  │     │
 │      └──────────────────┘              └──────────────────┘     │
 │                                                                 │
@@ -95,6 +95,7 @@ stratum-server-nng/
 │   │   ├── vardiff.rs       # Variable difficulty algorithm
 │   │   ├── network_diff.rs  # Network difficulty tracking
 │   │   ├── diff_cache.rs    # Difficulty broadcast cache
+│   │   ├── worker.rs      # Worker name parsing
 │   │   └── mod.rs
 │   ├── accounting/          # SQLite accounting layer
 │   │   ├── sqlite.rs        # Database operations
@@ -108,7 +109,7 @@ stratum-server-nng/
 │   │   ├── mod.rs           # PPLNS plan building
 │   │   └── ...
 │   └── nng/                 # NNG integration
-│       ├── adapter.rs       # Bitcoind NNG adapter
+│       ├── adapter.rs       # Bitcoind NNG adapter (RPC + Pub/Sub)
 │       └── mod.rs
 ├── config.toml              # Runtime configuration
 ├── config.example.toml      # Configuration template
@@ -188,20 +189,22 @@ Copy `config.example.toml` to `config.toml` and adjust for your environment.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `n_multiplier` | float | `1.0` | PPLNS window size multiplier. 1.0 ≈ one block's worth of work |
+| `n_multiplier` | float | `1.0` | PPLNS window target work units. 1.0 ≈ one block's worth of cumulative work |
 | `min_payout_sat` | int | `546` | Minimum payout per miner (dust threshold) |
 | `payout_interval_secs` | int | `3600` | Scheduler run interval (seconds) |
 | `min_confirmations` | int | `100` | Confirmations before payout eligibility (enforced minimum: 100) |
 
 **PPLNS window behavior:**
-- `n_multiplier: 1.0` = window covers ~1 block of work
-- `n_multiplier: 2.0` = window covers ~2 blocks (more smoothing, slower response)
-- Larger values reduce variance but slow responsiveness to hashrate changes
+- The PPLNS window looks back in time from the found block's creation time
+- Shares are aggregated by payout address and weighted by their difficulty (work_units)
+- The window ends when cumulative work reaches `n_multiplier` target, capped at 200K shares
+- **True cross-round behavior**: The window spans multiple rounds (no round_id filter), preventing late-joiner advantage
+- Larger `n_multiplier` values smooth variance but slow responsiveness to hashrate changes
 
 #### Signing Configuration (`[pool.signing]`)
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+|-----------|------|----------|----------|
 | `mode` | string | `"internal"` | Signing mode (currently only `internal` supported) |
 | `private_key` | string | ✅ (for internal) | Private key for payout signing (32-byte hex or WIF format) |
 
@@ -243,6 +246,7 @@ curl -H "Authorization: Bearer devtoken" http://127.0.0.1:18080/status
 | `GET` | `/workers/summary` | ✅ | Worker accounting summary with accepted/rejected/stale counts |
 | `GET` | `/shares/rejected-reasons` | ✅ | Breakdown of rejected share reasons |
 | `GET` | `/reconciliation/missing-found-blocks` | ✅ | Found blocks with missing persistence (reconciliation) |
+| `GET` | `/health/payout-scheduler` | ✅ | Payout scheduler health (lease status, confirmed blocks, failed batches) |
 
 ### Example: Status Response
 
@@ -335,6 +339,81 @@ The SQLite database tracks all accounting state. Key tables:
 - `retry_at` - Scheduled retry time
 - `created_at` - Timestamp
 
+### `payout_dust_ledger`
+Tracks un-paid dust amounts for carry-forward in PPLNS payouts:
+- `id` - Primary key
+- `payout_batch_id` - Foreign key to payout_batches (which batch created the dust)
+- `found_block_id` - Foreign key to found_blocks
+- `address` - Payout address (Lotus address string)
+- `amount_sat` - Un-paid dust amount in satoshis (0 when fully paid out)
+- `policy` - Payout policy (e.g., "pplns")
+- `created_at` - Timestamp
+
+When a miner's accumulated dust reaches `min_payout_sat`, it's included in their next payout. The ledger uses FIFO ordering to reduce entries after payout.
+
+### `payout_entries`
+Individual miner payouts within a batch:
+- `id` - Primary key
+- `payout_batch_id` - Foreign key to payout_batches
+- `address` - Payout address
+- `amount_sat` - Amount in satoshis
+- `created_at` - Timestamp
+
+### `payout_share_snapshots`
+Shares aggregated for PPLNS window construction:
+- `id` - Primary key
+- `payout_batch_id` - Foreign key to payout_batches
+- `share_id` - Foreign key to share_outcomes
+- `payout_address` - Payout address
+- `work_units` - Difficulty-weighted work units
+- `share_created_at` - When the share was created
+- `ordering_criterion` - For deterministic distribution
+- `truncation_reason` - Why shares were truncated
+- `created_at` - Timestamp
+
+### `payout_scheduler_lease`
+Scheduler lease management for distributed payout coordination:
+- `id` - Primary key (always 1)
+- `owner` - Lease owner identifier
+- `expires_at` - Lease expiration time
+
+### `accounting_events`
+General accounting events for monitoring:
+- `id` - Primary key
+- `event_type` - Event type (e.g., "found_block_orphaned")
+- `status`, `session_id`, `worker_id`, `worker_name`, `payout_address`, `share_id`, `round_id`, `template_id`, `template_epoch`, `job_id`, `block_hash`, `height`, `payload_json`, `created_at`
+
+### `authorization_events`
+Worker authorization events:
+- `id` - Primary key
+- `session_id` - Session identifier
+- `worker_name` - Worker name
+- `payout_address` - Payout address
+- `worker_suffix` - Worker suffix
+- `authorized` - Whether authorization succeeded
+- `reason` - Rejection reason
+- `created_at` - Timestamp
+
+### `share_outcomes`
+Share validation outcomes:
+- `id` - Primary key
+- `session_id`, `worker_id`, `worker_name`, `payout_address`, `template_id`, `template_epoch`, `job_id`, `round_id`, `dedupe_key`, `status`, `reject_reason`, `node_result`, `low_diff_ok`, `network_target_ok`, `block_hash`, `share_id`, `created_at`
+
+### `round_events`
+Round lifecycle events:
+- `id` - Primary key
+- `round_id` - Foreign key to rounds
+- `event_type` - Event type
+- `reason`, `block_hash`, `template_id`, `created_at`
+
+### `submit_events`
+Block submission results from node:
+- `id` - Primary key
+- `block_hash`, `template_id`, `worker_id`, `worker_name`, `payout_address`, `node_result`, `created_at`, `session_id`, `job_id`, `round_id`, `template_epoch`
+
+### `meta` and `schema_migrations`
+Metadata and schema version tracking tables.
+
 ## Stratum Protocol
 
 Implements Stratum V1 protocol with the following methods:
@@ -345,6 +424,8 @@ Implements Stratum V1 protocol with the following methods:
 - `mining.authorize` - Authenticate worker (format: `address.workerSuffix`)
 - `mining.submit` - Submit share (params: `user`, `job_id`, `extraNonce2`, `nTime`, `nonce`)
 - `mining.extranonce.subscribe` - Subscribe to extranonce changes
+- `mining.ping` - Keep-alive ping
+- `mining.suggest_difficulty` - Suggest difficulty (not used)
 
 ### Server → Client
 
@@ -403,17 +484,30 @@ new_diff = clamp(new_diff, vardiff_min_floor, network_diff)
 
 ### PPLNS Algorithm
 
-The server uses PPLNS (Pay Per Last N Shares) for fair reward distribution:
+The server uses PPLNS (Pay Per Last N Shares) with true cross-round window behavior:
 
-1. When a block is found, it enters `pending` status
+**Window Construction:**
+1. When a block is found, it enters `confirmed` status
 2. After `min_confirmations` (min 100), it becomes `matured`
-3. The scheduler runs every `payout_interval_secs`
+3. The scheduler runs every `payout_interval_secs` (default: 1 hour)
 4. For each matured block:
-   - Load shares from the PPLNS window (last N work units)
-   - Calculate each worker's share of the reward
-   - Build payout plan with fee deduction
-   - Sign and broadcast payout transaction
-   - Track confirmation
+   - Query shares accepted and non-stale from the found block's creation time backward
+   - Stop when cumulative work reaches `n_multiplier` target (capped at 200K shares)
+   - Aggregate by payout address, weighted by difficulty (work_units)
+5. Build payout plan with fee deduction and dust carry-forward
+6. Sign and broadcast payout transaction
+7. Track confirmation via `getrawtransaction`
+
+**Cross-Round Behavior:**
+- The PPLNS window spans multiple rounds (no `round_id` filter)
+- Prevents late-joiner advantage by including shares from previous rounds
+- Implements early-leaver penalty: miners who leave before a block is found don't benefit from their earlier shares
+- Dust carry-forward: un-paid amounts below `min_payout_sat` accumulate across rounds and are included in future payouts
+
+**Deterministic Remainder Distribution:**
+- Floor division remainder (fractional satoshis) distributed to miners with largest fractional parts
+- Tie-breaking by address ascending for deterministic ordering
+- Ensures reproducible, fair payouts regardless of input order
 
 ### Fee Calculation
 
