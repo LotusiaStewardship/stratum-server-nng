@@ -13,14 +13,34 @@
 
 debug = false
 
+# -----------------------------------------------------------------------------
+# Network Configuration
+# -----------------------------------------------------------------------------
+#
+# The network is AUTO-DETECTED from the bitcoind_rpc.url port:
+# - Port 10604 → mainnet → ./dbs/mainnet/stratum-accounting.sqlite3
+# - Port 11604 → testnet → ./dbs/testnet/stratum-accounting.sqlite3
+# - Port 12604 → regtest → ./dbs/regtest/stratum-accounting.sqlite3
+#
+# You can override the network explicitly (not recommended):
+# network = "mainnet"
+#
+# You can override the database path explicitly:
+# sqlite_path = "./custom-path.sqlite3"
+# -----------------------------------------------------------------------------
+
 # Stratum TCP listen address for miners.
-# Common defaults:
-# - 0.0.0.0:3334 for public pool ingress
-# - 127.0.0.1:3334 for local testing only
+# IMPORTANT: Use different ports for different networks:
+# - mainnet:  0.0.0.0:3334 (or your production port)
+# - testnet:  0.0.0.0:13334
+# - regtest:  0.0.0.0:23334
 stratum_bind = "0.0.0.0:3334"
 
 # Operator API listen address.
-# Keep this on localhost or a protected network segment.
+# IMPORTANT: Use different ports for different networks:
+# - mainnet:  127.0.0.1:18080
+# - testnet:  127.0.0.1:18081
+# - regtest:  127.0.0.1:18082
 api_bind = "127.0.0.1:18080"
 
 # Bearer token for authenticated operator endpoints.
@@ -28,7 +48,8 @@ api_bind = "127.0.0.1:18080"
 api_token = "devtoken"
 
 # SQLite accounting database path.
-sqlite_path = "./stratum-accounting.sqlite3"
+# Auto-derived from RPC port (see Network Configuration above).
+# Set explicitly to override auto-detection.
 
 # lotusd NNG RPC endpoint used for mining template requests and block submission.
 # Use ipc:// on the same host or tcp:// when intentionally exposed.
@@ -179,6 +200,10 @@ max_jobs_cache = 512
 # - payout_script_hex (raw scriptPubKey)
 #
 # The resolved script must not be OP_RETURN / nulldata.
+# IMPORTANT: Use network-specific addresses:
+# - mainnet:  lotus_...
+# - testnet:  lotusT...
+# - regtest:  lotusR... (or testnet-style)
 payout_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # payout_script_hex = "76a914...88ac"
 
@@ -199,6 +224,10 @@ fee_bps = 100
 # One of these must be set when fee collection is enabled:
 # - fee_address
 # - fee_script_hex
+# IMPORTANT: Use network-specific addresses:
+# - mainnet:  lotus_...
+# - testnet:  lotusT...
+# - regtest:  lotusR... (or testnet-style)
 fee_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # fee_script_hex = "76a914...88ac"
 
@@ -234,12 +263,22 @@ mode = "internal"
 # - WIF / base58check-encoded secret key
 #
 # Never log this value. Prefer loading from a secure file or secret store.
+# IMPORTANT: Use network-specific keys:
+# - mainnet:  Mainnet WIF (5/K/L prefix)
+# - testnet:  Testnet WIF (9/c prefix)
+# - regtest:  Regtest WIF (9/c prefix)
 private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 # lotusd JSON-RPC endpoint used for raw transaction broadcast.
 # This matches Chronik's broadcast mechanics: raw tx -> JSON-RPC sendrawtransaction.
+# IMPORTANT: The port determines the network (see Network Configuration above):
 [bitcoind_rpc]
-url = "http://127.0.0.1:10604"
 rpc_user = "lotus"
 rpc_pass = "supersecurepassword"
+# Mainnet (port 10604)
+url = "http://127.0.0.1:10604"
+# Testnet (port 11604) - uncomment for testnet
+#url = "http://127.0.0.1:11604"
+# Regtest (port 12604) - uncomment for regtest
+#url = "http://127.0.0.1:12604"

@@ -58,3 +58,40 @@ pub struct PayoutBatch {
     pub submitted_txid: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Represents a block found by the pool.
+/// Tracks lifecycle from confirmed → matured → paid, or orphaned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoundBlock {
+    pub id: i64,
+    pub round_id: i64,
+    pub block_hash: String,
+    pub height: i64,
+    pub status: String,
+    pub template_id: Option<i64>,
+    pub worker_id: Option<i64>,
+    pub worker_name: Option<String>,
+    pub payout_address: Option<String>,
+    pub persist_source: Option<String>,
+    pub disconnected_at: Option<DateTime<Utc>>,
+    pub orphan_reason: Option<String>,
+    pub matured_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl FoundBlock {
+    /// Compute confirmations from authoritative tip height.
+    /// Returns -1 for orphaned blocks (per lotusd parlance).
+    /// Returns 0 for non-orphaned blocks when tip is behind block height.
+    pub fn confirmations(&self, tip_height: i64) -> i64 {
+        if self.status == "orphaned" {
+            return -1;
+        }
+        (tip_height - self.height + 1).max(0)
+    }
+
+    /// Check if block is matured based on confirmations.
+    pub fn is_matured(&self, tip_height: i64, coinbase_maturity: i64) -> bool {
+        self.status == "confirmed" && self.confirmations(tip_height) >= coinbase_maturity
+    }
+}

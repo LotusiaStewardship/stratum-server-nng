@@ -2295,6 +2295,7 @@ dependencies = [
  "bitcoinsuite-ecc-secp256k1",
  "chrono",
  "clap",
+ "flatbuffers",
  "hex",
  "parking_lot",
  "primitive-types",
@@ -2311,6 +2312,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

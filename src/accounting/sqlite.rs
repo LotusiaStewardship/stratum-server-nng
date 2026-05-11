@@ -1,6 +1,6 @@
-use crate::accounting::{PayoutBatch, PayoutMethod, Round, Share, Worker};
+use crate::accounting::{FoundBlock, PayoutBatch, PayoutMethod, Round, Share, Worker};
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,7 @@ pub struct MissingFoundBlock {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FoundBlockStateSummary {
-    pub pending: u64,
+    pub confirmed: u64,
     pub matured: u64,
     pub orphaned: u64,
     pub paid: u64,
@@ -37,6 +37,15 @@ pub struct SchedulerHealthSummary {
     pub matured_found_blocks_ready: u64,
     pub retry_ready_batches: u64,
     pub next_retry_at: Option<String>,
+}
+
+/// Information about the current scheduler lease
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseInfo {
+    pub owner: String,
+    pub expires_at: String,
+    pub is_valid: bool,
+    pub is_expired: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -139,7 +148,7 @@ impl AccountingDb {
                     round_id INTEGER NOT NULL,
                     block_hash TEXT NOT NULL UNIQUE,
                     height INTEGER,
-                    status TEXT NOT NULL DEFAULT 'pending',
+                    status TEXT NOT NULL DEFAULT 'confirmed',
                     confirmations INTEGER NOT NULL DEFAULT 0,
                     template_id INTEGER,
                     worker_id INTEGER,
@@ -190,7 +199,7 @@ impl AccountingDb {
             &tx,
             "found_blocks",
             "status",
-            "TEXT NOT NULL DEFAULT 'pending'",
+            "TEXT NOT NULL DEFAULT 'confirmed'",
         )?;
         Self::ensure_column(
             &tx,
@@ -214,8 +223,8 @@ impl AccountingDb {
         Self::ensure_column(
             &tx,
             "found_blocks",
-            "chain_state",
-            "TEXT NOT NULL DEFAULT 'pending'",
+            "orphan_reason",
+            "TEXT",
         )?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS payout_scheduler_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
@@ -338,6 +347,19 @@ impl AccountingDb {
         Self::ensure_column(&tx, "rounds", "status", "TEXT NOT NULL DEFAULT 'open'")?;
         Self::ensure_column(&tx, "rounds", "close_reason", "TEXT")?;
         Self::ensure_column(&tx, "rounds", "closed_at", "TEXT")?;
+
+        // Add indexes for found_blocks
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_found_blocks_status_height 
+                ON found_blocks(status, height);
+             CREATE INDEX IF NOT EXISTS idx_found_blocks_height_hash 
+                ON found_blocks(height, block_hash);",
+        )?;
+        // Index for PPLNS window query (true PPLNS across round boundaries)
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_shares_created_at 
+                ON shares(created_at DESC);",
+        )?;
 
         tx.commit()?;
         Ok(())
@@ -565,8 +587,8 @@ impl AccountingDb {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
 
         conn.execute(
-            "INSERT INTO found_blocks(round_id, block_hash, height, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, chain_state, status, confirmations, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 100, 'pending', 'pending', 0, ?9)
+            "INSERT INTO found_blocks(round_id, block_hash, height, template_id, worker_id, worker_name, payout_address, persist_source, coinbase_maturity_blocks, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 100, 'confirmed', ?9)
              ON CONFLICT(block_hash) DO UPDATE SET
                 round_id=excluded.round_id,
                 height=excluded.height,
@@ -636,6 +658,16 @@ impl AccountingDb {
         Ok(out)
     }
 
+    /// List weighted shares for PPLNS window, looking back from block find time.
+    /// 
+    /// Implements true PPLNS by querying across round boundaries. The window extends
+    /// back in time until target_work_units is reached, regardless of round boundaries.
+    /// This enforces early-leaver penalty and prevents late-joiner advantage.
+    /// 
+    /// # Arguments
+    /// * `found_block_id` - The found block to get the cutoff time from
+    /// * `target_work_units` - Target difficulty-weighted work units (N multiplier)
+    /// * `hard_limit` - Maximum number of shares to retrieve (safety limit)
     pub fn list_weighted_shares_for_pplns_window(
         &self,
         found_block_id: i64,
@@ -643,22 +675,25 @@ impl AccountingDb {
         hard_limit: u32,
     ) -> Result<Vec<PplnsWindowShare>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let (round_id, cutoff): (i64, String) = conn.query_row(
-            "SELECT round_id, created_at FROM found_blocks WHERE id=?1",
+        // Get the block find time as the cutoff point for the PPLNS window
+        let cutoff: String = conn.query_row(
+            "SELECT created_at FROM found_blocks WHERE id=?1",
             params![found_block_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
 
+        // Query shares ordered by creation time (most recent first), without round_id filter.
+        // This allows the PPLNS window to span multiple rounds, implementing true PPLNS.
         let mut stmt = conn.prepare(
             "SELECT s.id, w.payout_address, s.difficulty, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
              JOIN share_outcomes so ON so.share_id = s.id
-             WHERE s.accepted=1 AND s.stale=0 AND so.round_id = ?1 AND s.created_at <= ?2
-             ORDER BY so.id DESC
-             LIMIT ?3",
+             WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
+             ORDER BY s.created_at DESC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![round_id, cutoff, hard_limit as i64], |r| {
+        let rows = stmt.query_map(params![cutoff, hard_limit as i64], |r| {
             Ok(PplnsWindowShare {
                 share_id: r.get::<_, i64>(0)?,
                 payout_address: r.get::<_, String>(1)?,
@@ -683,13 +718,201 @@ impl AccountingDb {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let row = conn
             .query_row(
-                "SELECT id, block_hash FROM found_blocks WHERE chain_state='matured' AND status='matured' ORDER BY id ASC LIMIT 1",
+                "SELECT id, block_hash FROM found_blocks WHERE status='matured' ORDER BY id ASC LIMIT 1",
                 [],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
         Ok(row)
     }
+
+    /// Find latest found_block by height (for reconciliation)
+    pub fn find_latest_found_block(&self) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 ORDER BY height DESC 
+                 LIMIT 1",
+                [],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Find found_block by exact height
+    pub fn find_found_block_by_height(&self, height: i64) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 WHERE height = ?1",
+                params![height],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Find found_block by height AND hash (for precise orphan detection)
+    pub fn find_found_block_by_height_and_hash(
+        &self,
+        height: i64,
+        hash: &str,
+    ) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, round_id, block_hash, height, status, 
+                        template_id, worker_id, worker_name, 
+                        payout_address, persist_source, 
+                        disconnected_at, orphan_reason, matured_at, created_at
+                 FROM found_blocks 
+                 WHERE height = ?1 AND block_hash = ?2",
+                params![height, hash],
+                |r| Ok(FoundBlock {
+                    id: r.get(0)?,
+                    round_id: r.get(1)?,
+                    block_hash: r.get(2)?,
+                    height: r.get(3)?,
+                    status: r.get(4)?,
+                    template_id: r.get(5)?,
+                    worker_id: r.get(6)?,
+                    worker_name: r.get(7)?,
+                    payout_address: r.get(8)?,
+                    persist_source: r.get(9)?,
+                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    orphan_reason: r.get(11)?,
+                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
+                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
+                    ).flatten(),
+                    created_at: r.get(13)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark found_block as confirmed (status only; confirmations computed on-demand)
+    pub fn mark_found_block_confirmed(
+        &self,
+        block_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks 
+             SET status = 'confirmed' 
+             WHERE block_hash = ?1 AND status = 'pending'",
+            params![block_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Mark found_block as orphaned with reason
+    pub fn mark_found_block_orphaned(
+        &self,
+        block_hash: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE found_blocks 
+             SET status = 'orphaned', 
+                 disconnected_at = ?1, 
+                 orphan_reason = ?2 
+             WHERE block_hash = ?3",
+            params![now, reason, block_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Mark matured blocks based on tip height and coinbase maturity.
+    /// Formula: confirmations = tip_height - height + 1
+    /// DEPRECATED: Confirmations are now computed on-demand. Use mark_blocks_matured instead.
+    #[deprecated(since = "0.3.0", note = "Use mark_blocks_matured which uses computed confirmations")]
+    pub fn sync_found_block_confirmations(
+        &self,
+        _tip_height: i64,
+        _min_confirmations: u32,
+    ) -> Result<()> {
+        // No-op: confirmations are computed on-demand via FoundBlock::confirmations()
+        Ok(())
+    }
+
+    /// Mark blocks as matured based on tip height.
+    /// Uses computed confirmations: tip_height - height + 1
+    pub fn mark_blocks_matured(
+        &self,
+        tip_height: i64,
+        coinbase_maturity: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        // Blocks where (tip_height - height + 1) >= coinbase_maturity
+        // → height <= tip_height - coinbase_maturity + 1
+        let max_height = tip_height - coinbase_maturity + 1;
+        conn.execute(
+            "UPDATE found_blocks
+             SET status = 'matured', 
+                 matured_at = ?1
+             WHERE status = 'confirmed' 
+               AND height <= ?2",
+            params![now, max_height],
+        )?;
+        Ok(())
+    }
+
+
 
     pub fn mark_found_block_payout_submitted(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
@@ -763,6 +986,78 @@ impl AccountingDb {
         Ok(batch_id)
     }
 
+    /// Get accumulated dust amount for a payout address.
+    /// 
+    /// Returns the total un-paid dust amount for the given address from the dust ledger.
+    /// This is used for dust carry-forward in PPLNS payouts.
+    pub fn get_accumulated_dust(&self, address: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let total: Option<i64> = conn.query_row(
+            "SELECT COALESCE(SUM(amount_sat), 0) FROM payout_dust_ledger WHERE address=?1",
+            params![address],
+            |r| r.get(0),
+        )?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// Reduce dust ledger entries for an address after paying out accumulated dust.
+    /// 
+    /// This is called after a payout that includes previously accumulated dust.
+    /// Uses FIFO ordering (oldest entries first) to reduce dust ledger entries.
+    /// 
+    /// # Arguments
+    /// * `address` - The payout address to reduce dust for
+    /// * `amount_sat` - The amount of dust that was paid out
+    pub fn reduce_dust_ledger(&self, address: &str, amount_sat: i64) -> Result<()> {
+        if amount_sat <= 0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let tx = conn.transaction()?;
+        
+        // Get dust entries in FIFO order (oldest first)
+        // Use a block scope to ensure stmt is dropped before tx.commit()
+        let dust_entries: Vec<(i64, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, amount_sat FROM payout_dust_ledger 
+                 WHERE address=?1 AND amount_sat > 0 
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![address], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            // Collect rows into a Vec to release the borrow on tx
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        
+        let mut remaining_to_reduce = amount_sat;
+        for (entry_id, entry_amount) in dust_entries {
+            if remaining_to_reduce <= 0 {
+                break;
+            }
+            
+            if entry_amount <= remaining_to_reduce {
+                // Consume entire entry
+                tx.execute(
+                    "UPDATE payout_dust_ledger SET amount_sat=0 WHERE id=?1",
+                    params![entry_id],
+                )?;
+                remaining_to_reduce -= entry_amount;
+            } else {
+                // Partial consumption
+                let new_amount = entry_amount - remaining_to_reduce;
+                tx.execute(
+                    "UPDATE payout_dust_ledger SET amount_sat=?1 WHERE id=?2",
+                    params![new_amount, entry_id],
+                )?;
+                remaining_to_reduce = 0;
+            }
+        }
+        
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn update_payout_batch_state(
         &self,
         batch_id: i64,
@@ -794,89 +1089,20 @@ impl AccountingDb {
         Ok(())
     }
 
-    pub fn sync_found_block_confirmations(
-        &self,
-        tip_height: i64,
-        min_confirmations: u32,
-    ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        conn.execute(
-            "UPDATE found_blocks
-             SET confirmations = CASE
-                WHEN height IS NULL THEN confirmations
-                WHEN ?1 - height + 1 < 0 THEN 0
-                ELSE (?1 - height + 1)
-             END
-             WHERE chain_state='pending'",
-            params![tip_height],
-        )?;
-        conn.execute(
-            "UPDATE found_blocks
-             SET chain_state='matured', status='matured', matured_at=?1
-             WHERE chain_state='pending' AND confirmations >= CASE
-                WHEN coinbase_maturity_blocks > ?2 THEN coinbase_maturity_blocks ELSE ?2 END",
-            params![now, min_confirmations as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_pending_blocks_orphaned(&self) -> Result<u64> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let mut rounds = Vec::new();
-        {
-            let mut stmt = conn.prepare("SELECT DISTINCT round_id, block_hash, template_id FROM found_blocks WHERE chain_state='pending'")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                rounds.push(row?);
-            }
-        }
-        let changed = conn.execute(
-            "UPDATE found_blocks
-             SET chain_state='orphaned', status='orphaned', disconnected_at=?1
-             WHERE chain_state='pending'",
-            params![now],
-        )?;
-        conn.execute(
-            "UPDATE payout_batches
-             SET status='invalidated_orphan', last_error='found block orphaned'
-             WHERE status IN ('planned','signed','submitted')
-               AND found_block_id IN (SELECT id FROM found_blocks WHERE chain_state='orphaned')",
-            [],
-        )?;
-        drop(conn);
-        for (round_id, block_hash, template_id) in rounds {
-            let _ = self.close_round(
-                round_id,
-                template_id.map(|v| v as u64),
-                "round_closed_orphaned",
-                Some(&block_hash),
-            );
-        }
-        Ok(changed as u64)
-    }
-
     pub fn found_block_state_summary(&self) -> Result<FoundBlockStateSummary> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        let pending: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='pending'",
+        let confirmed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM found_blocks WHERE status='confirmed'",
             [],
             |r| r.get(0),
         )?;
         let matured: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='matured'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='matured'",
             [],
             |r| r.get(0),
         )?;
         let orphaned: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='orphaned'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='orphaned'",
             [],
             |r| r.get(0),
         )?;
@@ -886,7 +1112,7 @@ impl AccountingDb {
             |r| r.get(0),
         )?;
         Ok(FoundBlockStateSummary {
-            pending: pending as u64,
+            confirmed: confirmed as u64,
             matured: matured as u64,
             orphaned: orphaned as u64,
             paid: paid as u64,
@@ -991,7 +1217,7 @@ impl AccountingDb {
     pub fn scheduler_health_summary(&self) -> Result<SchedulerHealthSummary> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let matured_found_blocks_ready: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM found_blocks WHERE chain_state='matured' AND status='matured'",
+            "SELECT COUNT(*) FROM found_blocks WHERE status='matured'",
             [],
             |r| r.get(0),
         )?;
@@ -1229,6 +1455,125 @@ impl AccountingDb {
         }
         Ok(repaired)
     }
+
+    /// Acquire a scheduler lease for the given instance.
+    ///
+    /// Returns `Ok(true)` if lease was acquired successfully.
+    /// Returns `Ok(false)` if another instance currently holds the lease.
+    pub fn acquire_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
+        let now = Utc::now();
+        let expires = now + Duration::minutes(duration_minutes);
+        
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "INSERT INTO payout_scheduler_lease(id, owner, expires_at) 
+             VALUES(1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET 
+                 owner=excluded.owner,
+                 expires_at=excluded.expires_at
+             WHERE expires_at < ?3",
+            params![instance_id, expires.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Renew an existing scheduler lease.
+    ///
+    /// Returns `Ok(true)` if lease was renewed successfully.
+    /// Returns `Ok(false)` if this instance doesn't hold the lease.
+    pub fn renew_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
+        let now = Utc::now();
+        let expires = now + Duration::minutes(duration_minutes);
+        
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "UPDATE payout_scheduler_lease 
+             SET expires_at = ?1 
+             WHERE id = 1 AND owner = ?2",
+            params![expires.to_rfc3339(), instance_id],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Release a scheduler lease voluntarily.
+    ///
+    /// Returns `Ok(true)` if lease was released.
+    /// Returns `Ok(false)` if this instance didn't hold the lease.
+    pub fn release_scheduler_lease(&self, instance_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let rows = conn.execute(
+            "DELETE FROM payout_scheduler_lease WHERE id = 1 AND owner = ?1",
+            params![instance_id],
+        )?;
+        
+        Ok(rows > 0)
+    }
+
+    /// Check if a lease is currently held and by whom.
+    ///
+    /// Returns `Ok(Some(owner))` if lease is held (not expired).
+    /// Returns `Ok(None)` if no lease exists or lease has expired.
+    pub fn check_lease_status(&self) -> Result<Option<String>> {
+        let now = Utc::now();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let owner: Option<String> = conn.query_row(
+            "SELECT owner FROM payout_scheduler_lease 
+             WHERE id = 1 AND expires_at > ?1",
+            params![now.to_rfc3339()],
+            |r| r.get(0),
+        ).optional()?;
+        
+        Ok(owner)
+    }
+
+    #[cfg(test)]
+    pub fn expire_lease_for_test(&self) -> Result<()> {
+        let now = Utc::now();
+        let past = (now - Duration::minutes(5)).to_rfc3339();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        conn.execute(
+            "UPDATE payout_scheduler_lease SET expires_at = ?1 WHERE id = 1",
+            params![past],
+        )?;
+        Ok(())
+    }
+
+    /// Get detailed lease information including expiration time.
+    pub fn get_lease_info(&self) -> Result<Option<LeaseInfo>> {
+        let now = Utc::now();
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        
+        let row: Option<(String, String)> = conn.query_row(
+            "SELECT owner, expires_at FROM payout_scheduler_lease WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        
+        match row {
+            Some((owner, expires_str)) => {
+                let expires_at_dt = DateTime::parse_from_rfc3339(&expires_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                
+                let is_expired = expires_at_dt < now;
+                let is_valid = !is_expired;
+                
+                Ok(Some(LeaseInfo {
+                    owner,
+                    expires_at: expires_str,
+                    is_valid,
+                    is_expired,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 pub struct ShareOutcomeInsert<'a> {
@@ -1316,7 +1661,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "pending");
+        assert_eq!(status, "confirmed");
     }
 
     #[test]
@@ -1336,7 +1681,8 @@ mod tests {
             "submit_flow",
         )
         .unwrap();
-        assert_eq!(db.mark_pending_blocks_orphaned().unwrap(), 1);
+        db.mark_found_block_orphaned("bh2", "test_orphan").unwrap();
+        
         db.record_found_block(
             "bh3",
             11,
@@ -1347,9 +1693,9 @@ mod tests {
             "submit_flow",
         )
         .unwrap();
-        for _ in 0..100 {
-            db.sync_found_block_confirmations(220, 100).unwrap();
-        }
+        // Mark as matured (tip=220, height=120 => confirmations=101 >= 100)
+        db.mark_blocks_matured(220, 100).unwrap();
+        
         let conn = db.conn.lock().unwrap();
         let status: String = conn
             .query_row(
@@ -1359,5 +1705,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "matured");
+        
+        // Verify orphaned block returns -1 confirmations
+        let orphaned = db.find_found_block_by_height(10).unwrap().unwrap();
+        assert_eq!(orphaned.confirmations(220), -1);
+        
+        // Verify matured block has correct confirmations
+        let matured = db.find_found_block_by_height(11).unwrap().unwrap();
+        assert_eq!(matured.confirmations(220), 101);
     }
 }

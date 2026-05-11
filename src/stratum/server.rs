@@ -1,4 +1,4 @@
-use crate::accounting::{AccountingDb, ShareOutcomeInsert};
+use crate::accounting::{AccountingDb, FoundBlock, ShareOutcomeInsert};
 use crate::config::{Config, ResolvedPoolScripts};
 use crate::nng::adapter::{
     BitcoindMiningAdapter, JsonRpcClient, NngAdapter, NodeEvent, NodeMiningAdapter,
@@ -19,7 +19,7 @@ use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, LotusHeader};
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -127,6 +127,133 @@ impl StratumRuntime {
     }
 }
 
+/// Helper: orphan a found_block and close associated round
+fn orphan_found_block(
+    db: &AccountingDb,
+    found_block: &FoundBlock,
+    reason: &str,
+) -> Result<()> {
+    // 1. Mark as orphaned
+    db.mark_found_block_orphaned(&found_block.block_hash, reason)?;
+    
+    // 2. Close round
+    let _ = db.close_round(
+        found_block.round_id,
+        found_block.template_id.map(|v| v as u64),
+        "round_closed_orphaned",
+        Some(&found_block.block_hash),
+    );
+    
+    // 3. Record accounting event
+    let _ = db.record_accounting_event(
+        "found_block_orphaned",
+        Some("orphaned"),
+        None, None, None, None,
+        Some(found_block.round_id),
+        None, None, None,
+        Some(&found_block.block_hash),
+        Some(&format!("{{\"height\":{}}}", found_block.height)),
+    );
+    
+    Ok(())
+}
+
+/// Reconcile found_blocks with node on startup.
+/// Validates each found_block against node, marking orphaned if hash mismatch.
+async fn reconcile_found_blocks(
+    db: &AccountingDb,
+    adapter: &Arc<dyn NodeMiningAdapter>,
+) -> Result<i64> {
+    // 1. Get our latest found_block from DB
+    let latest = match db.find_latest_found_block()? {
+        Some(block) => block,
+        None => {
+            info!("no found_blocks to reconcile");
+            return Ok(0);
+        }
+    };
+    
+    let mut orphaned_count = 0u64;
+    let mut validated_count = 0u64;
+    
+    // 2. Start from latest height and walk down
+    let mut check_height = latest.height;
+    
+    loop {
+        // 3. Get found_block at this height
+        let found_block = match db.find_found_block_by_height(check_height)? {
+            Some(fb) => fb,
+            None => {
+                check_height -= 1;
+                if check_height < 0 { break; }
+                continue;
+            }
+        };
+        
+        // 4. Skip already orphaned blocks
+        if found_block.status == "orphaned" {
+            check_height -= 1;
+            if check_height < 0 { break; }
+            continue;
+        }
+        
+        // 5. Get node's block at this height
+        match adapter.get_block_by_height(check_height).await {
+            Ok(node_block) => {
+                let node_hash = node_block.header.hash.to_hex_be();
+                
+                // 6. Compare hashes
+                if node_hash == found_block.block_hash {
+                    // Match - block is valid
+                    validated_count += 1;
+                    
+                    info!(
+                        height = check_height,
+                        block_hash = %found_block.block_hash,
+                        "found_block validated"
+                    );
+                    
+                    // All blocks below are also valid - we're done
+                    break;
+                }
+                
+                // 7. Hash mismatch - orphan
+                warn!(
+                    height = check_height,
+                    our_hash = %found_block.block_hash,
+                    node_hash = %node_hash,
+                    "found_block orphaned (hash mismatch)"
+                );
+                
+                orphan_found_block(db, &found_block, "reorg_detected")?;
+                orphaned_count += 1;
+            }
+            Err(err) => {
+                // Node doesn't have block at this height
+                warn!(
+                    height = check_height,
+                    error = %err,
+                    "node doesn't have block at found_block height"
+                );
+                
+                orphan_found_block(db, &found_block, "block_not_found")?;
+                orphaned_count += 1;
+            }
+        }
+        
+        check_height -= 1;
+        if check_height < 0 { break; }
+    }
+    
+    info!(
+        orphaned_count,
+        validated_count,
+        "found_blocks reconciliation complete"
+    );
+    
+    Ok(check_height)
+}
+
 pub async fn run_stratum_server(
     cfg: Config,
     db: AccountingDb,
@@ -159,6 +286,18 @@ pub async fn run_stratum_server(
         Arc::new(BitcoindMiningAdapter::new(nng_adapter, json_rpc_client));
     let pool_scripts = cfg.resolve_pool_scripts()?;
     info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
+    
+    // Fetch actual chain tip from node via RPC
+    let node_tip = adapter.get_block_count().await?;
+    info!(node_tip, "fetched chain tip from node");
+    
+    // Reconcile found_blocks with node on startup
+    let _reconciled_height = reconcile_found_blocks(&db, &adapter).await?;
+    
+    // Track tip height from blkconnected events for confirmation computation
+    // Initialize from node's actual tip, not reconciliation result
+    let tip_height = Arc::new(AtomicI64::new(node_tip));
+    
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
     refresh_job_from_node(
         &runtime,
@@ -184,47 +323,142 @@ pub async fn run_stratum_server(
     let db_events = db.clone();
     let diff_cache_events = diff_cache.clone();
     let debug = cfg.debug;
+    let tip_height_events = tip_height.clone();
+    let min_confirmations = cfg.pool.pplns.min_confirmations as i64;
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
         let runtime_events = runtime_nng.clone();
         let adapter_events_inner = adapter_events.clone();
         tokio::spawn(async move {
+            // Track last seen template_epoch for missed-event detection
+            let mut last_template_epoch: Option<u64> = None;
+            
             while let Some(event) = rx.recv().await {
-                // All events trigger clean job replacement
+                // Lotus-specific: ALL events require clean_jobs=true because the Lotus header
+                // includes both merkle_root AND block size. When mempool changes, BOTH fields
+                // change, making all in-flight work immediately stale. This differs from Bitcoin
+                // where mempool updates only change merkle_root and miners could theoretically continue.
                 let clean = true;
-                let reason = match event {
-                    NodeEvent::UpdateBlkTip => "updateblktip",
-                    NodeEvent::MempoolRefresh => "mempool",
-                    NodeEvent::BlockDisconnected => "blkdisconctd",
-                };
-                if matches!(event, NodeEvent::BlockDisconnected) {
-                    match db_events.mark_pending_blocks_orphaned() {
-                        Ok(orphaned) if orphaned > 0 => {
-                            let _ = db_events.record_accounting_event(
-                                "block_orphaned",
-                                Some("orphaned"),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                Some("{\"reason\":\"blkdisconctd\"}"),
-                            );
-                            warn!(
-                                orphaned,
-                                "marked pending found blocks orphaned due to blkdisconctd"
-                            );
+                
+                let reason = match &event {
+                    // PRIMARY: miningwrkchg event - purpose-built for stratum servers
+                    // Includes reason code and monotonically increasing template_epoch
+                    NodeEvent::MiningWorkChanged {
+                        reason,
+                        tip_height,
+                        template_epoch,
+                        ..
+                    } => {
+                        // Detect missed events (gaps in template_epoch sequence)
+                        if let Some(last_epoch) = last_template_epoch {
+                            if *template_epoch > last_epoch + 1 {
+                                let missed = template_epoch - last_epoch - 1;
+                                warn!(
+                                    last_epoch,
+                                    current_epoch = template_epoch,
+                                    missed,
+                                    "missed miningwrkchg events from lotusd"
+                                );
+                            }
+                            if *template_epoch <= last_epoch {
+                                debug!(
+                                    last_epoch,
+                                    current_epoch = template_epoch,
+                                    "duplicate or out-of-order miningwrkchg event"
+                                );
+                                // Still process - lotusd may restart and reset epoch counter
+                            }
                         }
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!(error = %err, "failed applying blkdisconctd orphan update")
+                        last_template_epoch = Some(*template_epoch);
+                        
+                        // Update tip height tracker for confirmation computation
+                        tip_height_events.store(*tip_height, Ordering::SeqCst);
+                        
+                        // Mark matured blocks based on new tip using configured min_confirmations
+                        if let Err(err) = db_events.mark_blocks_matured(
+                            *tip_height,
+                            min_confirmations,
+                        ) {
+                            error!(error = %err, "failed marking matured blocks after miningwrkchg");
                         }
+                        
+                        // Use reason code for logging (affects reason string only, NOT clean_jobs)
+                        reason.as_str()
                     }
-                }
+                    // SECONDARY: blkconnected - for accounting only (mark blocks matured)
+                    // Template refresh handled by miningwrkchg, but we still need this for accounting
+                    NodeEvent::BlockConnected { height, hash: _, prev_hash: _ } => {
+                        // Update tip height tracker
+                        tip_height_events.store(*height, Ordering::SeqCst);
+                        
+                        // Mark matured blocks based on new tip using configured min_confirmations
+                        if let Err(err) = db_events.mark_blocks_matured(
+                            *height,
+                            min_confirmations,
+                        ) {
+                            error!(error = %err, "failed marking matured blocks after blkconnected");
+                        }
+                        
+                        "blkconnected"
+                    }
+                    // SECONDARY: blkdisconctd - for accounting only (orphan found blocks)
+                    // Template refresh handled by miningwrkchg, but we still need this for accounting
+                    NodeEvent::BlockDisconnected { height, hash, prev_hash: _ } => {
+                        // 1. Find OUR block at exact height+hash
+                        match db_events.find_found_block_by_height_and_hash(*height, hash) {
+                            Ok(Some(found_block)) => {
+                                // 2. Mark ONLY this block as orphaned
+                                if let Err(err) = db_events.mark_found_block_orphaned(hash, "blkdisconctd") {
+                                    error!(error = %err, block_hash = %hash, "failed marking found_block orphaned");
+                                } else {
+                                    warn!(
+                                        block_hash = %hash,
+                                        height = height,
+                                        round_id = found_block.round_id,
+                                        worker = %found_block.worker_name.unwrap_or_default(),
+                                        "pool-mined block orphaned via blkdisconctd"
+                                    );
+                                }
+                                
+                                // 3. Close the round
+                                let _ = db_events.close_round(
+                                    found_block.round_id,
+                                    found_block.template_id.map(|v| v as u64),
+                                    "round_closed_orphaned",
+                                    Some(hash),
+                                );
+                                
+                                // 4. Record accounting event
+                                let _ = db_events.record_accounting_event(
+                                    "found_block_orphaned",
+                                    Some("orphaned"),
+                                    None, None, None, None,
+                                    Some(found_block.round_id),
+                                    None, None, None,
+                                    Some(hash),
+                                    Some(&format!("{{\"height\":{}}}", height)),
+                                );
+                            }
+                            Ok(None) => {
+                                debug!(block_hash = %hash, height = height, "external block disconnected");
+                            }
+                            Err(err) => error!(error = %err, "failed checking orphaned found_block"),
+                        }
+                        
+                        // Update tip height tracker (reorg: tip goes back to prev block)
+                        tip_height_events.store(height - 1, Ordering::SeqCst);
+                        
+                        // Mark matured blocks based on new tip using configured min_confirmations
+                        if let Err(err) = db_events.mark_blocks_matured(
+                            height - 1,
+                            min_confirmations,
+                        ) {
+                            error!(error = %err, "failed marking matured blocks after reorg");
+                        }
+                        
+                        "blkdisconctd"
+                    }
+                };
                 if let Err(err) = refresh_job_from_node(
                     &runtime_events,
                     adapter_events_inner.clone(),
@@ -244,8 +478,17 @@ pub async fn run_stratum_server(
 
         if let Err(err) = rpc_adapter
             .run_pub_loop(&nng_pub_url, move |ev| {
+                // Log event type for debugging drops
+                // Include template_epoch for miningwrkchg events to aid in missed-event detection
+                let event_type = match &ev {
+                    NodeEvent::MiningWorkChanged { reason, template_epoch, tip_height: _, .. } => {
+                        format!("miningwrkchg[{}@{}]", reason.as_str(), template_epoch)
+                    }
+                    NodeEvent::BlockConnected { height, .. } => format!("blkconnected@{}", height),
+                    NodeEvent::BlockDisconnected { height, .. } => format!("blkdisconctd@{}", height),
+                };
                 if tx.send(ev).is_err() {
-                    warn!("NNG event queue dropped; stratum event consumer not running");
+                    warn!(event_type, "NNG event dropped; stratum event consumer not running");
                 }
             })
             .await
