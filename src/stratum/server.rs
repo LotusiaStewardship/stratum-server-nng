@@ -332,146 +332,155 @@ pub async fn run_stratum_server(
         tokio::spawn(async move {
             // Track last seen template_epoch for missed-event detection
             let mut last_template_epoch: Option<u64> = None;
-            
-            while let Some(event) = rx.recv().await {
-                // Lotus-specific: ALL events require clean_jobs=true because the Lotus header
-                // includes both merkle_root AND block size. When mempool changes, BOTH fields
-                // change, making all in-flight work immediately stale. This differs from Bitcoin
-                // where mempool updates only change merkle_root and miners could theoretically continue.
-                let clean = true;
-                
-                let reason = match &event {
-                    // PRIMARY: miningwrkchg event - purpose-built for stratum servers
-                    // Includes reason code and monotonically increasing template_epoch
-                    NodeEvent::MiningWorkChanged {
-                        reason,
-                        tip_height,
-                        template_epoch,
-                        ..
-                    } => {
-                        // Detect missed events (gaps in template_epoch sequence)
-                        if let Some(last_epoch) = last_template_epoch {
-                            if *template_epoch > last_epoch + 1 {
-                                let missed = template_epoch - last_epoch - 1;
-                                warn!(
-                                    last_epoch,
-                                    current_epoch = template_epoch,
-                                    missed,
-                                    "missed miningwrkchg events from lotusd"
-                                );
-                            }
-                            if *template_epoch <= last_epoch {
+
+            // Coalescing state: only MiningWorkChanged is debounced. Accounting events
+            // (blkconnected/blkdisconctd) are processed immediately since they don't
+            // trigger expensive RPC calls.
+            let mut pending_mining_work: Option<NodeEvent> = None;
+            let debounce_duration = Duration::from_millis(100);
+            let mut debounce_timer = tokio::time::interval(debounce_duration);
+            debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    // Collect incoming NNG events
+                    Some(event) = rx.recv() => {
+                        match &event {
+                            NodeEvent::MiningWorkChanged { template_epoch, .. } => {
+                                // Coalesce: replace pending with newer event. Only the
+                                // latest event matters — older ones are superseded.
+                                let prev_epoch = pending_mining_work.as_ref().and_then(|e| {
+                                    match e {
+                                        NodeEvent::MiningWorkChanged { template_epoch: e, .. } => Some(*e),
+                                        _ => None,
+                                    }
+                                });
                                 debug!(
-                                    last_epoch,
-                                    current_epoch = template_epoch,
-                                    "duplicate or out-of-order miningwrkchg event"
+                                    previous_epoch = prev_epoch.map(|e| e.to_string()).as_deref().unwrap_or("none"),
+                                    new_epoch = template_epoch,
+                                    "coalescing miningwrkchg event"
                                 );
-                                // Still process - lotusd may restart and reset epoch counter
+                                pending_mining_work = Some(event);
                             }
-                        }
-                        last_template_epoch = Some(*template_epoch);
-                        
-                        // Update tip height tracker for confirmation computation
-                        tip_height_events.store(*tip_height, Ordering::SeqCst);
-                        
-                        // Mark matured blocks based on new tip using configured min_confirmations
-                        if let Err(err) = db_events.mark_blocks_matured(
-                            *tip_height,
-                            min_confirmations,
-                        ) {
-                            error!(error = %err, "failed marking matured blocks after miningwrkchg");
-                        }
-                        
-                        // Use reason code for logging (affects reason string only, NOT clean_jobs)
-                        reason.as_str()
-                    }
-                    // SECONDARY: blkconnected - for accounting only (mark blocks matured)
-                    // Template refresh handled by miningwrkchg, but we still need this for accounting
-                    NodeEvent::BlockConnected { height, hash: _, prev_hash: _ } => {
-                        // Update tip height tracker
-                        tip_height_events.store(*height, Ordering::SeqCst);
-                        
-                        // Mark matured blocks based on new tip using configured min_confirmations
-                        if let Err(err) = db_events.mark_blocks_matured(
-                            *height,
-                            min_confirmations,
-                        ) {
-                            error!(error = %err, "failed marking matured blocks after blkconnected");
-                        }
-                        
-                        "blkconnected"
-                    }
-                    // SECONDARY: blkdisconctd - for accounting only (orphan found blocks)
-                    // Template refresh handled by miningwrkchg, but we still need this for accounting
-                    NodeEvent::BlockDisconnected { height, hash, prev_hash: _ } => {
-                        // 1. Find OUR block at exact height+hash
-                        match db_events.find_found_block_by_height_and_hash(*height, hash) {
-                            Ok(Some(found_block)) => {
-                                // 2. Mark ONLY this block as orphaned
-                                if let Err(err) = db_events.mark_found_block_orphaned(hash, "blkdisconctd") {
-                                    error!(error = %err, block_hash = %hash, "failed marking found_block orphaned");
-                                } else {
-                                    warn!(
-                                        block_hash = %hash,
-                                        height = height,
-                                        round_id = found_block.round_id,
-                                        worker = %found_block.worker_name.unwrap_or_default(),
-                                        "pool-mined block orphaned via blkdisconctd"
-                                    );
+                            NodeEvent::BlockConnected { height, hash: _, prev_hash: _ } => {
+                                // Accounting only — process immediately, no debounce
+                                tip_height_events.store(*height, Ordering::SeqCst);
+                                if let Err(err) = db_events.mark_blocks_matured(
+                                    *height,
+                                    min_confirmations,
+                                ) {
+                                    error!(error = %err, "failed marking matured blocks after blkconnected");
                                 }
-                                
-                                // 3. Close the round
-                                let _ = db_events.close_round(
-                                    found_block.round_id,
-                                    found_block.template_id.map(|v| v as u64),
-                                    "round_closed_orphaned",
-                                    Some(hash),
-                                );
-                                
-                                // 4. Record accounting event
-                                let _ = db_events.record_accounting_event(
-                                    "found_block_orphaned",
-                                    Some("orphaned"),
-                                    None, None, None, None,
-                                    Some(found_block.round_id),
-                                    None, None, None,
-                                    Some(hash),
-                                    Some(&format!("{{\"height\":{}}}", height)),
-                                );
                             }
-                            Ok(None) => {
-                                debug!(block_hash = %hash, height = height, "external block disconnected");
+                            NodeEvent::BlockDisconnected { height, hash, prev_hash: _ } => {
+                                // Accounting only — process immediately, no debounce
+                                match db_events.find_found_block_by_height_and_hash(*height, hash) {
+                                    Ok(Some(found_block)) => {
+                                        if let Err(err) = db_events.mark_found_block_orphaned(hash, "blkdisconctd") {
+                                            error!(error = %err, block_hash = %hash, "failed marking found_block orphaned");
+                                        } else {
+                                            warn!(
+                                                block_hash = %hash,
+                                                height = height,
+                                                round_id = found_block.round_id,
+                                                worker = %found_block.worker_name.unwrap_or_default(),
+                                                "pool-mined block orphaned via blkdisconctd"
+                                            );
+                                        }
+                                        let _ = db_events.close_round(
+                                            found_block.round_id,
+                                            found_block.template_id.map(|v| v as u64),
+                                            "round_closed_orphaned",
+                                            Some(hash),
+                                        );
+                                        let _ = db_events.record_accounting_event(
+                                            "found_block_orphaned",
+                                            Some("orphaned"),
+                                            None, None, None, None,
+                                            Some(found_block.round_id),
+                                            None, None, None,
+                                            Some(hash),
+                                            Some(&format!("{{\"height\":{}}}", height)),
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        debug!(block_hash = %hash, height = height, "external block disconnected");
+                                    }
+                                    Err(err) => error!(error = %err, "failed checking orphaned found_block"),
+                                }
+                                tip_height_events.store(height - 1, Ordering::SeqCst);
+                                if let Err(err) = db_events.mark_blocks_matured(
+                                    height - 1,
+                                    min_confirmations,
+                                ) {
+                                    error!(error = %err, "failed marking matured blocks after reorg");
+                                }
                             }
-                            Err(err) => error!(error = %err, "failed checking orphaned found_block"),
                         }
-                        
-                        // Update tip height tracker (reorg: tip goes back to prev block)
-                        tip_height_events.store(height - 1, Ordering::SeqCst);
-                        
-                        // Mark matured blocks based on new tip using configured min_confirmations
-                        if let Err(err) = db_events.mark_blocks_matured(
-                            height - 1,
-                            min_confirmations,
-                        ) {
-                            error!(error = %err, "failed marking matured blocks after reorg");
-                        }
-                        
-                        "blkdisconctd"
                     }
-                };
-                if let Err(err) = refresh_job_from_node(
-                    &runtime_events,
-                    adapter_events_inner.clone(),
-                    &pool_scripts_events,
-                    stats_events.clone(),
-                    &diff_cache_events,
-                    clean,
-                    reason,
-                    debug,
-                )
-                .await
-                {
-                    warn!(error = %err, reason, "template refresh failed after event");
+
+                    // Debounce timer fires — process the latest pending MiningWorkChanged
+                    _ = debounce_timer.tick() => {
+                        if let Some(event) = pending_mining_work.take() {
+                            if let NodeEvent::MiningWorkChanged {
+                                ref reason,
+                                tip_height,
+                                template_epoch,
+                                ..
+                            } = event
+                            {
+                                // Detect missed events (gaps in template_epoch sequence)
+                                if let Some(last_epoch) = last_template_epoch {
+                                    if template_epoch > last_epoch + 1 {
+                                        let missed = template_epoch - last_epoch - 1;
+                                        warn!(
+                                            last_epoch,
+                                            current_epoch = template_epoch,
+                                            missed,
+                                            "missed miningwrkchg events from lotusd"
+                                        );
+                                    }
+                                    if template_epoch <= last_epoch {
+                                        debug!(
+                                            last_epoch,
+                                            current_epoch = template_epoch,
+                                            "duplicate or out-of-order miningwrkchg event"
+                                        );
+                                    }
+                                }
+                                last_template_epoch = Some(template_epoch);
+
+                                // Update tip height tracker for confirmation computation
+                                tip_height_events.store(tip_height, Ordering::SeqCst);
+
+                                // Mark matured blocks based on new tip using configured min_confirmations
+                                if let Err(err) = db_events.mark_blocks_matured(
+                                    tip_height,
+                                    min_confirmations,
+                                ) {
+                                    error!(error = %err, "failed marking matured blocks after miningwrkchg");
+                                }
+
+                                // Refresh the mining template and broadcast to all miners.
+                                // clean=true because the Lotus header includes block_size,
+                                // so ALL work changes (mempool, new tip, reorg) invalidate
+                                // in-flight work.
+                                if let Err(err) = refresh_job_from_node(
+                                    &runtime_events,
+                                    adapter_events_inner.clone(),
+                                    &pool_scripts_events,
+                                    stats_events.clone(),
+                                    &diff_cache_events,
+                                    true,  // clean_jobs
+                                    reason.as_str(),
+                                    debug,
+                                ).await {
+                                    warn!(error = %err, reason = reason.as_str(),
+                                        "template refresh failed after miningwrkchg");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
