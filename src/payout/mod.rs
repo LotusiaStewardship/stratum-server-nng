@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 /// Represents a complete payout plan for distributing block rewards.
-/// 
+///
 /// Contains the final outputs to be paid, dust amounts below minimum payout,
 /// and accounting information for the reward distribution.
 #[derive(Debug, Clone)]
@@ -26,22 +26,22 @@ pub struct PayoutPlan {
 }
 
 /// Trait for abstracting the transaction signing and submission mechanism.
-/// 
+///
 /// Allows the payout system to support different signing modes (e.g., internal,
 /// external HSM, multisig) without coupling to specific implementation details.
 pub trait OptionalSigner: Send + Sync {
     /// Sign the payout transaction and broadcast it to the network.
-    /// 
+    ///
     /// # Arguments
     /// * `plan` - The payout plan containing outputs to be paid
-    /// 
+    ///
     /// # Returns
     /// The transaction ID (txid) of the submitted transaction as a hex string.
     fn sign_and_submit(&self, _plan: &PayoutPlan) -> Result<String>;
 }
 
 /// Represents a miner's share of work in the PPLNS window.
-/// 
+///
 /// Used to calculate proportional payout amounts based on contributed work.
 #[derive(Debug, Clone)]
 pub struct WeightedShare {
@@ -53,13 +53,13 @@ pub struct WeightedShare {
 }
 
 /// Calculate the pool fee from a gross reward amount.
-/// 
+///
 /// Uses 128-bit intermediate arithmetic to prevent overflow during multiplication.
-/// 
+///
 /// # Arguments
 /// * `gross_reward_sat` - Total reward in satoshis before fee deduction
 /// * `fee_bps` - Fee in basis points (1/100th of a percent). E.g., 100 = 1%
-/// 
+///
 /// # Returns
 /// Fee amount in satoshis, truncated to nearest whole satoshi.
 pub fn compute_fee(gross_reward_sat: i64, fee_bps: u32) -> i64 {
@@ -67,13 +67,13 @@ pub fn compute_fee(gross_reward_sat: i64, fee_bps: u32) -> i64 {
 }
 
 /// Build a PPLNS (Pay Per Last N Shares) payout plan for a found block.
-/// 
+///
 /// Distributes the net reward (after fees) proportionally among miners based on
 /// their work units in the PPLNS window. Handles fractional satoshi remainders
 /// deterministically by distributing them to miners with largest fractional parts.
-/// 
+///
 /// Includes accumulated dust from previous payouts (dust carry-forward).
-/// 
+///
 /// # Arguments
 /// * `gross_reward_sat` - Total block reward in satoshis
 /// * `fee_bps` - Pool fee in basis points (e.g., 100 = 1%)
@@ -81,10 +81,10 @@ pub fn compute_fee(gross_reward_sat: i64, fee_bps: u32) -> i64 {
 /// * `shares` - List of weighted shares from miners in the PPLNS window
 /// * `min_payout_sat` - Minimum payout threshold; amounts below this become dust
 /// * `dust_by_address` - Map of address → accumulated dust from previous payouts
-/// 
+///
 /// # Returns
 /// A `PayoutPlan` containing outputs, dust, and accounting information.
-/// 
+///
 /// # Edge Cases
 /// - If total_work <= 0 or net_reward <= 0, returns plan with only fee output (if any)
 /// - Remainder satoshis from floor division are distributed deterministically
@@ -255,7 +255,7 @@ mod tests {
         }];
         let mut dust = HashMap::new();
         dust.insert("a".to_string(), 100); // 100 sats accumulated dust
-        
+
         let p = build_pplns_payout_plan(1000, 0, None, &shares, 0, &dust);
         // Should receive 1000 (current) + 100 (dust) = 1100
         assert_eq!(p.outputs, vec![("a".into(), 1100)]);

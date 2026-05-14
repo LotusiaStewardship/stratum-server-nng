@@ -4,7 +4,6 @@ use crate::accounting::{
 };
 use crate::stratum::server::RuntimeStats;
 use anyhow::Result;
-use tracing::error;
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -14,6 +13,7 @@ use axum::{
 };
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tracing::error;
 
 #[derive(Clone)]
 struct ApiState {
@@ -238,31 +238,38 @@ async fn payout_scheduler_health(
     if !check_auth(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    
+
     // Get lease information
     let lease_info = match state.db.get_lease_info() {
         Ok(info) => info,
         Err(err) => {
             error!(error = %err, "failed to get lease info");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to get lease info").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to get lease info",
+            )
+                .into_response();
         }
     };
-    
+
     let lease_held = lease_info.as_ref().map(|i| i.is_valid).unwrap_or(false);
-    let instance_id = lease_info.as_ref().map(|i| i.owner.clone()).unwrap_or_else(|| "unknown".to_string());
-    
+    let instance_id = lease_info
+        .as_ref()
+        .map(|i| i.owner.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
     // Get confirmed blocks count
     let confirmed_blocks = match state.db.found_block_state_summary() {
         Ok(summary) => summary.matured,
         Err(_) => 0,
     };
-    
+
     // Get failed batches count
     let failed_batches = match state.db.payout_batch_state_summary() {
         Ok(summary) => summary.failed,
         Err(_) => 0,
     };
-    
+
     // Determine overall status
     let status = if failed_batches > 0 {
         "degraded".to_string()
@@ -271,7 +278,7 @@ async fn payout_scheduler_health(
     } else {
         "unhealthy".to_string()
     };
-    
+
     Json(PayoutSchedulerHealthResp {
         status,
         instance_id,
@@ -279,7 +286,7 @@ async fn payout_scheduler_health(
         lease_info,
         confirmed_blocks,
         failed_batches,
-        last_run: None, // Would need to track this in scheduler
+        last_run: None,     // Would need to track this in scheduler
         last_success: None, // Would need to track this in scheduler
     })
     .into_response()
@@ -306,10 +313,7 @@ pub async fn start_operator_api(
             "/reconciliation/missing-found-blocks",
             get(reconciliation_missing_found_blocks),
         )
-        .route(
-            "/health/payout-scheduler",
-            get(payout_scheduler_health),
-        )
+        .route("/health/payout-scheduler", get(payout_scheduler_health))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind).await?;

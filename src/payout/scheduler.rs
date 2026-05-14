@@ -25,20 +25,20 @@ use crate::{
 const COINBASE_MATURITY_BLOCKS: u32 = 100;
 
 /// Main entry point for the payout scheduler background task.
-/// 
+///
 /// Runs an infinite loop that periodically:
 /// 1. Acquires/renews a scheduler lease for HA coordination
 /// 2. Syncs block confirmations to track maturity
 /// 3. Processes matured found blocks and creates payout transactions
 /// 4. Submits payouts to bitcoind and tracks confirmation
-/// 
+///
 /// # Arguments
 /// * `cfg` - Pool configuration including signing keys, fee settings, and PPLNS parameters
 /// * `db` - Accounting database for tracking shares, found blocks, and payout batches
-/// 
+///
 /// # Early Exit
 /// Returns immediately if signing mode is not "internal" (external signing not yet supported).
-/// 
+///
 /// # Lease Behavior
 /// Uses scheduler lease mechanism to ensure only one instance processes payouts at a time
 /// in HA deployments. Lease is acquired each interval and renewed after processing.
@@ -82,7 +82,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
     let instance_id = &cfg.pool.pplns.instance_id;
     // Lease duration before expiration (default 5 minutes)
     let lease_duration_mins = scheduler_lease::DEFAULT_LEASE_DURATION_MINS;
-    
+
     // Main scheduler loop: wait for interval, then attempt payout processing
     loop {
         tokio::time::sleep(interval).await;
@@ -142,46 +142,71 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
         let mut processed_count = 0;
         // Rate limit: process at most 10 blocks per interval to avoid overwhelming bitcoind
         let max_blocks_per_interval = 10;
-        
+
         // Process each matured found block one at a time
         // take_next_matured_fetch returns blocks in order of maturity (oldest first)
         while let Some((found_block_id, block_hash)) = db.take_next_matured_found_block()? {
             // Check rate limit before processing
             if processed_count >= max_blocks_per_interval {
-                info!(processed_count, "rate limit reached, will continue in next interval");
+                info!(
+                    processed_count,
+                    "rate limit reached, will continue in next interval"
+                );
                 break;
             }
             processed_count += 1;
-            
+
             // Log first block normally, subsequent blocks as "catching up"
             if processed_count == 1 {
                 info!(block_hash, "processing matured found block");
             } else {
-                info!(block_hash, processed_count, "catching up: processing additional matured found block");
+                info!(
+                    block_hash,
+                    processed_count, "catching up: processing additional matured found block"
+                );
             }
 
-            // Calculate target work units for PPLNS window
-            // n_multiplier is in "blocks of work" units; scale by network difficulty
-            // and normalize to min difficulty so work_units = equivalent min-diff shares
-            let target_work_units =
-                cfg.pool.pplns.n_multiplier * (network_diff / cfg.vardiff.vardiff_min_floor).max(1.0);
-            // Retrieve all weighted shares in the PPLNS window for this found block
-            // Third parameter (200_000) is the maximum number of shares to retrieve
-            let window_shares =
-                db.list_weighted_shares_for_pplns_window(
-                    found_block_id,
-                    target_work_units,
-                    200_000,
-                    cfg.vardiff.vardiff_min_floor,
-                )?;
-            // Convert database shares to WeightedShare structs for payout calculation
-            let shares = window_shares
-                .iter()
-                .map(|s| WeightedShare {
-                    payout_address: s.payout_address.clone(),
-                    work_units: s.work_units,
-                })
-                .collect::<Vec<_>>();
+            // Calculate target work units for PPLNS window.
+            //
+            // The DB returns work_units = difficulty / vardiff_min_floor (normalized).
+            // N = n_multiplier × network_difficulty (in raw difficulty units).
+            // To express N in normalized work_units: N / vardiff_min_floor.
+            //
+            // With n_multiplier=2.0 (industry standard), the window spans ~2 expected
+            // rounds of work, providing variance smoothing while remaining responsive.
+            let target_work_units = (cfg.pool.pplns.n_multiplier * network_diff
+                / cfg.vardiff.vardiff_min_floor)
+                .max(1.0);
+            // Retrieve all weighted shares in the PPLNS window for this found block.
+            // Third parameter (200_000) is the maximum number of shares to retrieve (safety cap).
+            let window_shares = db.list_weighted_shares_for_pplns_window(
+                found_block_id,
+                target_work_units,
+                200_000,
+                cfg.vardiff.vardiff_min_floor,
+            )?;
+
+            // Build weighted shares with partial credit at window boundary.
+            // When the last share would push cumulative work past target_work_units,
+            // only credit the remaining amount needed to reach the target.
+            // This prevents over-paying (see implementation plan §6, Bug 6).
+            let shares: Vec<WeightedShare> = {
+                let mut cumulative = 0.0;
+                let mut out = Vec::with_capacity(window_shares.len());
+                for s in window_shares.iter() {
+                    if cumulative >= target_work_units {
+                        break;
+                    }
+                    let remaining = target_work_units - cumulative;
+                    let contribution = s.work_units.min(remaining);
+                    cumulative += contribution;
+                    out.push(WeightedShare {
+                        payout_address: s.payout_address.clone(),
+                        work_units: contribution,
+                    });
+                }
+                out
+            };
 
             // Debug: Log PPLNS window details
             let total_work_units: f64 = shares.iter().map(|s| s.work_units).sum();
@@ -200,10 +225,16 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             );
             // Debug: Log top 10 shares by work units
             let mut shares_sorted = shares.clone();
-            shares_sorted.sort_by(|a, b| b.work_units.partial_cmp(&a.work_units).unwrap_or(std::cmp::Ordering::Equal));
-            let top_shares: Vec<_> = shares_sorted.iter().take(10).map(|s| {
-                format!("{}:{:.4}", s.payout_address, s.work_units)
-            }).collect();
+            shares_sorted.sort_by(|a, b| {
+                b.work_units
+                    .partial_cmp(&a.work_units)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_shares: Vec<_> = shares_sorted
+                .iter()
+                .take(10)
+                .map(|s| format!("{}:{:.4}", s.payout_address, s.work_units))
+                .collect();
             debug!(
                 found_block_id,
                 top_shares = top_shares.join(", "),
@@ -255,7 +286,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             let fee_enabled = cfg.pool.fee.enabled;
             let fee_bps = if fee_enabled { cfg.pool.fee.fee_bps } else { 0 };
             let min_payout_sat = cfg.pool.pplns.min_payout_sat;
-            
+
             // Query accumulated dust for each unique address (dust carry-forward)
             let mut dust_by_address: HashMap<String, i64> = HashMap::new();
             for addr in &unique_addresses {
@@ -265,7 +296,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                     }
                 }
             }
-            
+
             let plan = build_pplns_payout_plan(
                 actual_coinbase_value,
                 fee_bps,
@@ -293,9 +324,11 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             // Debug: Log payout outputs summary (top 10 by amount)
             let mut outputs_sorted = plan.outputs.clone();
             outputs_sorted.sort_by(|a, b| b.1.cmp(&a.1));
-            let top_outputs: Vec<_> = outputs_sorted.iter().take(10).map(|(addr, amt)| {
-                format!("{}:{}", addr, amt)
-            }).collect();
+            let top_outputs: Vec<_> = outputs_sorted
+                .iter()
+                .take(10)
+                .map(|(addr, amt)| format!("{}:{}", addr, amt))
+                .collect();
             let total_outputs_sat: i64 = plan.outputs.iter().map(|(_, amt)| *amt).sum();
             let total_dust_sat: i64 = plan.dust.iter().map(|(_, amt)| *amt).sum();
             debug!(
@@ -324,25 +357,28 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             // Debug: Log batch creation
             debug!(
                 batch_id,
-                found_block_id,
-                retry_key,
-                "payout batch created in database"
+                found_block_id, retry_key, "payout batch created in database"
             );
 
             // Build and sign the payout transaction using the coinbase as input
             let coinbase_txid_hex = coinbase.tx.txid.to_hex_be();
             let coinbase_input_value = payout_output.value;
-            
+
             // Separate worker outputs from fee output for transaction construction
             // plan.outputs includes fee for accounting, but TxBuilder handles fee as Leftover
             let fee_addr_str = cfg.pool.fee.fee_address.as_deref();
-            let worker_outputs: Vec<(String, i64)> = if fee_addr_str.is_some() && !plan.outputs.is_empty() {
-                // Fee output is appended last by build_pplns_payout_plan
-                plan.outputs.iter().take(plan.outputs.len() - 1).cloned().collect()
-            } else {
-                plan.outputs.clone()
-            };
-            
+            let worker_outputs: Vec<(String, i64)> =
+                if fee_addr_str.is_some() && !plan.outputs.is_empty() {
+                    // Fee output is appended last by build_pplns_payout_plan
+                    plan.outputs
+                        .iter()
+                        .take(plan.outputs.len() - 1)
+                        .cloned()
+                        .collect()
+                } else {
+                    plan.outputs.clone()
+                };
+
             // Build fee script for Leftover output
             let fee_script = if let Some(fee_addr) = fee_addr_str {
                 fee_addr.parse::<LotusAddress>()?.script().clone()
@@ -350,7 +386,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 // Fallback to payout script if no fee address configured
                 Script::from_slice(&payout_script)
             };
-            
+
             let signed_tx = match build_and_sign_payout_tx(
                 &worker_outputs,
                 &fee_script,
@@ -362,7 +398,8 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 Ok(tx) => tx,
                 Err(err) => {
                     // Schedule retry in 60 seconds on signing failure
-                    let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                    let retry_at =
+                        (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
                     db.schedule_batch_retry(batch_id, &err.to_string(), &retry_at)?;
                     error!(error = %err, batch_id, found_block_id, block_hash, "failed signing payout tx");
                     continue;
@@ -373,9 +410,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             let tx_serialized = signed_tx.ser();
             let tx_size_bytes = tx_serialized.as_ref().len();
             let worker_output_sat: i64 = worker_outputs.iter().map(|(_, amt)| *amt).sum();
-            let pool_fee_output = signed_tx.outputs.last()
-                .map(|o| o.value)
-                .unwrap_or(0);
+            let pool_fee_output = signed_tx.outputs.last().map(|o| o.value).unwrap_or(0);
             let network_fee_sat = coinbase_input_value - worker_output_sat - pool_fee_output;
             debug!(
                 batch_id,
@@ -422,7 +457,8 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                     .to_string(),
                 Err(err) => {
                     // Schedule retry in 60 seconds on submission failure
-                    let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                    let retry_at =
+                        (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
                     db.schedule_batch_retry(batch_id, &err.to_string(), &retry_at)?;
                     error!(error = %err, batch_id, found_block_id, block_hash, "failed submitting payout tx via JSON-RPC");
                     continue;
@@ -432,7 +468,7 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
             db.update_payout_batch_state(batch_id, "submitted", None, Some(&submitted_txid), None)?;
             // Mark the found block as having a payout submitted (prevents re-processing)
             db.mark_found_block_payout_submitted(found_block_id)?;
-            
+
             // Reduce dust ledger for addresses that received accumulated dust
             // This completes the dust carry-forward cycle
             for (addr, dust_amount) in &dust_by_address {
@@ -498,25 +534,30 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 }
             }
         }
-        
+
         // Renew lease after processing blocks to maintain exclusive access
         // This extends the lease duration so another instance doesn't take over
-        if let Err(err) = scheduler_lease::renew_scheduler_lease(&db, instance_id, lease_duration_mins) {
+        if let Err(err) =
+            scheduler_lease::renew_scheduler_lease(&db, instance_id, lease_duration_mins)
+        {
             error!(error = %err, "failed to renew payout scheduler lease");
         }
-        
+
         // Log summary if any blocks were processed this interval
         if processed_count > 0 {
-            info!(processed_count, "completed payout processing for this interval");
+            info!(
+                processed_count,
+                "completed payout processing for this interval"
+            );
         }
     }
 }
 
 /// Parse a private key from hex or WIF format.
-/// 
+///
 /// # Arguments
 /// * `private_key` - Private key as a hex string or WIF (Wallet Import Format)
-/// 
+///
 /// # Returns
 /// * `Ok(SecKey)` - Parsed secret key
 /// * `Err(...)` - If the key format is invalid
@@ -526,14 +567,14 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
 }
 
 /// Build and sign a payout transaction that spends the coinbase payout output.
-/// 
+///
 /// Creates a transaction with:
 /// - Input: coinbase vout[1] (pool payout: subsidy + TX fees - miner fund)
 /// - Outputs: one output per miner (fixed amounts), pool fee receives the leftover
-/// 
+///
 /// Uses P2PKH signing with the pool's private key. The sequence number is set
 /// to 0xffff_fffe to enable Replace-By-Fee (RBF) if needed.
-/// 
+///
 /// # Arguments
 /// * `outputs` - List of (address, amount) pairs to pay to miners (excludes pool fee)
 /// * `fee_script` - Pool's fee address script (receives leftover after network fee)
@@ -541,11 +582,11 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
 /// * `seckey` - Pool's private key for signing
 /// * `prev_txid` - Transaction ID of the coinbase transaction
 /// * `prev_value` - Value of the coinbase payout output in satoshis
-/// 
+///
 /// # Returns
 /// * `Ok(UnhashedTx)` - Signed payout transaction ready for serialization
 /// * `Err(...)` - If signing fails, outputs exceed input, or script is not P2PKH
-/// 
+///
 /// # Fee Handling
 /// Network fee is automatically calculated at 2 sat/byte by TxBuilder::sign().
 /// The pool fee output receives: prev_value - worker_outputs - network_fee.

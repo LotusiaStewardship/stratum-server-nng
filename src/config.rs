@@ -60,6 +60,11 @@ pub struct FeeConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PplnsConfig {
+    /// Difficulty-weighted PPLNS window multiplier.
+    /// N = n_multiplier × network_difficulty (in raw difficulty units).
+    /// Industry standard: 2.0 (spans ~2 expected rounds for variance smoothing).
+    /// Values < 1.0 approach PROP behaviour; values > 5.0 make payouts too sticky.
+    #[serde(default = "default_n_multiplier")]
     pub n_multiplier: f64,
     pub min_payout_sat: i64,
     pub payout_interval_secs: u64,
@@ -67,6 +72,49 @@ pub struct PplnsConfig {
     /// Unique identifier for this pool instance (used for scheduler lease)
     #[serde(default = "default_instance_id")]
     pub instance_id: String,
+    /// Invalid share banning configuration.
+    #[serde(default)]
+    pub banning: BanningConfig,
+}
+
+/// Configuration for invalid share banning.
+///
+/// When enabled, miners whose share rejection ratio exceeds the threshold
+/// after submitting `check_threshold` shares are disconnected.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BanningConfig {
+    /// Enable or disable invalid share banning.
+    #[serde(default = "default_banning_enabled")]
+    pub enabled: bool,
+    /// Number of shares to collect before checking the rejection ratio.
+    #[serde(default = "default_check_threshold")]
+    pub check_threshold: u32,
+    /// Maximum allowed rejection percentage. Miners exceeding this are banned.
+    #[serde(default = "default_invalid_percent")]
+    pub invalid_percent: f64,
+}
+
+impl Default for BanningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_threshold: 50,
+            invalid_percent: 50.0,
+        }
+    }
+}
+
+fn default_n_multiplier() -> f64 {
+    2.0
+}
+fn default_banning_enabled() -> bool {
+    true
+}
+fn default_check_threshold() -> u32 {
+    50
+}
+fn default_invalid_percent() -> f64 {
+    50.0
 }
 
 fn default_instance_id() -> String {
@@ -131,9 +179,7 @@ impl VarDiffConfig {
             || self.vardiff_initial_pct > 1.0
             || !self.vardiff_initial_pct.is_finite()
         {
-            return Err(anyhow::anyhow!(
-                "vardiff_initial_pct must be in (0.0, 1.0]"
-            ));
+            return Err(anyhow::anyhow!("vardiff_initial_pct must be in (0.0, 1.0]"));
         }
         Ok(())
     }
@@ -164,9 +210,9 @@ impl Config {
         }
 
         // Auto-set database path if using default pattern or not explicitly set
-        let should_override_db_path = cfg.sqlite_path.contains("stratum-accounting")
-            || cfg.sqlite_path.is_empty();
-        
+        let should_override_db_path =
+            cfg.sqlite_path.contains("stratum-accounting") || cfg.sqlite_path.is_empty();
+
         if should_override_db_path {
             cfg.sqlite_path = default_db_path_for_network(&cfg.network);
         }
@@ -191,7 +237,10 @@ impl Config {
         }
         // Validate network is known value
         if !["mainnet", "testnet", "regtest"].contains(&self.network.as_str()) {
-            anyhow::bail!("network must be one of: mainnet, testnet, regtest (got: {})", self.network);
+            anyhow::bail!(
+                "network must be one of: mainnet, testnet, regtest (got: {})",
+                self.network
+            );
         }
         let _ = self.resolve_pool_scripts()?;
         self.vardiff.validate()?;

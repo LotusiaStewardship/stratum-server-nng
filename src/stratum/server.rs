@@ -128,14 +128,10 @@ impl StratumRuntime {
 }
 
 /// Helper: orphan a found_block and close associated round
-fn orphan_found_block(
-    db: &AccountingDb,
-    found_block: &FoundBlock,
-    reason: &str,
-) -> Result<()> {
+fn orphan_found_block(db: &AccountingDb, found_block: &FoundBlock, reason: &str) -> Result<()> {
     // 1. Mark as orphaned
     db.mark_found_block_orphaned(&found_block.block_hash, reason)?;
-    
+
     // 2. Close round
     let _ = db.close_round(
         found_block.round_id,
@@ -143,18 +139,23 @@ fn orphan_found_block(
         "round_closed_orphaned",
         Some(&found_block.block_hash),
     );
-    
+
     // 3. Record accounting event
     let _ = db.record_accounting_event(
         "found_block_orphaned",
         Some("orphaned"),
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
         Some(found_block.round_id),
-        None, None, None,
+        None,
+        None,
+        None,
         Some(&found_block.block_hash),
         Some(&format!("{{\"height\":{}}}", found_block.height)),
     );
-    
+
     Ok(())
 }
 
@@ -172,51 +173,55 @@ async fn reconcile_found_blocks(
             return Ok(0);
         }
     };
-    
+
     let mut orphaned_count = 0u64;
     let mut validated_count = 0u64;
-    
+
     // 2. Start from latest height and walk down
     let mut check_height = latest.height;
-    
+
     loop {
         // 3. Get found_block at this height
         let found_block = match db.find_found_block_by_height(check_height)? {
             Some(fb) => fb,
             None => {
                 check_height -= 1;
-                if check_height < 0 { break; }
+                if check_height < 0 {
+                    break;
+                }
                 continue;
             }
         };
-        
+
         // 4. Skip already orphaned blocks
         if found_block.status == "orphaned" {
             check_height -= 1;
-            if check_height < 0 { break; }
+            if check_height < 0 {
+                break;
+            }
             continue;
         }
-        
+
         // 5. Get node's block at this height
         match adapter.get_block_by_height(check_height).await {
             Ok(node_block) => {
                 let node_hash = node_block.header.hash.to_hex_be();
-                
+
                 // 6. Compare hashes
                 if node_hash == found_block.block_hash {
                     // Match - block is valid
                     validated_count += 1;
-                    
+
                     info!(
                         height = check_height,
                         block_hash = %found_block.block_hash,
                         "found_block validated"
                     );
-                    
+
                     // All blocks below are also valid - we're done
                     break;
                 }
-                
+
                 // 7. Hash mismatch - orphan
                 warn!(
                     height = check_height,
@@ -224,7 +229,7 @@ async fn reconcile_found_blocks(
                     node_hash = %node_hash,
                     "found_block orphaned (hash mismatch)"
                 );
-                
+
                 orphan_found_block(db, &found_block, "reorg_detected")?;
                 orphaned_count += 1;
             }
@@ -235,22 +240,23 @@ async fn reconcile_found_blocks(
                     error = %err,
                     "node doesn't have block at found_block height"
                 );
-                
+
                 orphan_found_block(db, &found_block, "block_not_found")?;
                 orphaned_count += 1;
             }
         }
-        
+
         check_height -= 1;
-        if check_height < 0 { break; }
+        if check_height < 0 {
+            break;
+        }
     }
-    
+
     info!(
         orphaned_count,
-        validated_count,
-        "found_blocks reconciliation complete"
+        validated_count, "found_blocks reconciliation complete"
     );
-    
+
     Ok(check_height)
 }
 
@@ -286,18 +292,18 @@ pub async fn run_stratum_server(
         Arc::new(BitcoindMiningAdapter::new(nng_adapter, json_rpc_client));
     let pool_scripts = cfg.resolve_pool_scripts()?;
     info!(payout_script_fingerprint = %pool_scripts.payout_fingerprint, "pool payout script configured");
-    
+
     // Fetch actual chain tip from node via RPC
     let node_tip = adapter.get_block_count().await?;
     info!(node_tip, "fetched chain tip from node");
-    
+
     // Reconcile found_blocks with node on startup
     let _reconciled_height = reconcile_found_blocks(&db, &adapter).await?;
-    
+
     // Track tip height from blkconnected events for confirmation computation
     // Initialize from node's actual tip, not reconciliation result
     let tip_height = Arc::new(AtomicI64::new(node_tip));
-    
+
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
     refresh_job_from_node(
         &runtime,
@@ -490,14 +496,24 @@ pub async fn run_stratum_server(
                 // Log event type for debugging drops
                 // Include template_epoch for miningwrkchg events to aid in missed-event detection
                 let event_type = match &ev {
-                    NodeEvent::MiningWorkChanged { reason, template_epoch, tip_height: _, .. } => {
+                    NodeEvent::MiningWorkChanged {
+                        reason,
+                        template_epoch,
+                        tip_height: _,
+                        ..
+                    } => {
                         format!("miningwrkchg[{}@{}]", reason.as_str(), template_epoch)
                     }
                     NodeEvent::BlockConnected { height, .. } => format!("blkconnected@{}", height),
-                    NodeEvent::BlockDisconnected { height, .. } => format!("blkdisconctd@{}", height),
+                    NodeEvent::BlockDisconnected { height, .. } => {
+                        format!("blkdisconctd@{}", height)
+                    }
                 };
                 if tx.send(ev).is_err() {
-                    warn!(event_type, "NNG event dropped; stratum event consumer not running");
+                    warn!(
+                        event_type,
+                        "NNG event dropped; stratum event consumer not running"
+                    );
                 }
             })
             .await
@@ -816,8 +832,8 @@ async fn handle_conn(
     // Initialize VarDiff with the low starting difficulty and network diff as ceiling
     let mut vardiff = VarDiff::new(
         initial_diff,
-        cfg.vardiff.vardiff_min_floor,    // Absolute floor
-        network_diff,                      // Dynamic ceiling = network diff
+        cfg.vardiff.vardiff_min_floor, // Absolute floor
+        network_diff,                  // Dynamic ceiling = network diff
         cfg.vardiff.vardiff_target_secs,
         cfg.vardiff.vardiff_retarget_secs,
     );
@@ -886,17 +902,17 @@ async fn handle_conn(
             // Priority 2: Difficulty update from network
             diff_result = diff_rx.recv() => {
                 let new_network_diff = diff_result?;
-                
+
                 // Update this miner's VarDiff max to new network diff
                 vardiff.update_max(new_network_diff);
-                
+
                 info!(
                     session_id = %session_id,
                     old_diff = vardiff.current,
                     new_network_diff = new_network_diff,
                     "network difficulty updated"
                 );
-                
+
                 // Send difficulty update to miner
                 if let Err(e) = send_set_difficulty(&mut write_half, new_network_diff).await {
                     warn!(session_id = %session_id, error = %e, "failed to send difficulty update");
@@ -1495,6 +1511,30 @@ async fn handle_conn(
                     inflight_ids.remove(&id_key);
                 }
             }
+        }
+    }
+
+    // Check invalid share ratio and ban if threshold exceeded
+    let total_validated = share_stats.accepted + share_stats.rejected;
+    if cfg.pool.pplns.banning.enabled
+        && total_validated >= cfg.pool.pplns.banning.check_threshold as u64
+    {
+        let rejection_rate = (share_stats.rejected as f64 / total_validated as f64) * 100.0;
+        if rejection_rate > cfg.pool.pplns.banning.invalid_percent {
+            warn!(
+                session_id = %session_id,
+                accepted = share_stats.accepted,
+                rejected = share_stats.rejected,
+                total_validated,
+                rejection_rate = format!("{:.1}%", rejection_rate),
+                threshold = cfg.pool.pplns.banning.invalid_percent,
+                "miner banned: invalid share ratio exceeded threshold"
+            );
+            return Err(anyhow!(
+                "banned: invalid share ratio {:.1}% > {}%",
+                rejection_rate,
+                cfg.pool.pplns.banning.invalid_percent
+            ));
         }
     }
 

@@ -114,23 +114,23 @@ mod tests {
     fn vardiff_with_network_diff_ceiling() {
         let network_diff = 72.34;
         let mut vd = VarDiff::new(
-            network_diff,  // Start at network diff
-            0.001,         // Absolute floor
-            network_diff,  // Ceiling = network diff
+            network_diff, // Start at network diff
+            0.001,        // Absolute floor
+            network_diff, // Ceiling = network diff
             15.0,
             90.0,
         );
-        
+
         // Verify initial state
         assert!((vd.current - network_diff).abs() < 0.0001);
         assert!((vd.max - network_diff).abs() < 0.0001);
         assert!((vd.min - 0.001).abs() < 0.0001);
-        
+
         // Test update_max
         vd.update_max(100.0);
         assert!((vd.max - 100.0).abs() < 0.0001);
         assert!((vd.current - network_diff).abs() < 0.0001); // current unchanged
-        
+
         // Test update_max with lower value (should clamp current)
         vd.update_max(50.0);
         assert!((vd.max - 50.0).abs() < 0.0001);
@@ -145,9 +145,9 @@ mod tests {
         let initial_diff = network_diff * 0.01;
 
         let mut vd = VarDiff::new(
-            initial_diff,    // Start at 1% of network diff
-            0.001,           // Absolute floor
-            network_diff,    // Ceiling = network diff
+            initial_diff, // Start at 1% of network diff
+            0.001,        // Absolute floor
+            network_diff, // Ceiling = network diff
             15.0,
             90.0,
         );
@@ -162,8 +162,14 @@ mod tests {
             vd.record_share(t);
         }
         let d1 = vd.maybe_retarget(90).unwrap();
-        assert!(d1 > initial_diff, "difficulty should ramp up from low start");
-        assert!(d1 < network_diff, "difficulty should not exceed network diff");
+        assert!(
+            d1 > initial_diff,
+            "difficulty should ramp up from low start"
+        );
+        assert!(
+            d1 < network_diff,
+            "difficulty should not exceed network diff"
+        );
 
         // Continue fast shares — should keep ramping up toward network diff
         for round in 0..20 {

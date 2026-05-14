@@ -91,7 +91,11 @@ pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option
                 return Some(StratumResponse::rejected(req.id, 24, "unauthorized-worker"));
             }
             if arr.len() < 5 {
-                return Some(StratumResponse::rejected(req.id, 20, "invalid-submit-shape"));
+                return Some(StratumResponse::rejected(
+                    req.id,
+                    20,
+                    "invalid-submit-shape",
+                ));
             }
             if !session.active_jobs.contains(job_id) {
                 return Some(StratumResponse::rejected(req.id, 21, "stale-job"));

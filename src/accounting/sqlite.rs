@@ -220,12 +220,7 @@ impl AccountingDb {
         )?;
         Self::ensure_column(&tx, "found_blocks", "matured_at", "TEXT")?;
         Self::ensure_column(&tx, "found_blocks", "disconnected_at", "TEXT")?;
-        Self::ensure_column(
-            &tx,
-            "found_blocks",
-            "orphan_reason",
-            "TEXT",
-        )?;
+        Self::ensure_column(&tx, "found_blocks", "orphan_reason", "TEXT")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS submit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, block_hash TEXT NOT NULL, template_id INTEGER, worker_id INTEGER, worker_name TEXT, payout_address TEXT, node_result TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(block_hash, worker_id, node_result));")?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS payout_scheduler_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
         tx.execute_batch(
@@ -659,14 +654,14 @@ impl AccountingDb {
     }
 
     /// List weighted shares for PPLNS window, looking back from block find time.
-    /// 
+    ///
     /// Implements true PPLNS by querying across round boundaries. The window extends
     /// back in time until target_work_units is reached, regardless of round boundaries.
     /// This enforces early-leaver penalty and prevents late-joiner advantage.
-    /// 
+    ///
     /// Share difficulty is normalized to `min_difficulty` so work_units represent
     /// "equivalent minimum-difficulty shares" for auditability.
-    /// 
+    ///
     /// # Arguments
     /// * `found_block_id` - The found block to get the cutoff time from
     /// * `target_work_units` - Target normalized work units (N multiplier)
@@ -744,26 +739,38 @@ impl AccountingDb {
                  ORDER BY height DESC 
                  LIMIT 1",
                 [],
-                |r| Ok(FoundBlock {
-                    id: r.get(0)?,
-                    round_id: r.get(1)?,
-                    block_hash: r.get(2)?,
-                    height: r.get(3)?,
-                    status: r.get(4)?,
-                    template_id: r.get(5)?,
-                    worker_id: r.get(6)?,
-                    worker_name: r.get(7)?,
-                    payout_address: r.get(8)?,
-                    persist_source: r.get(9)?,
-                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    orphan_reason: r.get(11)?,
-                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    created_at: r.get(13)?,
-                }),
+                |r| {
+                    Ok(FoundBlock {
+                        id: r.get(0)?,
+                        round_id: r.get(1)?,
+                        block_hash: r.get(2)?,
+                        height: r.get(3)?,
+                        status: r.get(4)?,
+                        template_id: r.get(5)?,
+                        worker_id: r.get(6)?,
+                        worker_name: r.get(7)?,
+                        payout_address: r.get(8)?,
+                        persist_source: r.get(9)?,
+                        disconnected_at: r
+                            .get::<_, Option<String>>(10)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        orphan_reason: r.get(11)?,
+                        matured_at: r
+                            .get::<_, Option<String>>(12)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        created_at: r.get(13)?,
+                    })
+                },
             )
             .optional()?;
         Ok(row)
@@ -781,26 +788,38 @@ impl AccountingDb {
                  FROM found_blocks 
                  WHERE height = ?1",
                 params![height],
-                |r| Ok(FoundBlock {
-                    id: r.get(0)?,
-                    round_id: r.get(1)?,
-                    block_hash: r.get(2)?,
-                    height: r.get(3)?,
-                    status: r.get(4)?,
-                    template_id: r.get(5)?,
-                    worker_id: r.get(6)?,
-                    worker_name: r.get(7)?,
-                    payout_address: r.get(8)?,
-                    persist_source: r.get(9)?,
-                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    orphan_reason: r.get(11)?,
-                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    created_at: r.get(13)?,
-                }),
+                |r| {
+                    Ok(FoundBlock {
+                        id: r.get(0)?,
+                        round_id: r.get(1)?,
+                        block_hash: r.get(2)?,
+                        height: r.get(3)?,
+                        status: r.get(4)?,
+                        template_id: r.get(5)?,
+                        worker_id: r.get(6)?,
+                        worker_name: r.get(7)?,
+                        payout_address: r.get(8)?,
+                        persist_source: r.get(9)?,
+                        disconnected_at: r
+                            .get::<_, Option<String>>(10)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        orphan_reason: r.get(11)?,
+                        matured_at: r
+                            .get::<_, Option<String>>(12)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        created_at: r.get(13)?,
+                    })
+                },
             )
             .optional()?;
         Ok(row)
@@ -822,36 +841,45 @@ impl AccountingDb {
                  FROM found_blocks 
                  WHERE height = ?1 AND block_hash = ?2",
                 params![height, hash],
-                |r| Ok(FoundBlock {
-                    id: r.get(0)?,
-                    round_id: r.get(1)?,
-                    block_hash: r.get(2)?,
-                    height: r.get(3)?,
-                    status: r.get(4)?,
-                    template_id: r.get(5)?,
-                    worker_id: r.get(6)?,
-                    worker_name: r.get(7)?,
-                    payout_address: r.get(8)?,
-                    persist_source: r.get(9)?,
-                    disconnected_at: r.get::<_, Option<String>>(10)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    orphan_reason: r.get(11)?,
-                    matured_at: r.get::<_, Option<String>>(12)?.map(|s| 
-                        DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()
-                    ).flatten(),
-                    created_at: r.get(13)?,
-                }),
+                |r| {
+                    Ok(FoundBlock {
+                        id: r.get(0)?,
+                        round_id: r.get(1)?,
+                        block_hash: r.get(2)?,
+                        height: r.get(3)?,
+                        status: r.get(4)?,
+                        template_id: r.get(5)?,
+                        worker_id: r.get(6)?,
+                        worker_name: r.get(7)?,
+                        payout_address: r.get(8)?,
+                        persist_source: r.get(9)?,
+                        disconnected_at: r
+                            .get::<_, Option<String>>(10)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        orphan_reason: r.get(11)?,
+                        matured_at: r
+                            .get::<_, Option<String>>(12)?
+                            .map(|s| {
+                                DateTime::parse_from_rfc3339(&s)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .ok()
+                            })
+                            .flatten(),
+                        created_at: r.get(13)?,
+                    })
+                },
             )
             .optional()?;
         Ok(row)
     }
 
     /// Mark found_block as confirmed (status only; confirmations computed on-demand)
-    pub fn mark_found_block_confirmed(
-        &self,
-        block_hash: &str,
-    ) -> Result<()> {
+    pub fn mark_found_block_confirmed(&self, block_hash: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         conn.execute(
             "UPDATE found_blocks 
@@ -863,11 +891,7 @@ impl AccountingDb {
     }
 
     /// Mark found_block as orphaned with reason
-    pub fn mark_found_block_orphaned(
-        &self,
-        block_hash: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub fn mark_found_block_orphaned(&self, block_hash: &str, reason: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         conn.execute(
@@ -884,7 +908,10 @@ impl AccountingDb {
     /// Mark matured blocks based on tip height and coinbase maturity.
     /// Formula: confirmations = tip_height - height + 1
     /// DEPRECATED: Confirmations are now computed on-demand. Use mark_blocks_matured instead.
-    #[deprecated(since = "0.3.0", note = "Use mark_blocks_matured which uses computed confirmations")]
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use mark_blocks_matured which uses computed confirmations"
+    )]
     pub fn sync_found_block_confirmations(
         &self,
         _tip_height: i64,
@@ -896,11 +923,7 @@ impl AccountingDb {
 
     /// Mark blocks as matured based on tip height.
     /// Uses computed confirmations: tip_height - height + 1
-    pub fn mark_blocks_matured(
-        &self,
-        tip_height: i64,
-        coinbase_maturity: i64,
-    ) -> Result<()> {
+    pub fn mark_blocks_matured(&self, tip_height: i64, coinbase_maturity: i64) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         // Blocks where (tip_height - height + 1) >= coinbase_maturity
@@ -916,8 +939,6 @@ impl AccountingDb {
         )?;
         Ok(())
     }
-
-
 
     pub fn mark_found_block_payout_submitted(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
@@ -992,7 +1013,7 @@ impl AccountingDb {
     }
 
     /// Get accumulated dust amount for a payout address.
-    /// 
+    ///
     /// Returns the total un-paid dust amount for the given address from the dust ledger.
     /// This is used for dust carry-forward in PPLNS payouts.
     pub fn get_accumulated_dust(&self, address: &str) -> Result<i64> {
@@ -1006,10 +1027,10 @@ impl AccountingDb {
     }
 
     /// Reduce dust ledger entries for an address after paying out accumulated dust.
-    /// 
+    ///
     /// This is called after a payout that includes previously accumulated dust.
     /// Uses FIFO ordering (oldest entries first) to reduce dust ledger entries.
-    /// 
+    ///
     /// # Arguments
     /// * `address` - The payout address to reduce dust for
     /// * `amount_sat` - The amount of dust that was paid out
@@ -1019,7 +1040,7 @@ impl AccountingDb {
         }
         let mut conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         let tx = conn.transaction()?;
-        
+
         // Get dust entries in FIFO order (oldest first)
         // Use a block scope to ensure stmt is dropped before tx.commit()
         let dust_entries: Vec<(i64, i64)> = {
@@ -1034,13 +1055,13 @@ impl AccountingDb {
             // Collect rows into a Vec to release the borrow on tx
             rows.filter_map(|r| r.ok()).collect()
         };
-        
+
         let mut remaining_to_reduce = amount_sat;
         for (entry_id, entry_amount) in dust_entries {
             if remaining_to_reduce <= 0 {
                 break;
             }
-            
+
             if entry_amount <= remaining_to_reduce {
                 // Consume entire entry
                 tx.execute(
@@ -1058,7 +1079,7 @@ impl AccountingDb {
                 remaining_to_reduce = 0;
             }
         }
-        
+
         tx.commit()?;
         Ok(())
     }
@@ -1465,12 +1486,16 @@ impl AccountingDb {
     ///
     /// Returns `Ok(true)` if lease was acquired successfully.
     /// Returns `Ok(false)` if another instance currently holds the lease.
-    pub fn acquire_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
+    pub fn acquire_scheduler_lease(
+        &self,
+        instance_id: &str,
+        duration_minutes: i64,
+    ) -> Result<bool> {
         let now = Utc::now();
         let expires = now + Duration::minutes(duration_minutes);
-        
+
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        
+
         let rows = conn.execute(
             "INSERT INTO payout_scheduler_lease(id, owner, expires_at) 
              VALUES(1, ?1, ?2)
@@ -1480,7 +1505,7 @@ impl AccountingDb {
              WHERE expires_at < ?3",
             params![instance_id, expires.to_rfc3339(), now.to_rfc3339()],
         )?;
-        
+
         Ok(rows > 0)
     }
 
@@ -1491,16 +1516,16 @@ impl AccountingDb {
     pub fn renew_scheduler_lease(&self, instance_id: &str, duration_minutes: i64) -> Result<bool> {
         let now = Utc::now();
         let expires = now + Duration::minutes(duration_minutes);
-        
+
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        
+
         let rows = conn.execute(
             "UPDATE payout_scheduler_lease 
              SET expires_at = ?1 
              WHERE id = 1 AND owner = ?2",
             params![expires.to_rfc3339(), instance_id],
         )?;
-        
+
         Ok(rows > 0)
     }
 
@@ -1510,12 +1535,12 @@ impl AccountingDb {
     /// Returns `Ok(false)` if this instance didn't hold the lease.
     pub fn release_scheduler_lease(&self, instance_id: &str) -> Result<bool> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        
+
         let rows = conn.execute(
             "DELETE FROM payout_scheduler_lease WHERE id = 1 AND owner = ?1",
             params![instance_id],
         )?;
-        
+
         Ok(rows > 0)
     }
 
@@ -1526,14 +1551,16 @@ impl AccountingDb {
     pub fn check_lease_status(&self) -> Result<Option<String>> {
         let now = Utc::now();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        
-        let owner: Option<String> = conn.query_row(
-            "SELECT owner FROM payout_scheduler_lease 
+
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT owner FROM payout_scheduler_lease 
              WHERE id = 1 AND expires_at > ?1",
-            params![now.to_rfc3339()],
-            |r| r.get(0),
-        ).optional()?;
-        
+                params![now.to_rfc3339()],
+                |r| r.get(0),
+            )
+            .optional()?;
+
         Ok(owner)
     }
 
@@ -1553,22 +1580,24 @@ impl AccountingDb {
     pub fn get_lease_info(&self) -> Result<Option<LeaseInfo>> {
         let now = Utc::now();
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        
-        let row: Option<(String, String)> = conn.query_row(
-            "SELECT owner, expires_at FROM payout_scheduler_lease WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional()?;
-        
+
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT owner, expires_at FROM payout_scheduler_lease WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
         match row {
             Some((owner, expires_str)) => {
                 let expires_at_dt = DateTime::parse_from_rfc3339(&expires_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
-                
+
                 let is_expired = expires_at_dt < now;
                 let is_valid = !is_expired;
-                
+
                 Ok(Some(LeaseInfo {
                     owner,
                     expires_at: expires_str,
@@ -1687,7 +1716,7 @@ mod tests {
         )
         .unwrap();
         db.mark_found_block_orphaned("bh2", "test_orphan").unwrap();
-        
+
         db.record_found_block(
             "bh3",
             11,
@@ -1700,7 +1729,7 @@ mod tests {
         .unwrap();
         // Mark as matured (tip=220, height=120 => confirmations=101 >= 100)
         db.mark_blocks_matured(220, 100).unwrap();
-        
+
         let conn = db.conn.lock().unwrap();
         let status: String = conn
             .query_row(
@@ -1710,11 +1739,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "matured");
-        
+
         // Verify orphaned block returns -1 confirmations
         let orphaned = db.find_found_block_by_height(10).unwrap().unwrap();
         assert_eq!(orphaned.confirmations(220), -1);
-        
+
         // Verify matured block has correct confirmations
         let matured = db.find_found_block_by_height(11).unwrap().unwrap();
         assert_eq!(matured.confirmations(220), 101);

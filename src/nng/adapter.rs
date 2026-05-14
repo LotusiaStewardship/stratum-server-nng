@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bitcoinsuite_bitcoind_nng::{
-    OptionExt, Block, BlockIdentifier, MiningTemplate, PubInterface, RpcInterface,
+    Block, BlockIdentifier, MiningTemplate, OptionExt, PubInterface, RpcInterface,
 };
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusBlock, Sha256d};
 use flatbuffers::VerifierOptions;
@@ -158,7 +158,7 @@ impl MiningWorkChangeReason {
 }
 
 /// Normalized node event for stratum server template refresh.
-/// 
+///
 /// Lotus-specific note: ALL events require clean_jobs=true because the Lotus header
 /// includes both merkle_root AND block size. When mempool changes, BOTH fields change,
 /// making all in-flight work immediately stale. This differs from Bitcoin where mempool
@@ -166,7 +166,7 @@ impl MiningWorkChangeReason {
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
     /// Mining work invalidated - refresh template immediately.
-    /// 
+    ///
     /// This is the PRIMARY event for template refresh, emitted by lotusd's
     /// miningwrkchg pub/sub topic. It consolidates mempool and block events
     /// into a single low-latency signal designed specifically for stratum servers.
@@ -184,7 +184,7 @@ pub enum NodeEvent {
         template_epoch: u64,
     },
     /// Block connected - kept for accounting (marking blocks matured)
-    /// 
+    ///
     /// NOTE: This is NOT used for template refresh anymore. miningwrkchg handles that.
     /// This event is kept for backward compatibility and accounting operations.
     BlockConnected {
@@ -193,7 +193,7 @@ pub enum NodeEvent {
         prev_hash: String,
     },
     /// Block disconnected - kept for accounting (orphaning found blocks)
-    /// 
+    ///
     /// NOTE: This is NOT used for template refresh anymore. miningwrkchg handles that.
     /// This event is kept for backward compatibility and accounting operations.
     BlockDisconnected {
@@ -224,16 +224,16 @@ impl NngAdapter {
     }
 
     /// Subscribe to NNG pub/sub topics and emit normalized events.
-    /// 
+    ///
     /// PRIMARY SUBSCRIPTION: miningwrkchg
     /// This is the purpose-built, low-latency signal for stratum servers.
     /// Emitted by lotusd on: new block, reorg, mempool change, manual invalidation.
     /// Includes template_epoch for deduplication and missed-event detection.
-    /// 
+    ///
     /// SECONDARY SUBSCRIPTIONS: blkconnected, blkdisconctd
     /// Kept for accounting operations only (marking blocks matured, orphaning found blocks).
     /// NOT used for template refresh - miningwrkchg handles that more efficiently.
-    /// 
+    ///
     /// COMMENTED OUT: mempooltxadd, mempooltxrem
     /// These are too granular for stratum template refresh. Each individual mempool
     /// event would trigger a template refresh, causing excessive updates. lotusd
@@ -512,7 +512,12 @@ impl NodeMiningAdapter for BitcoindMiningAdapter {
     async fn get_block_by_height(&self, height: i64) -> Result<Block> {
         // Validate height fits in i32 range to prevent silent truncation
         if height < i32::MIN as i64 || height > i32::MAX as i64 {
-            anyhow::bail!("block height {} out of valid range [{}, {}]", height, i32::MIN, i32::MAX);
+            anyhow::bail!(
+                "block height {} out of valid range [{}, {}]",
+                height,
+                i32::MIN,
+                i32::MAX
+            );
         }
         self.nng
             .rpc

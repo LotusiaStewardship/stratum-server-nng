@@ -116,7 +116,7 @@ mod tests {
     fn test_tracker_network_diff_only() {
         let config = DynamicDiffConfig::default();
         let tracker = NetworkDifficultyTracker::new(config);
-        
+
         // Initial placeholder
         assert!((tracker.network_diff() - 1.0).abs() < 0.0001);
     }
