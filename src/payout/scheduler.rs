@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 use bitcoinsuite_bitcoind::rpc_client::{BitcoindRpcClient, BitcoindRpcClientConf};
+use bitcoinsuite_bitcoind_stratum::target_to_difficulty;
 use bitcoinsuite_core::{
     ecc::{Ecc, SecKey},
     BitcoinCode, Bytes, Hashed, LotusAddress, OutPoint, P2PKHSignatory, Script, SequenceNo,
@@ -107,8 +108,17 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
 
         // Get current blockchain tip height from mining template
         // Used to determine which found blocks have matured (coinbase + min_confirmations)
-        let tip_height = match adapter.get_mining_template(None, None).await {
-            Ok(t) => t.height as i64,
+        let (tip_height, network_diff) = match adapter.get_mining_template(None, None).await {
+            Ok(t) => {
+                let target_bytes: [u8; 32] = t
+                    .target
+                    .to_vec_be()
+                    .try_into()
+                    .expect("template target must be 32 bytes");
+                let diff = target_to_difficulty(&target_bytes)
+                    .expect("failed to convert template target to difficulty");
+                (t.height as i64, diff)
+            }
             Err(err) => {
                 error!(error = %err, "failed loading tip height for payout maturity sync");
                 continue;
@@ -150,9 +160,10 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 info!(block_hash, processed_count, "catching up: processing additional matured found block");
             }
 
-            // Calculate target work units for PPLNS window (N multiplier)
-            // This determines how many shares back the payout window extends
-            let target_work_units = cfg.pool.pplns.n_multiplier.max(1.0);
+            // Calculate target work units for PPLNS window
+            // n_multiplier is in "blocks of work" units; scale by network difficulty
+            // so N = n_multiplier × network_diff gives difficulty-weighted shares
+            let target_work_units = cfg.pool.pplns.n_multiplier * network_diff.max(1.0);
             // Retrieve all weighted shares in the PPLNS window for this found block
             // Third parameter (200_000) is the maximum number of shares to retrieve
             let window_shares =

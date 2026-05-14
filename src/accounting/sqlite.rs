@@ -688,7 +688,6 @@ impl AccountingDb {
             "SELECT s.id, w.payout_address, s.difficulty, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
-             JOIN share_outcomes so ON so.share_id = s.id
              WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
              ORDER BY s.created_at DESC
              LIMIT ?2",
