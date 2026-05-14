@@ -664,15 +664,20 @@ impl AccountingDb {
     /// back in time until target_work_units is reached, regardless of round boundaries.
     /// This enforces early-leaver penalty and prevents late-joiner advantage.
     /// 
+    /// Share difficulty is normalized to `min_difficulty` so work_units represent
+    /// "equivalent minimum-difficulty shares" for auditability.
+    /// 
     /// # Arguments
     /// * `found_block_id` - The found block to get the cutoff time from
-    /// * `target_work_units` - Target difficulty-weighted work units (N multiplier)
+    /// * `target_work_units` - Target normalized work units (N multiplier)
     /// * `hard_limit` - Maximum number of shares to retrieve (safety limit)
+    /// * `min_difficulty` - Minimum vardiff floor used to normalize share difficulty
     pub fn list_weighted_shares_for_pplns_window(
         &self,
         found_block_id: i64,
         target_work_units: f64,
         hard_limit: u32,
+        min_difficulty: f64,
     ) -> Result<Vec<PplnsWindowShare>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
         // Get the block find time as the cutoff point for the PPLNS window
@@ -683,16 +688,17 @@ impl AccountingDb {
         )?;
 
         // Query shares ordered by creation time (most recent first), without round_id filter.
+        // Difficulty is normalized to min_difficulty so work_units = equivalent min-diff shares.
         // This allows the PPLNS window to span multiple rounds, implementing true PPLNS.
         let mut stmt = conn.prepare(
-            "SELECT s.id, w.payout_address, s.difficulty, s.created_at
+            "SELECT s.id, w.payout_address, s.difficulty / ?3, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
              WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
              ORDER BY s.created_at DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![cutoff, hard_limit as i64], |r| {
+        let rows = stmt.query_map(params![cutoff, hard_limit as i64, min_difficulty], |r| {
             Ok(PplnsWindowShare {
                 share_id: r.get::<_, i64>(0)?,
                 payout_address: r.get::<_, String>(1)?,

@@ -162,12 +162,18 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
 
             // Calculate target work units for PPLNS window
             // n_multiplier is in "blocks of work" units; scale by network difficulty
-            // so N = n_multiplier × network_diff gives difficulty-weighted shares
-            let target_work_units = cfg.pool.pplns.n_multiplier * network_diff.max(1.0);
+            // and normalize to min difficulty so work_units = equivalent min-diff shares
+            let target_work_units =
+                cfg.pool.pplns.n_multiplier * (network_diff / cfg.vardiff.vardiff_min_floor).max(1.0);
             // Retrieve all weighted shares in the PPLNS window for this found block
             // Third parameter (200_000) is the maximum number of shares to retrieve
             let window_shares =
-                db.list_weighted_shares_for_pplns_window(found_block_id, target_work_units, 200_000)?;
+                db.list_weighted_shares_for_pplns_window(
+                    found_block_id,
+                    target_work_units,
+                    200_000,
+                    cfg.vardiff.vardiff_min_floor,
+                )?;
             // Convert database shares to WeightedShare structs for payout calculation
             let shares = window_shares
                 .iter()
