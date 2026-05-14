@@ -1045,7 +1045,7 @@ async fn handle_conn(
                         if prevalidate_submit_shape(&submit, session.extranonce2_size).is_err() {
                             share_stats.errored += 1;
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, extranonce2 = %submit.extranonce2, ntime = %submit.ntime_hex_6b, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: invalid-submit-shape");
-                            let err = StratumResponse::err(req_id.clone(), 20, "invalid-submit-shape");
+                            let err = StratumResponse::rejected(req_id.clone(), 20, "invalid-submit-shape");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         }
@@ -1086,14 +1086,14 @@ async fn handle_conn(
                                 share_id: None,
                             });
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: stale-job (no assigned context)");
-                            let err = StratumResponse::err(req_id.clone(), 21, "stale-job");
+                            let err = StratumResponse::rejected(req_id.clone(), 21, "stale-job");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         };
                         if submit.ntime_hex_6b != assigned.ntime_hex_6b {
                             share_stats.rejected += 1;
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: ntime-mismatch");
-                            let err = StratumResponse::err(req_id.clone(), 20, "ntime-mismatch");
+                            let err = StratumResponse::rejected(req_id.clone(), 20, "ntime-mismatch");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         }
@@ -1106,7 +1106,7 @@ async fn handle_conn(
                         ) {
                             share_stats.rejected += 1;
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, difficulty = share_difficulty, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: low-difficulty-share");
-                            let err = StratumResponse::err(req_id.clone(), 23, "low-difficulty-share");
+                            let err = StratumResponse::rejected(req_id.clone(), 23, "low-difficulty-share");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         }
@@ -1294,7 +1294,7 @@ async fn handle_conn(
                         if !merkle_matches_block {
                             share_stats.rejected += 1;
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: bad-txnmrklroot");
-                            let err = StratumResponse::err(req_id.clone(), 20, "bad-txnmrklroot");
+                            let err = StratumResponse::rejected(req_id.clone(), 20, "bad-txnmrklroot");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         }
@@ -1381,7 +1381,7 @@ async fn handle_conn(
                                 errored = share_stats.errored,
                                 "share rejected by lotusd submit path"
                             );
-                            let err = StratumResponse::err(req_id.clone(), 20, "block-submit-rejected");
+                            let err = StratumResponse::rejected(req_id.clone(), 20, "block-submit-rejected");
                             send_json_line(&mut write_half, &err).await?;
                             continue;
                         }

@@ -88,13 +88,13 @@ pub fn handle_request(session: &mut SessionState, req: StratumRequest) -> Option
             let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
             let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
             if !session.authorized_workers.contains(worker) {
-                return Some(StratumResponse::err(req.id, 24, "unauthorized-worker"));
+                return Some(StratumResponse::rejected(req.id, 24, "unauthorized-worker"));
             }
             if arr.len() < 5 {
-                return Some(StratumResponse::err(req.id, 20, "invalid-submit-shape"));
+                return Some(StratumResponse::rejected(req.id, 20, "invalid-submit-shape"));
             }
             if !session.active_jobs.contains(job_id) {
-                return Some(StratumResponse::err(req.id, 21, "stale-job"));
+                return Some(StratumResponse::rejected(req.id, 21, "stale-job"));
             }
             Some(StratumResponse::ok(req.id, Value::Bool(true)))
         }

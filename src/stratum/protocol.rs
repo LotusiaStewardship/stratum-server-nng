@@ -63,6 +63,16 @@ impl StratumResponse {
             error: serde_json::json!([code, message, Value::Null]),
         }
     }
+
+    /// Share rejected: result=false with error reason.
+    /// Used for stale-job, unauthorized-worker, etc.
+    pub fn rejected(id: Value, code: i64, message: &str) -> Self {
+        Self {
+            id,
+            result: Value::Bool(false),
+            error: serde_json::json!([code, message, Value::Null]),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
