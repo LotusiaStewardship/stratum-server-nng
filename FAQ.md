@@ -36,6 +36,7 @@ Welcome! This FAQ answers common questions about mining with the Lotus pool, the
   - [What does "matured" mean?](#what-does-matured-mean)
   - [How are payouts distributed?](#how-are-payouts-distributed)
 - [Mining Setup](#mining-setup)
+  - [What mining software should I use?](#what-mining-software-should-i-use)
   - [How do I configure my miner?](#how-do-i-configure-my-miner)
   - [What worker name format should I use?](#what-worker-name-format-should-i-use)
   - [What port should I connect to?](#what-port-should-i-connect-to)
@@ -69,6 +70,8 @@ Lotus is a blockchain based on the Bitcoin codebase with modifications. It uses 
 ### Do I need to run a Lotus node to mine?
 
 **No.** You only need mining hardware (ASIC or CPU/GPU miner) and mining software that supports Stratum V1. The pool operator runs the Lotus node (`lotusd`) and this pool server. You simply point your miner to the pool's Stratum endpoint.
+
+For GPU mining, the recommended software is **lotus-gpu-miner** (see [What mining software should I use?](#what-mining-software-should-i-use)).
 
 ---
 
@@ -207,7 +210,7 @@ For example, if the window contains 10,000 work units total and you contributed 
 - **N > 1.0** → Larger window, more smoothing, slower responsiveness.
 - **N < 1.0** → Smaller window, less smoothing, faster responsiveness.
 
-This pool defaults to **N = 1.0**, meaning the window spans approximately one block's worth of work. This is a balance between variance smoothing and timely payouts.
+This pool defaults to **N = 2.0** (industry standard), meaning the window spans approximately two blocks' worth of work. This provides better variance smoothing while remaining responsive to miner contributions.
 
 ### How does PPLNS compare to PPS?
 
@@ -298,19 +301,52 @@ Each miner's payout amount is calculated proportionally from their PPLNS weighte
 
 ## Mining Setup
 
+### What mining software should I use?
+
+The canonical mining software for the Lotus pool is **lotus-gpu-miner**, a GPU-optimized miner specifically designed for Lotus's proof-of-work algorithm.
+
+- **Repository:** [`lotus-gpu-miner`](https://github.com/LotusiaStewardship/lotus-gpu-miner)
+- **Features:**
+  - GPU-accelerated mining (OpenCL for AMD/NVIDIA, Metal for Apple Silicon)
+  - Native Stratum V1 support
+  - Automatic difficulty adjustment
+  - Cross-platform (Windows, macOS, Linux)
+  - CLI and GUI interfaces
+
 ### How do I configure my miner?
 
-Point your Stratum V1-compatible miner to the pool's endpoint:
+#### For lotus-gpu-miner
+
+**Configuration file** (`~/.lotus-miner/config.toml`):
+
+```toml
+mine_to_address = "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+stratum_url = "pool.lotusia.org:3334"
+stratum_worker_name = "rig01"
+stratum_password = "x"
+```
+
+**Command-line**:
+
+```bash
+./lotus-miner-cli --stratum-url pool.lotusia.org:3334 --mine-to-address lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi --stratum-worker-name rig01 --stratum-password x
+```
+
+Note: The miner combines `mine_to_address` and `stratum_worker_name` automatically as `<address>.<worker_name>`.
+
+#### For other Stratum V1 miners
+
+Point your miner to the pool's endpoint:
 
 ```
-stratum+tcp://<pool-ip>:<port>
+URL:      <pool-ip>:<port>  (or stratum+tcp://<pool-ip>:<port>)
 Username: <your-lotus-address>.<worker-name>
 Password: x  (or leave blank)
 ```
 
 For example:
 ```
-URL:       stratum+tcp://pool.example.com:3334
+URL:       pool.example.com:3334
 Username:  lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01
 Password:  x
 ```
