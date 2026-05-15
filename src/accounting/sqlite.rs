@@ -350,10 +350,10 @@ impl AccountingDb {
              CREATE INDEX IF NOT EXISTS idx_found_blocks_height_hash 
                 ON found_blocks(height, block_hash);",
         )?;
-        // Index for PPLNS window query (true PPLNS across round boundaries)
+        // Index for PPLNS window query (share-ID-anchored, true PPLNS across round boundaries)
         tx.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_shares_created_at 
-                ON shares(created_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_shares_accepted_stale_id 
+                ON shares(accepted, stale, id DESC);",
         )?;
 
         tx.commit()?;
@@ -675,25 +675,44 @@ impl AccountingDb {
         min_difficulty: f64,
     ) -> Result<Vec<PplnsWindowShare>> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-        // Get the block find time as the cutoff point for the PPLNS window
-        let cutoff: String = conn.query_row(
-            "SELECT created_at FROM found_blocks WHERE id=?1",
+
+        // Step 1: Get the block hash for this found block
+        let block_hash: String = conn.query_row(
+            "SELECT block_hash FROM found_blocks WHERE id=?1",
             params![found_block_id],
             |r| r.get(0),
         )?;
 
-        // Query shares ordered by creation time (most recent first), without round_id filter.
-        // Difficulty is normalized to min_difficulty so work_units = equivalent min-diff shares.
-        // This allows the PPLNS window to span multiple rounds, implementing true PPLNS.
+        // Step 2: Find the share_id of the block-finding share from share_outcomes.
+        // This is the anchor point for the PPLNS window - we walk backward from this share.
+        // Per PPLNS spec (§6): "the ordered set of shares whose cumulative difficulty sum
+        // equals N, counting backward from the share that found the block."
+        let block_finding_share_id: i64 = conn.query_row(
+            "SELECT share_id FROM share_outcomes 
+             WHERE block_hash = ?1 AND share_id IS NOT NULL 
+             LIMIT 1",
+            params![&block_hash],
+            |r| r.get(0),
+        ).map_err(|e| anyhow!(
+            "block-finding share not found for block '{}': {}; 
+             this indicates a data integrity issue - share_outcomes must record the share_id 
+             for any share that found a block",
+            block_hash, e
+        ))?;
+
+        // Step 3: Query shares by ID cutoff (share-ID-anchored PPLNS window).
+        // Using share.id (auto-increment primary key) guarantees insertion-order semantics.
+        // This is the correct PPLNS implementation - no timestamps involved.
         let mut stmt = conn.prepare(
             "SELECT s.id, w.payout_address, s.difficulty / ?3, s.created_at
              FROM shares s
              JOIN workers w ON w.id = s.worker_id
-             WHERE s.accepted=1 AND s.stale=0 AND s.created_at <= ?1
-             ORDER BY s.created_at DESC
+             WHERE s.accepted=1 AND s.stale=0 AND s.id <= ?1
+             ORDER BY s.id DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![cutoff, hard_limit as i64, min_difficulty], |r| {
+
+        let rows = stmt.query_map(params![block_finding_share_id, hard_limit as i64, min_difficulty], |r| {
             Ok(PplnsWindowShare {
                 share_id: r.get::<_, i64>(0)?,
                 payout_address: r.get::<_, String>(1)?,
@@ -701,12 +720,22 @@ impl AccountingDb {
                 created_at: r.get::<_, String>(3)?,
             })
         })?;
+
+        // Step 4: Accumulate shares until target work units reached, with partial credit at boundary.
+        // Partial credit prevents over-paying when the last share would push cumulative work past target.
         let mut out = Vec::new();
         let mut cumulative_work = 0.0;
         for row in rows {
             let row = row?;
-            cumulative_work += row.work_units;
-            out.push(row);
+            let remaining = target_work_units - cumulative_work;
+            let contribution = row.work_units.min(remaining);
+            cumulative_work += contribution;
+            out.push(PplnsWindowShare {
+                share_id: row.share_id,
+                payout_address: row.payout_address,
+                work_units: contribution,
+                created_at: row.created_at,
+            });
             if cumulative_work >= target_work_units {
                 break;
             }
@@ -1747,5 +1776,262 @@ mod tests {
         // Verify matured block has correct confirmations
         let matured = db.find_found_block_by_height(11).unwrap().unwrap();
         assert_eq!(matured.confirmations(220), 101);
+    }
+
+    #[test]
+    fn test_pplns_window_anchored_at_block_finding_share() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert a test worker
+        let worker = db.upsert_worker("test_addr_1", None).unwrap();
+
+        // Insert 10 shares and track their IDs
+        let template_id = 1u64;
+        let mut share_ids = Vec::new();
+        for i in 1..=10 {
+            let dedupe_key = format!("share_{}", i);
+            let id = db.insert_share_idempotent(worker.id, template_id, 1.0, true, false, &dedupe_key)
+                .unwrap();
+            share_ids.push(id.unwrap());
+        }
+
+        // Record a found block anchored at the 7th share (index 6)
+        let block_finding_share_id = share_ids[6];
+        let now = Utc::now().to_rfc3339();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO share_outcomes(
+                session_id, worker_id, worker_name, payout_address,
+                template_id, template_epoch, job_id, round_id, dedupe_key,
+                status, block_hash, share_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "test_session", worker.id, "test_worker", "test_addr_1",
+                template_id as i64, 0, "test_job", 1, "share_7",
+                "accepted", "block_hash_abc", block_finding_share_id, now
+            ],
+        ).unwrap();
+
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO found_blocks(
+                round_id, block_hash, height, status, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![1, "block_hash_abc", 100, "confirmed", now],
+        ).unwrap();
+
+        // Get the found_block_id
+        let found_block_id: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT id FROM found_blocks WHERE block_hash = 'block_hash_abc'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+
+        // Query PPLNS window with target of 5 work units
+        let window = db.list_weighted_shares_for_pplns_window(
+            found_block_id,
+            5.0,
+            100,
+            1.0,
+        ).unwrap();
+
+        // Verify: should have exactly 5 shares
+        assert_eq!(window.len(), 5, "window should contain exactly 5 shares");
+
+        // Verify: shares should be in descending ID order ending at block-finding share
+        let window_share_ids: Vec<i64> = window.iter().map(|s| s.share_id).collect();
+        assert_eq!(window_share_ids.first(), Some(&block_finding_share_id), 
+            "window should start at block-finding share");
+
+        // Verify: block-finding share IS included in the window
+        assert!(window_share_ids.contains(&block_finding_share_id), 
+            "block-finding share must be included in window");
+    }
+
+    #[test]
+    fn test_pplns_window_partial_credit_at_boundary() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert a test worker
+        let worker = db.upsert_worker("test_addr_1", None).unwrap();
+
+        // Insert 5 shares with difficulty 2.0 each and track their IDs
+        let template_id = 1u64;
+        let mut share_ids = Vec::new();
+        for i in 1..=5 {
+            let dedupe_key = format!("share_pc_{}", i);
+            let id = db.insert_share_idempotent(worker.id, template_id, 2.0, true, false, &dedupe_key)
+                .unwrap();
+            share_ids.push(id.unwrap());
+        }
+
+        // Record found block anchored at the last share (index 4)
+        let block_finding_share_id = share_ids[4];
+        let now = Utc::now().to_rfc3339();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO share_outcomes(
+                session_id, worker_id, worker_name, payout_address,
+                template_id, template_epoch, job_id, round_id, dedupe_key,
+                status, block_hash, share_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "test_session", worker.id, "test_worker", "test_addr_1",
+                template_id as i64, 0, "test_job", 1, "share_pc_5",
+                "accepted", "block_hash_xyz", block_finding_share_id, now
+            ],
+        ).unwrap();
+
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO found_blocks(
+                round_id, block_hash, height, status, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![1, "block_hash_xyz", 100, "confirmed", now],
+        ).unwrap();
+
+        let found_block_id: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT id FROM found_blocks WHERE block_hash = 'block_hash_xyz'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+
+        // Query PPLNS window with target of 7 work units.
+        // Shares: 5(2.0) + 4(2.0) + 3(2.0) = 6.0, need 1.0 more from share 2
+        // Share 2 should get partial credit of 1.0 (not full 2.0)
+        let window = db.list_weighted_shares_for_pplns_window(
+            found_block_id,
+            7.0,
+            100,
+            1.0,
+        ).unwrap();
+
+        // Verify: should have 4 shares
+        assert_eq!(window.len(), 4, "window should contain 4 shares");
+
+        // Verify: total work units equals exactly target (7.0)
+        let total_work: f64 = window.iter().map(|s| s.work_units).sum();
+        assert_eq!(total_work, 7.0, "total work should equal target exactly (partial credit applied)");
+
+        // Verify: last share has partial credit of 1.0, not full 2.0
+        let last_share = window.last().unwrap();
+        assert_eq!(last_share.share_id, share_ids[1], "last share should be the 2nd share");
+        assert_eq!(last_share.work_units, 1.0, "last share should have partial credit of 1.0");
+    }
+
+    #[test]
+    fn test_pplns_window_error_on_missing_share_outcomes() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert a test worker
+        let worker = db.upsert_worker("test_addr_1", None).unwrap();
+
+        // Insert a share (but we won't link it to any block)
+        let template_id = 1u64;
+        db.insert_share_idempotent(worker.id, template_id, 1.0, true, false, "share_missing")
+            .unwrap();
+
+        // Record found block WITHOUT corresponding share_outcomes entry
+        let now = Utc::now().to_rfc3339();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO found_blocks(
+                round_id, block_hash, height, status, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![1, "block_hash_missing", 100, "confirmed", now],
+        ).unwrap();
+
+        let found_block_id: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT id FROM found_blocks WHERE block_hash = 'block_hash_missing'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+
+        // Query should fail with clear error message
+        let result = db.list_weighted_shares_for_pplns_window(
+            found_block_id,
+            5.0,
+            100,
+            1.0,
+        );
+
+        assert!(result.is_err(), "should error when share_outcomes entry is missing");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("block-finding share not found"), "error should mention missing share");
+        assert!(err.contains("share_outcomes"), "error should mention share_outcomes table");
+    }
+
+    #[test]
+    fn test_pplns_window_excludes_shares_after_block_finding_share() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert a test worker
+        let worker = db.upsert_worker("test_addr_1", None).unwrap();
+
+        // Insert 10 shares and track their IDs
+        let template_id = 1u64;
+        let mut share_ids = Vec::new();
+        for i in 1..=10 {
+            let dedupe_key = format!("share_excl_{}", i);
+            let id = db.insert_share_idempotent(worker.id, template_id, 1.0, true, false, &dedupe_key)
+                .unwrap();
+            share_ids.push(id.unwrap());
+        }
+
+        // Record found block anchored at share ID 5 (index 4, middle of share log)
+        let block_finding_share_id = share_ids[4];
+        let now = Utc::now().to_rfc3339();
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO share_outcomes(
+                session_id, worker_id, worker_name, payout_address,
+                template_id, template_epoch, job_id, round_id, dedupe_key,
+                status, block_hash, share_id, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "test_session", worker.id, "test_worker", "test_addr_1",
+                template_id as i64, 0, "test_job", 1, "share_excl_5",
+                "accepted", "block_hash_middle", block_finding_share_id, now
+            ],
+        ).unwrap();
+
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO found_blocks(
+                round_id, block_hash, height, status, created_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![1, "block_hash_middle", 100, "confirmed", now],
+        ).unwrap();
+
+        let found_block_id: i64 = db.conn.lock().unwrap().query_row(
+            "SELECT id FROM found_blocks WHERE block_hash = 'block_hash_middle'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+
+        // Query PPLNS window with large target (should get all shares up to block-finding share)
+        let window = db.list_weighted_shares_for_pplns_window(
+            found_block_id,
+            100.0,
+            100,
+            1.0,
+        ).unwrap();
+
+        // Verify: should have exactly 5 shares
+        assert_eq!(window.len(), 5, "window should contain exactly 5 shares");
+
+        // Verify: NO shares after the block-finding share are included
+        let window_share_ids: Vec<i64> = window.iter().map(|s| s.share_id).collect();
+        for id in &window_share_ids {
+            assert!(*id <= block_finding_share_id, 
+                "share ID {} should not be in window (after block-finding share)", id);
+        }
+
+        // Verify: shares 6-10 are NOT in the window
+        for excluded_share_id in share_ids.iter().skip(5) {
+            assert!(!window_share_ids.contains(excluded_share_id), 
+                "share {} should be excluded", excluded_share_id);
+        }
     }
 }

@@ -186,27 +186,15 @@ pub async fn run_payout_scheduler(cfg: Config, db: AccountingDb) -> Result<()> {
                 cfg.vardiff.vardiff_min_floor,
             )?;
 
-            // Build weighted shares with partial credit at window boundary.
-            // When the last share would push cumulative work past target_work_units,
-            // only credit the remaining amount needed to reach the target.
-            // This prevents over-paying (see implementation plan §6, Bug 6).
-            let shares: Vec<WeightedShare> = {
-                let mut cumulative = 0.0;
-                let mut out = Vec::with_capacity(window_shares.len());
-                for s in window_shares.iter() {
-                    if cumulative >= target_work_units {
-                        break;
-                    }
-                    let remaining = target_work_units - cumulative;
-                    let contribution = s.work_units.min(remaining);
-                    cumulative += contribution;
-                    out.push(WeightedShare {
-                        payout_address: s.payout_address.clone(),
-                        work_units: contribution,
-                    });
-                }
-                out
-            };
+            // Window shares already have partial credit applied at the boundary
+            // (handled by list_weighted_shares_for_pplns_window).
+            let shares: Vec<WeightedShare> = window_shares
+                .iter()
+                .map(|s| WeightedShare {
+                    payout_address: s.payout_address.clone(),
+                    work_units: s.work_units,
+                })
+                .collect();
 
             // Debug: Log PPLNS window details
             let total_work_units: f64 = shares.iter().map(|s| s.work_units).sum();
