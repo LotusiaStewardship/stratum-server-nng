@@ -561,7 +561,7 @@ fn parse_hex_seckey(private_key: &str) -> Result<SecKey> {
 /// - Outputs: one output per miner (fixed amounts), pool fee receives the leftover
 ///
 /// Uses P2PKH signing with the pool's private key. The sequence number is set
-/// to 0xffff_fffe to enable Replace-By-Fee (RBF) if needed.
+/// to SEQUENCE_FINAL (0xffffffff) to disable nLockTime.
 ///
 /// # Arguments
 /// * `outputs` - List of (address, amount) pairs to pay to miners (excludes pool fee)
@@ -625,7 +625,7 @@ fn build_and_sign_payout_tx(
                     out_idx: 1, // Lotus coinbase: vout[1] is pool payout
                 },
                 script: Script::default(), // Empty for coinbase; will be replaced by signature
-                sequence: SequenceNo::from_u32(0xffff_fffe), // RBF-enabled sequence
+                sequence: SequenceNo::from_u32(0xffffffff), // SEQUENCE_FINAL
                 sign_data: Some(SignData::new(vec![
                     SignField::OutputScript(payout_script),
                     SignField::Value(prev_value),
