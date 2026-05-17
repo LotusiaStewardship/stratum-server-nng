@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+
+{% block title %}{{ footer.pool_name }} - FAQ{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h1 class="text-2xl font-bold">Frequently Asked Questions</h1>
+    <p class="text-gray-400 mt-1">Everything you need to know about mining on {{ footer.pool_name }}.</p>
+</div>
+
+<div class="space-y-4">
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>How do I connect to the pool?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p class="mb-2">Use the following stratum URL:</p>
+            <pre class="bg-primary-950 p-3 rounded text-primary-300 font-mono text-sm">stratum+tcp://pool.lotusia.org:3334</pre>
+            <p class="mt-2">Credentials:</p>
+            <ul class="list-disc list-inside text-sm mt-1 space-y-1">
+                <li><strong>Username:</strong> Your Lotus (XPI) payout address</li>
+                <li><strong>Password:</strong> <code class="text-primary-300">x</code> (any password works)</li>
+            </ul>
+            <p class="mt-2 text-sm text-gray-400">Optionally append a worker name: <code class="text-primary-300">address.workername</code></p>
+        </div>
+    </div>
+
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>What is the pool fee?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>The pool fee is displayed in the footer. It is deducted from the gross block reward before miner payouts.</p>
+        </div>
+    </div>
+
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>How are payouts calculated? (PPLNS)</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>We use <strong>PPLNS</strong> (Pay Per Last N Shares). The payout window covers the last N difficulty units of work, where N = {{ n_multiplier }}× network difficulty.</p>
+            <ul class="list-disc list-inside text-sm mt-2 space-y-1">
+                <li>Shares are difficulty-weighted (a 2× diff share counts as 2 shares)</li>
+                <li>The window extends across round boundaries</li>
+                <li>Early leavers receive less; late joiners receive less (fair for everyone)</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>When are payouts sent?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>Payouts are processed automatically after a found block matures ({{ min_confirmations }} confirmations). The scheduler runs periodically to process matured blocks.</p>
+        </div>
+    </div>
+
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>What is the minimum payout?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>The minimum payout threshold is displayed on the dashboard. Outputs below this threshold are carried forward to the next payout batch (no dust is lost).</p>
+        </div>
+    </div>
+
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>What miner software should I use?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>Any stratum-compatible miner that supports the Lotus (XPI) algorithm will work. Popular options include:</p>
+            <ul class="list-disc list-inside text-sm mt-2 space-y-1">
+                <li>CPUMiner (for CPU mining)</li>
+                <li>Any ASIC miner with stratum support</li>
+            </ul>
+        </div>
+    </div>
+</div>
+{% endblock %}

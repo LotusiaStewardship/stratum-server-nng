@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}{{ footer.pool_name }} - Payouts{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl font-bold">Payout History</h1>
+    <p class="text-gray-400 mt-1">Recent payout batches processed by the pool.</p>
+</div>
+
+{% if payouts.is_empty() %}
+<div class="bg-primary-900 rounded-lg border border-primary-700 p-8 text-center text-gray-500">
+    No payouts yet. Payouts are processed when blocks mature.
+</div>
+{% else %}
+<div class="bg-primary-900 rounded-lg border border-primary-700 overflow-hidden">
+    <div class="overflow-x-auto">
+        <table class="w-full">
+            <thead class="bg-primary-950">
+                <tr>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Batch</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Method</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">TXID</th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Created</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-primary-700">
+                {% for payout in payouts %}
+                <tr class="hover:bg-primary-800 transition-colors">
+                    <td class="px-4 py-4 text-primary-400 font-mono text-sm">#{{ payout.id }}</td>
+                    <td class="px-4 py-4 text-gray-300 text-sm uppercase">{{ payout.method }}</td>
+                    <td class="px-4 py-4">
+                        <span class="px-2 py-1 rounded-full text-xs
+                            {% if payout.status == "confirmed" %}bg-green-900 text-green-300
+                            {% else if payout.status == "submitted" %}bg-blue-900 text-blue-300
+                            {% else if payout.status == "signed" %}bg-yellow-900 text-yellow-300
+                            {% else if payout.status == "planned" %}bg-gray-700 text-gray-300
+                            {% else %}bg-red-900 text-red-300{% endif %}">
+                            {{ payout.status }}
+                        </span>
+                    </td>
+                    <td class="px-4 py-4 font-mono text-xs text-gray-300">{{ payout.txid }}</td>
+                    <td class="px-4 py-4 text-gray-500 text-sm">{{ payout.created_at }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

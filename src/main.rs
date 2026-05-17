@@ -3,6 +3,7 @@ use clap::Parser;
 use stratum_server_nng::accounting::{AccountingDb, PayoutMethod};
 use stratum_server_nng::api::start_operator_api;
 use stratum_server_nng::config::{CliArgs, Config};
+use stratum_server_nng::http::start_http_dashboard;
 use stratum_server_nng::payout::scheduler::run_payout_scheduler;
 use stratum_server_nng::stratum::diff_cache::DifficultyCache;
 use stratum_server_nng::stratum::network_diff::{DynamicDiffConfig, NetworkDifficultyTracker};
@@ -45,6 +46,11 @@ async fn main() -> Result<()> {
         "network detected (auto-derived from RPC port)"
     );
     info!(nng_rpc = %cfg.nng_rpc_url, nng_pub = %cfg.nng_pub_url, "nng endpoints configured");
+    info!(
+        http_enabled = cfg.http_enabled,
+        http_bind = %cfg.http_bind,
+        "HTTP dashboard configured"
+    );
 
     let stats = std::sync::Arc::new(RuntimeStats::default());
 
@@ -67,8 +73,15 @@ async fn main() -> Result<()> {
     let api_db = db.clone();
     let api_bind = cfg.api_bind.clone();
     let api_token = cfg.api_token.clone();
-
     let api_stats = stats.clone();
+
+    // HTTP dashboard
+    let http_enabled = cfg.http_enabled;
+    let http_db = db.clone();
+    let http_bind = cfg.http_bind.clone();
+    let http_stats = stats.clone();
+    let http_pool_config = cfg.pool.clone();
+    let http_diff_cache = diff_cache.clone();
 
     let reconcile_db = db.clone();
     let reconcile_stats = stats.clone();
@@ -104,16 +117,25 @@ async fn main() -> Result<()> {
         tokio::spawn(
             async move { start_operator_api(api_bind, api_token, api_db, api_stats).await },
         );
+    let http_task = tokio::spawn(async move {
+        if http_enabled {
+            start_http_dashboard(http_bind, http_db, http_stats, http_pool_config, http_diff_cache).await
+        } else {
+            tracing::info!("HTTP dashboard disabled by configuration");
+            Ok(())
+        }
+    });
     let scheduler_task =
         tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
     let stratum_task = tokio::spawn(async move {
         run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache).await
     });
 
-    let (api_res, stratum_res, _reconcile_res, scheduler_res) =
-        tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task);
+    let (api_res, stratum_res, _reconcile_res, scheduler_res, http_res) =
+        tokio::join!(api_task, stratum_task, reconcile_task, scheduler_task, http_task);
     scheduler_res??;
     api_res??;
     stratum_res??;
+    http_res??;
     Ok(())
 }
