@@ -266,6 +266,7 @@ pub async fn run_stratum_server(
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
     events_tx: crate::http::DashboardEventSender,
+    share_aggregator: crate::stratum::share_aggregator::ShareAggregator,
 ) -> Result<()> {
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
@@ -534,6 +535,7 @@ pub async fn run_stratum_server(
         let pool_scripts = pool_scripts.clone();
         let diff_cache = diff_cache.clone();
         let events_tx = events_tx.clone();
+        let share_aggregator = share_aggregator.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_conn(
                 socket,
@@ -545,6 +547,7 @@ pub async fn run_stratum_server(
                 stats,
                 diff_cache,
                 events_tx,
+                share_aggregator,
             )
             .await
             {
@@ -819,6 +822,7 @@ async fn handle_conn(
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
     events_tx: crate::http::DashboardEventSender,
+    share_aggregator: crate::stratum::share_aggregator::ShareAggregator,
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
@@ -1079,6 +1083,13 @@ async fn handle_conn(
                         let round_id = db.resolve_round_for_template(job.template_id)?;
                         let Some(assigned) = assigned_jobs.get(job_id).cloned() else {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                true, // stale
+                            );
                             let _ = db.record_share_outcome(ShareOutcomeInsert {
                                 session_id: &session_id,
                                 worker_id: worker_row.id,
@@ -1112,6 +1123,13 @@ async fn handle_conn(
                         };
                         if submit.ntime_hex_6b != assigned.ntime_hex_6b {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: ntime-mismatch");
                             let err = StratumResponse::rejected(req_id.clone(), 20, "ntime-mismatch");
                             send_json_line(&mut write_half, &err).await?;
@@ -1125,6 +1143,13 @@ async fn handle_conn(
                             share_difficulty,
                         ) {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, difficulty = share_difficulty, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: low-difficulty-share");
                             let err = StratumResponse::rejected(req_id.clone(), 23, "low-difficulty-share");
                             send_json_line(&mut write_half, &err).await?;
@@ -1255,6 +1280,13 @@ async fn handle_conn(
                             });
 
                             share_stats.accepted += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                true,
+                                false,
+                            );
                             info!(
                                 session_id = %session_id,
                                 req_id = %req_id,
@@ -1313,6 +1345,13 @@ async fn handle_conn(
                         };
                         if !merkle_matches_block {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: bad-txnmrklroot");
                             let err = StratumResponse::rejected(req_id.clone(), 20, "bad-txnmrklroot");
                             send_json_line(&mut write_half, &err).await?;
@@ -1384,6 +1423,13 @@ async fn handle_conn(
 
                         if !share_accepted {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(
                                 session_id = %session_id,
                                 req_id = %req_id,
@@ -1461,6 +1507,13 @@ async fn handle_conn(
                                         };
                                         events_tx.send(DashboardEvent::BlockFound(event));
                                     }
+                                    
+                                    // Record block for share aggregation
+                                    share_aggregator.record_block(
+                                        worker_row.id,
+                                        worker_row.payout_address.clone(),
+                                        worker.worker_suffix.clone(),
+                                    );
                                 }
                                 Err(err) => {
                                     stats

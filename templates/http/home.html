@@ -89,7 +89,7 @@
             </thead>
             <tbody id="home-workers-body" class="divide-y divide-primary-700">
                 {% for worker in workers %}
-                <tr id="worker-{{ worker.id }}" class="hover:bg-primary-800 transition-colors">
+                <tr id="worker-{{ worker.id }}" data-worker-id="{{ worker.id }}" class="hover:bg-primary-800 transition-colors">
                     <td class="px-4 py-4">
                         <a href="/miner/{{ worker.payout_address }}" class="text-primary-400 hover:text-primary-300 font-mono text-xs">
                             {{ worker.payout_address_short }}

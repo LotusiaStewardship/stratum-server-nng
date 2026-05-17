@@ -2,6 +2,24 @@
 //!
 //! Real-time event broadcasting for HTTP dashboard updates.
 //! Events are broadcast to all connected WebSocket clients.
+//!
+//! # Event Flow
+//!
+//! 1. Stratum server emits `BlockFoundEvent` on block submission
+//! 2. `ShareAggregator` emits `ShareUpdateEvent` every 30 seconds (aggregated)
+//! 3. Background task emits `StatsUpdateEvent` every 5 seconds
+//! 4. WebSocket clients receive all events via broadcast channel
+//! 5. Cache invalidation triggers on `BlockFoundEvent` and `ShareUpdateEvent`
+//!
+//! # Why Share Aggregation?
+//!
+//! Shares arrive at high frequency (100s-1000s per minute). Broadcasting
+//! each share would:
+//! - Flood WebSocket clients with excessive updates
+//! - Increase bandwidth costs significantly
+//! - Provide minimal UX value (users care about aggregates)
+//!
+//! Instead, shares are aggregated per-worker and broadcast every 30 seconds.
 
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;

@@ -30,6 +30,20 @@
     </script>
     <style>
         body { font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif; }
+        
+        /* WebSocket update animation */
+        tr.updated {
+            animation: flash-update 0.5s ease-out;
+        }
+        
+        @keyframes flash-update {
+            0% {
+                background-color: rgba(168, 85, 247, 0.3);
+            }
+            100% {
+                background-color: transparent;
+            }
+        }
     </style>
 </head>
 <body class="bg-gray-950 text-white min-h-screen">

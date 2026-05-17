@@ -165,16 +165,21 @@
 
     function updateWorkerRow(rowId, update) {
         const row = document.getElementById(rowId);
-        if (row) {
-            // Update existing row
-            const acceptedCell = row.querySelector('.shares-accepted');
-            const rejectedCell = row.querySelector('.shares-rejected');
-            const blocksCell = row.querySelector('.blocks-found');
-            
-            if (acceptedCell) acceptedCell.textContent = update.shares_accepted.toLocaleString();
-            if (rejectedCell) rejectedCell.textContent = update.shares_rejected.toLocaleString();
-            if (blocksCell) blocksCell.textContent = update.blocks_found.toLocaleString();
-        }
+        if (!row) return;
+        
+        // Update existing row
+        const acceptedCell = row.querySelector('.shares-accepted');
+        const rejectedCell = row.querySelector('.shares-rejected');
+        const blocksCell = row.querySelector('.blocks-found');
+        
+        if (acceptedCell) acceptedCell.textContent = update.shares_accepted.toLocaleString();
+        if (rejectedCell) rejectedCell.textContent = update.shares_rejected.toLocaleString();
+        if (blocksCell) blocksCell.textContent = update.blocks_found.toLocaleString();
+        
+        // Visual flash to indicate update
+        row.classList.add('updated');
+        setTimeout(() => row.classList.remove('updated'), 500);
+        
         // Note: New workers will appear on next page refresh
         // (implementing dynamic row insertion is more complex)
     }

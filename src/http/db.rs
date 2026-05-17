@@ -256,7 +256,7 @@ impl CachedDb {
     pub fn new(inner: PublicDb) -> Self {
         let stats_cache = Cache::builder()
             .max_capacity(10)
-            .time_to_live(StdDuration::from_secs(10))  // 2x broadcast interval for overlap
+            .time_to_live(StdDuration::from_secs(5))  // Match broadcast interval
             .build();
         Self { inner, stats_cache }
     }

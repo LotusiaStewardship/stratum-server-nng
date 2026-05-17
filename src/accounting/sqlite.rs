@@ -1690,6 +1690,35 @@ impl AccountingDb {
         Ok((hashrate, active_miners as u64))
     }
 
+    /// Calculate hashrate for a specific worker over a time window
+    ///
+    /// # Arguments
+    /// * `worker_id` - The worker ID to calculate hashrate for
+    /// * `window_secs` - Time window in seconds (e.g., 300 for 5 minutes)
+    ///
+    /// # Returns
+    /// Hashrate in hashes per second, or 0.0 if no shares found
+    pub fn calculate_worker_hashrate(&self, worker_id: i64, window_secs: u64) -> Result<f64> {
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+        let window_start = now - Duration::seconds(window_secs as i64);
+
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+
+        // Total work = sum of accepted share difficulties in the time window
+        let total_work: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(difficulty), 0.0) FROM shares
+             WHERE worker_id = ?1 AND accepted = 1 AND stale = 0 AND created_at >= ?2",
+            params![worker_id, window_start.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+
+        // hashrate = total_work * 2^32 / time_window_seconds
+        // 2^32 ≈ 4294967296 hashes per difficulty unit
+        let hashrate = (total_work * 4294967296.0) / (window_secs as f64);
+        Ok(hashrate)
+    }
+
     /// Get average network difficulty from recent shares
     pub fn get_average_difficulty(&self, since: &str) -> Result<f64> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;

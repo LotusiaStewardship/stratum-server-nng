@@ -5,6 +5,7 @@ use stratum_server_nng::api::start_operator_api;
 use stratum_server_nng::config::{CliArgs, Config};
 use stratum_server_nng::http::{start_http_dashboard, DashboardEventSender};
 use stratum_server_nng::payout::scheduler::run_payout_scheduler;
+use stratum_server_nng::stratum::share_aggregator::ShareAggregator;
 use stratum_server_nng::stratum::diff_cache::DifficultyCache;
 use stratum_server_nng::stratum::network_diff::{DynamicDiffConfig, NetworkDifficultyTracker};
 use stratum_server_nng::stratum::server::{run_stratum_server, RuntimeStats};
@@ -78,6 +79,9 @@ async fn main() -> Result<()> {
     // HTTP dashboard event sender (only if enabled)
     let events_tx = DashboardEventSender::new(cfg.http_enabled);
     
+    // Share aggregator for periodic broadcast (only if HTTP dashboard enabled)
+    let share_aggregator = ShareAggregator::new(db.clone(), events_tx.clone(), 30);
+    
     // HTTP dashboard
     let http_enabled = cfg.http_enabled;
     let http_db = db.clone();
@@ -129,10 +133,17 @@ async fn main() -> Result<()> {
             Ok(())
         }
     });
+    
+    // Spawn share aggregator broadcast loop
+    let aggregator_clone = share_aggregator.clone();
+    tokio::spawn(async move {
+        let _ = aggregator_clone.spawn_broadcast_loop().await;
+    });
+    
     let scheduler_task =
         tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
     let stratum_task = tokio::spawn(async move {
-        run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache, events_tx).await
+        run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache, events_tx, share_aggregator).await
     });
 
     let (api_res, stratum_res, _reconcile_res, scheduler_res, http_res) =

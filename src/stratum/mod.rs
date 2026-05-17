@@ -4,6 +4,7 @@ pub mod job;
 pub mod network_diff;
 pub mod protocol;
 pub mod server;
+pub mod share_aggregator;
 pub mod validation;
 pub mod vardiff;
 pub mod worker;
