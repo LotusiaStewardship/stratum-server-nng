@@ -49,7 +49,7 @@ pub async fn home_page(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.cached_db.get_pool_stats(network_difficulty).await.unwrap_or_default();
     
     // Use db directly for blocks/workers (these don't change as frequently)
-    let db = PublicDb::new(state.db.clone());
+    let db = PublicDb::new(state.db.clone(), state.stats.clone());
     let blocks = db.list_found_blocks(10, None).unwrap_or_default();
     let workers = db.list_workers(10, 0).unwrap_or_default();
 

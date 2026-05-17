@@ -33,7 +33,7 @@ pub async fn list_workers(
         offset = query.offset,
         "API request: GET /api/workers"
     );
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.list_workers(query.limit, query.offset) {
         Ok(workers) => {
             info!(count = workers.len(), "workers retrieved");
@@ -52,7 +52,7 @@ pub async fn get_miner(
     Path(address): Path<String>,
 ) -> impl IntoResponse {
     info!(address = %address, "API request: GET /api/miner/:address");
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.get_worker_by_address(&address) {
         Ok(Some(miner)) => {
             info!(

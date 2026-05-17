@@ -5,9 +5,11 @@
 
 use crate::accounting::AccountingDb;
 use crate::http::models::*;
+use crate::stratum::server::RuntimeStats;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use moka::future::Cache;
+use std::sync::Arc;
 use tracing::info;
 use std::time::Duration as StdDuration;
 
@@ -15,11 +17,12 @@ use std::time::Duration as StdDuration;
 #[derive(Clone)]
 pub struct PublicDb {
     inner: AccountingDb,
+    stats: Arc<RuntimeStats>,
 }
 
 impl PublicDb {
-    pub fn new(db: AccountingDb) -> Self {
-        Self { inner: db }
+    pub fn new(db: AccountingDb, stats: Arc<RuntimeStats>) -> Self {
+        Self { inner: db, stats }
     }
 
     /// Get aggregate pool statistics
@@ -241,7 +244,7 @@ impl PublicDb {
     }
 
     fn get_tip_height(&self) -> Result<i64> {
-        self.inner.get_tip_height()
+        Ok(self.stats.get_tip_height())
     }
 }
 

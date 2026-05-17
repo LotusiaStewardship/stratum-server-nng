@@ -27,7 +27,7 @@ pub async fn start_http_dashboard(
     events_tx: DashboardEventSender,
 ) -> Result<()> {
     // Create cached database wrapper for efficient page rendering
-    let public_db = PublicDb::new(db.clone());
+    let public_db = PublicDb::new(db.clone(), stats.clone());
     let cached_db = CachedDb::new(public_db.clone());
     
     // Spawn background task to periodically broadcast FRESH stats updates

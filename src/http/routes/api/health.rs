@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 pub async fn health_check(State(state): State<AppState>) -> Json<crate::http::models::HealthResponse> {
     info!("API request: GET /api/health");
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.health_check() {
         Ok(health) => {
             info!(status = %health.status, "health check passed");

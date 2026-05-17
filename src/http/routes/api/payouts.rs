@@ -19,7 +19,7 @@ pub async fn list_payouts(
     Query(query): Query<PayoutsQuery>,
 ) -> Json<Vec<crate::http::models::PayoutInfo>> {
     info!(limit = query.limit, "API request: GET /api/payouts");
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.list_payout_batches(query.limit) {
         Ok(payouts) => {
             info!(count = payouts.len(), "payouts retrieved");

@@ -19,7 +19,7 @@ pub async fn list_rounds(
     Query(query): Query<RoundsQuery>,
 ) -> Json<Vec<crate::http::models::RoundStats>> {
     info!(limit = query.limit, "API request: GET /api/rounds");
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.list_recent_rounds(query.limit) {
         Ok(rounds) => {
             info!(count = rounds.len(), "rounds retrieved");

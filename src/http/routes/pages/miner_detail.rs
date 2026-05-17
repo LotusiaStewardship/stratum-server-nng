@@ -38,7 +38,7 @@ pub async fn miner_detail_page(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let db = PublicDb::new(state.db.clone());
+    let db = PublicDb::new(state.db.clone(), state.stats.clone());
 
     match db.get_worker_by_address(&address) {
         Ok(Some(miner)) => {

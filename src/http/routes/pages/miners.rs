@@ -30,7 +30,7 @@ struct MinersPage {
 }
 
 pub async fn miners_page(State(state): State<AppState>) -> impl IntoResponse {
-    let db = PublicDb::new(state.db.clone());
+    let db = PublicDb::new(state.db.clone(), state.stats.clone());
     let workers = db.list_workers(200, 0).unwrap_or_default();
 
     let fee_str = if state.pool_config.fee.enabled {

@@ -24,7 +24,7 @@ pub async fn list_blocks(
         status = ?query.status,
         "API request: GET /api/blocks"
     );
-    let db = PublicDb::new(state.db);
+    let db = PublicDb::new(state.db, state.stats.clone());
     match db.list_found_blocks(query.limit, query.status.as_deref()) {
         Ok(blocks) => {
             info!(count = blocks.len(), "blocks retrieved");
