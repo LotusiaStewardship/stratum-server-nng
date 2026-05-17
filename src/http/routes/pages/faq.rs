@@ -17,6 +17,12 @@ struct FaqPage {
     footer: FooterCtx,
     n_multiplier: String,
     min_confirmations: String,
+    min_payout_sat: String,
+    payout_interval_secs: String,
+    vardiff_target_secs: String,
+    vardiff_retarget_secs: String,
+    vardiff_initial_pct: String,
+    vardiff_min_floor: String,
 }
 
 pub async fn faq_page(State(state): State<AppState>) -> impl IntoResponse {
@@ -34,6 +40,12 @@ pub async fn faq_page(State(state): State<AppState>) -> impl IntoResponse {
         },
         n_multiplier: state.pool_config.pplns.n_multiplier.to_string(),
         min_confirmations: state.pool_config.pplns.min_confirmations.to_string(),
+        min_payout_sat: state.pool_config.pplns.min_payout_sat.to_string(),
+        payout_interval_secs: state.pool_config.pplns.payout_interval_secs.to_string(),
+        vardiff_target_secs: state.config.vardiff.vardiff_target_secs.to_string(),
+        vardiff_retarget_secs: state.config.vardiff.vardiff_retarget_secs.to_string(),
+        vardiff_initial_pct: (state.config.vardiff.vardiff_initial_pct * 100.0).to_string(),
+        vardiff_min_floor: state.config.vardiff.vardiff_min_floor.to_string(),
     };
 
     template.into_response()

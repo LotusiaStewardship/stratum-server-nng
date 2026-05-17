@@ -8,81 +8,240 @@
     <p class="text-gray-400 mt-1">Everything you need to know about mining on {{ footer.pool_name }}.</p>
 </div>
 
-<div class="space-y-4">
+<div class="space-y-6">
+    <!-- Quick Start Section -->
+    <div class="bg-primary-900/50 rounded-lg border border-primary-700 p-6">
+        <h2 class="text-xl font-bold mb-4 text-primary-300">🚀 Quick Start</h2>
+        <div class="space-y-4">
+            <div>
+                <h3 class="font-semibold mb-2">1. Download the Miner</h3>
+                <p class="text-gray-300 text-sm mb-2">The canonical mining software for Lotus Pool is <strong>lotus-gpu-miner v0.4.1</strong>:</p>
+                <div class="flex flex-wrap gap-2">
+                    <a href="https://github.com/LotusiaStewardship/lotus-gpu-miner/releases/download/v0.4.1/lotus-miner-macos-x86_64.zip" class="inline-block bg-primary-700 hover:bg-primary-600 px-4 py-2 rounded text-sm transition-colors">
+                        🍎 macOS (x86_64)
+                    </a>
+                    <a href="https://github.com/LotusiaStewardship/lotus-gpu-miner/releases/download/v0.4.1/lotus-miner-windows-x86_64.zip" class="inline-block bg-primary-700 hover:bg-primary-600 px-4 py-2 rounded text-sm transition-colors">
+                        🪟 Windows (x86_64)
+                    </a>
+                    <a href="https://github.com/LotusiaStewardship/lotus-gpu-miner/releases/download/v0.4.1/lotus-miner-linux-x86_64.zip" class="inline-block bg-primary-700 hover:bg-primary-600 px-4 py-2 rounded text-sm transition-colors">
+                        🐧 Linux (x86_64)
+                    </a>
+                </div>
+                <p class="text-gray-400 text-xs mt-2">
+                    <a href="https://github.com/LotusiaStewardship/lotus-gpu-miner/releases" target="_blank" class="underline hover:text-primary-300">View all releases on GitHub</a>
+                </p>
+            </div>
+            
+            <div>
+                <h3 class="font-semibold mb-2">2. Configure Your Miner</h3>
+                <p class="text-gray-300 text-sm mb-2">Create a config file at <code class="text-primary-300 bg-primary-950 px-2 py-1 rounded">~/.lotus-miner/config.toml</code>:</p>
+                <pre class="bg-primary-950 p-3 rounded text-primary-300 font-mono text-xs overflow-x-auto">mine_to_address = "lotus_YOUR_ADDRESS_HERE"
+stratum_url = "pool.lotusia.org:3334"
+stratum_worker_name = "rig01"
+stratum_password = "x"</pre>
+                <p class="text-gray-400 text-xs mt-2">Replace <code class="text-primary-300">lotus_YOUR_ADDRESS_HERE</code> with your actual Lotus payout address.</p>
+            </div>
+            
+            <div>
+                <h3 class="font-semibold mb-2">3. Start Mining</h3>
+                <pre class="bg-primary-950 p-3 rounded text-primary-300 font-mono text-xs overflow-x-auto">./lotus-miner-cli --stratum-url pool.lotusia.org:3334 --mine-to-address lotus_YOUR_ADDRESS --stratum-worker-name rig01 --stratum-password x</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Connection Details -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
             <span>How do I connect to the pool?</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p class="mb-2">Use the following stratum URL:</p>
+            <p class="mb-2">Use the following stratum connection details:</p>
             <pre class="bg-primary-950 p-3 rounded text-primary-300 font-mono text-sm">stratum+tcp://pool.lotusia.org:3334</pre>
             <p class="mt-2">Credentials:</p>
             <ul class="list-disc list-inside text-sm mt-1 space-y-1">
-                <li><strong>Username:</strong> Your Lotus (XPI) payout address</li>
+                <li><strong>Username:</strong> Your Lotus (XPI) payout address (e.g., <code class="text-primary-300">lotus_16PSJN...</code>)</li>
                 <li><strong>Password:</strong> <code class="text-primary-300">x</code> (any password works)</li>
             </ul>
-            <p class="mt-2 text-sm text-gray-400">Optionally append a worker name: <code class="text-primary-300">address.workername</code></p>
+            <p class="mt-2 text-sm text-gray-400">Optionally append a worker name: <code class="text-primary-300">address.workername</code> (e.g., <code class="text-primary-300">lotus_16PSJN....rig01</code>)</p>
+            
+            <h4 class="font-semibold mt-4 mb-2">Network Ports</h4>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm text-left">
+                    <thead class="text-xs uppercase bg-primary-950">
+                        <tr>
+                            <th class="px-4 py-2">Network</th>
+                            <th class="px-4 py-2">Stratum Port</th>
+                            <th class="px-4 py-2">API Port</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2">Mainnet</td>
+                            <td class="px-4 py-2 text-primary-300">3334</td>
+                            <td class="px-4 py-2">18080</td>
+                        </tr>
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2">Testnet</td>
+                            <td class="px-4 py-2 text-primary-300">13334</td>
+                            <td class="px-4 py-2">18081</td>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2">Regtest</td>
+                            <td class="px-4 py-2 text-primary-300">23334</td>
+                            <td class="px-4 py-2">18082</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 
+    <!-- Pool Fee -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
             <span>What is the pool fee?</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p>The pool fee is displayed in the footer. It is deducted from the gross block reward before miner payouts.</p>
+            <p>The pool fee is <strong>{{ footer.pool_fee_bps }} bps</strong> ({% if footer.pool_fee_bps == "100" %}1.00%{% else if footer.pool_fee_bps == "200" %}2.00%{% else if footer.pool_fee_bps == "50" %}0.50%{% else %}{{ footer.pool_fee_bps }} bps{% endif %}). This is deducted from the gross block reward before miner payouts.</p>
+            <p class="text-sm text-gray-400 mt-2">For example, if the block reward is 1,000,000 satoshis and the fee is 1%, the pool takes 10,000 satoshis and distributes 990,000 among miners.</p>
         </div>
     </div>
 
+    <!-- PPLNS -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
             <span>How are payouts calculated? (PPLNS)</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p>We use <strong>PPLNS</strong> (Pay Per Last N Shares). The payout window covers the last N difficulty units of work, where N = {{ n_multiplier }}× network difficulty.</p>
+            <p>We use <strong>PPLNS</strong> (Pay Per Last N Shares). The payout window covers the last <strong>{{ n_multiplier }}×</strong> the expected work needed to find one block.</p>
             <ul class="list-disc list-inside text-sm mt-2 space-y-1">
                 <li>Shares are difficulty-weighted (a 2× diff share counts as 2 shares)</li>
-                <li>The window extends across round boundaries</li>
-                <li>Early leavers receive less; late joiners receive less (fair for everyone)</li>
+                <li>The window extends across round boundaries — no discrete "rounds"</li>
+                <li>Long-term miners benefit more (anti-pool-hopping)</li>
+                <li>Early leavers receive less; late joiners receive less</li>
             </ul>
+            <p class="text-sm text-gray-400 mt-3">
+                For example, if the window contains 10,000 work units total and you contributed 500, you receive <strong>5%</strong> of the net reward.
+            </p>
         </div>
     </div>
 
+    <!-- Payout Timing -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
             <span>When are payouts sent?</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p>Payouts are processed automatically after a found block matures ({{ min_confirmations }} confirmations). The scheduler runs periodically to process matured blocks.</p>
+            <p>Payouts are processed automatically every <strong>{{ payout_interval_secs }} seconds</strong> ({% if payout_interval_secs == "3600" %}1 hour{% else if payout_interval_secs == "1800" %}30 minutes{% else if payout_interval_secs == "900" %}15 minutes{% else %}{{ payout_interval_secs }} seconds{% endif %}).</p>
+            <p class="mt-2">Blocks must mature to <strong>{{ min_confirmations }} confirmations</strong> before payouts can be distributed (this is a consensus rule — coinbase rewards cannot be spent until 100 blocks have been mined after them).</p>
+            <h4 class="font-semibold mt-3 mb-1">Block Lifecycle:</h4>
+            <ol class="list-decimal list-inside text-sm space-y-1 text-gray-300">
+                <li><strong>Found</strong> — Pool submits a valid block to the network</li>
+                <li><strong>Confirmed</strong> — Block has at least one confirmation</li>
+                <li><strong>Matured</strong> — Block has ≥{{ min_confirmations }} confirmations (coinbase can be spent)</li>
+                <li><strong>Paid</strong> — Payout scheduler distributes rewards to miners</li>
+            </ol>
         </div>
     </div>
 
+    <!-- Minimum Payout -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
             <span>What is the minimum payout?</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p>The minimum payout threshold is displayed on the dashboard. Outputs below this threshold are carried forward to the next payout batch (no dust is lost).</p>
+            <p>The minimum payout threshold is <strong>{{ min_payout_sat }} satoshis</strong>. This prevents the creation of dust outputs — tiny transaction outputs that cost more in fees than they're worth to spend.</p>
+            <p class="mt-2 text-sm">If your share of a block reward is below this threshold, the amount is stored as <strong>dust</strong> and carried forward to future payouts. When your accumulated dust + new payout ≥ minimum, the combined amount is paid out. <strong>No value is ever lost to dust.</strong></p>
         </div>
     </div>
 
+    <!-- VarDiff -->
     <div class="bg-primary-900 rounded-lg border border-primary-700">
         <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
-            <span>What miner software should I use?</span>
+            <span>How does difficulty work? (VarDiff)</span>
             <span class="text-primary-400 text-xl">+</span>
         </button>
         <div class="hidden px-6 pb-4 text-gray-300">
-            <p>Any stratum-compatible miner that supports the Lotus (XPI) algorithm will work. Popular options include:</p>
-            <ul class="list-disc list-inside text-sm mt-2 space-y-1">
-                <li>CPUMiner (for CPU mining)</li>
-                <li>Any ASIC miner with stratum support</li>
+            <p>The pool uses <strong>VarDiff (Variable Difficulty)</strong> — an automatic per-miner difficulty adjustment system.</p>
+            <h4 class="font-semibold mt-3 mb-1">How it works:</h4>
+            <ul class="list-disc list-inside text-sm mt-1 space-y-1">
+                <li><strong>Target:</strong> One accepted share every <strong>{{ vardiff_target_secs }} seconds</strong></li>
+                <li><strong>Retarget:</strong> Every <strong>{{ vardiff_retarget_secs }} seconds</strong>, the pool adjusts your difficulty</li>
+                <li><strong>Start:</strong> New miners begin at <strong>{{ vardiff_initial_pct }}%</strong> of network difficulty</li>
+                <li><strong>Floor:</strong> Minimum difficulty is <strong>{{ vardiff_min_floor }}</strong> (allows tiny miners to participate)</li>
+                <li><strong>Adjustment:</strong> ±50% per retarget to prevent wild swings</li>
             </ul>
+            <p class="mt-3 text-sm">
+                If your shares arrive faster than {{ vardiff_target_secs }} seconds, difficulty increases. If slower, difficulty decreases. You don't need to configure anything — VarDiff adapts to your hashrate automatically.
+            </p>
         </div>
     </div>
+
+    <!-- Share Validation -->
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>What causes rejected shares?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>Shares can be rejected for several reasons:</p>
+            <div class="overflow-x-auto mt-2">
+                <table class="w-full text-sm text-left">
+                    <thead class="text-xs uppercase bg-primary-950">
+                        <tr>
+                            <th class="px-4 py-2">Reason</th>
+                            <th class="px-4 py-2">Description</th>
+                        </tr>
+                    </thead>
+                    <tbody class="space-y-2">
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2 text-primary-300">Stale</td>
+                            <td class="px-4 py-2">Job was replaced by a newer block (new block found)</td>
+                        </tr>
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2 text-primary-300">Duplicate</td>
+                            <td class="px-4 py-2">Share already submitted (connection hiccup or misconfiguration)</td>
+                        </tr>
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2 text-primary-300">Invalid</td>
+                            <td class="px-4 py-2">Structural errors (bad nonce, extranonce, etc.)</td>
+                        </tr>
+                        <tr class="border-b border-primary-800">
+                            <td class="px-4 py-2 text-primary-300">Low-difficulty</td>
+                            <td class="px-4 py-2">Share doesn't meet your assigned difficulty</td>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2 text-primary-300">Unauthorized</td>
+                            <td class="px-4 py-2">Miner didn't complete subscribe/authorize handshake</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p class="text-sm text-gray-400 mt-3">
+                High stale rates can indicate network latency. High invalid rates may indicate hardware instability or overclocking issues.
+            </p>
+        </div>
+    </div>
+
+    <!-- What is Lotus -->
+    <div class="bg-primary-900 rounded-lg border border-primary-700">
+        <button class="w-full px-6 py-4 text-left font-semibold flex items-center justify-between" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <span>What is Lotus (XPI)?</span>
+            <span class="text-primary-400 text-xl">+</span>
+        </button>
+        <div class="hidden px-6 pb-4 text-gray-300">
+            <p>Lotus (XPI) is a blockchain based on the Bitcoin codebase with modifications. It uses the same proof-of-work mining fundamentals — miners compete to find valid blocks by performing hash computations.</p>
+            <p class="mt-2 text-sm">This pool is specifically designed for Lotus's consensus rules, including its block structure, coinbase transaction format, and address encoding. You do <strong>not</strong> need to run a Lotus node to mine — just point your miner to the pool's Stratum endpoint.</p>
+        </div>
+    </div>
+</div>
+
+<div class="mt-8 text-center text-gray-500 text-sm">
+    <p>This FAQ is maintained alongside the stratum-server-nng codebase. If you have additional questions, please consult the source code or contact the pool operator.</p>
 </div>
 {% endblock %}

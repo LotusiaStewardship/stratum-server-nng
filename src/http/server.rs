@@ -22,6 +22,7 @@ pub async fn start_http_dashboard(
     db: crate::accounting::AccountingDb,
     stats: std::sync::Arc<crate::stratum::server::RuntimeStats>,
     pool_config: crate::config::PoolConfig,
+    config: crate::config::Config,
     diff_cache: crate::stratum::diff_cache::DifficultyCache,
     events_tx: DashboardEventSender,
 ) -> Result<()> {
@@ -80,7 +81,7 @@ pub async fn start_http_dashboard(
     }
     
     // Create application state with cached_db for page rendering
-    let state = AppState::new(db.clone(), stats, pool_config, diff_cache, events_tx, cached_db);
+    let state = AppState::new(db.clone(), stats, pool_config, config, diff_cache, events_tx, cached_db);
 
     // Build router with all routes
     let app = Router::new()

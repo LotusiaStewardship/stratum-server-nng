@@ -1,7 +1,7 @@
 //! HTTP Dashboard Application State
 
 use crate::accounting::AccountingDb;
-use crate::config::PoolConfig;
+use crate::config::{Config, PoolConfig};
 use crate::stratum::diff_cache::DifficultyCache;
 use crate::stratum::server::RuntimeStats;
 use super::events::DashboardEventSender;
@@ -14,6 +14,7 @@ pub struct AppState {
     pub db: AccountingDb,
     pub stats: Arc<RuntimeStats>,
     pub pool_config: PoolConfig,
+    pub config: Config,
     pub diff_cache: DifficultyCache,
     /// Event sender for real-time dashboard updates
     pub events_tx: DashboardEventSender,
@@ -26,6 +27,7 @@ impl AppState {
         db: AccountingDb,
         stats: Arc<RuntimeStats>,
         pool_config: PoolConfig,
+        config: Config,
         diff_cache: DifficultyCache,
         events_tx: DashboardEventSender,
         cached_db: CachedDb,
@@ -34,6 +36,7 @@ impl AppState {
             db,
             stats,
             pool_config,
+            config,
             diff_cache,
             events_tx,
             cached_db,

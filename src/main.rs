@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
     let http_bind = cfg.http_bind.clone();
     let http_stats = stats.clone();
     let http_pool_config = cfg.pool.clone();
+    let http_config = cfg.clone();
     let http_diff_cache = diff_cache.clone();
     let http_events_tx = events_tx.clone();
 
@@ -127,7 +128,7 @@ async fn main() -> Result<()> {
         );
     let http_task = tokio::spawn(async move {
         if http_enabled {
-            start_http_dashboard(http_bind, http_db, http_stats, http_pool_config, http_diff_cache, http_events_tx).await
+            start_http_dashboard(http_bind, http_db, http_stats, http_pool_config, http_config, http_diff_cache, http_events_tx).await
         } else {
             tracing::info!("HTTP dashboard disabled by configuration");
             Ok(())
