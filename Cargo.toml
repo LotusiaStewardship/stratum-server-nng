@@ -11,7 +11,7 @@ anyhow = "1"
 async-trait = "0.1"
 askama = "0.12"
 askama_axum = "0.4"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 bitcoinsuite-bitcoind = { path = "../bitcoinsuite/bitcoinsuite-bitcoind" }
 bitcoinsuite-bitcoind-nng = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-nng" }
 bitcoinsuite-bitcoind-stratum = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-stratum" }
@@ -20,6 +20,7 @@ bitcoinsuite-ecc-secp256k1 = { path = "../bitcoinsuite/bitcoinsuite-ecc-secp256k
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+moka = { version = "0.12", features = ["future"] }
 parking_lot = "0.12"
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json"] }
@@ -36,6 +37,7 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 flatbuffers = "25"
+futures-util = "0.3"
 governor = { version = "0.6", features = ["std"] }
 url = "2"
 

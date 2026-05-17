@@ -47,6 +47,10 @@
                     <a href="/payouts" class="text-gray-300 hover:text-primary-300 transition-colors">Payouts</a>
                     <a href="/faq" class="text-gray-300 hover:text-primary-300 transition-colors">FAQ</a>
                 </div>
+                <div class="flex items-center gap-2 text-xs text-gray-400">
+                    <span id="ws-status" class="text-yellow-400" title="Connecting...">●</span>
+                    <span class="hidden sm:inline">Live</span>
+                </div>
             </div>
         </div>
     </nav>
@@ -63,38 +67,7 @@
         </div>
     </footer>
 
-    <script>
-        // Poll /api/stats every 10s for live dashboard updates
-        async function pollStats() {
-            try {
-                const res = await fetch('/api/stats');
-                if (!res.ok) return;
-                const stats = await res.json();
-                const el = (id) => document.getElementById(id);
-                if (el('stat-hashrate')) el('stat-hashrate').textContent = formatHashrate(stats.pool_hashrate);
-                if (el('stat-miners')) el('stat-miners').textContent = stats.active_miners.toLocaleString();
-                if (el('stat-diff')) el('stat-diff').textContent = formatDifficulty(stats.network_difficulty);
-                if (el('stat-blocks-24h')) el('stat-blocks-24h').textContent = stats.blocks_found_24h.toLocaleString();
-            } catch {}
-        }
-        function formatHashrate(h) {
-            if (h >= 1e12) return (h / 1e12).toFixed(2) + ' TH/s';
-            if (h >= 1e9) return (h / 1e9).toFixed(2) + ' GH/s';
-            if (h >= 1e6) return (h / 1e6).toFixed(2) + ' MH/s';
-            if (h >= 1e3) return (h / 1e3).toFixed(2) + ' KH/s';
-            return h.toFixed(2) + ' H/s';
-        }
-        function formatDifficulty(d) {
-            if (d >= 1e12) return (d / 1e12).toFixed(2) + ' T';
-            if (d >= 1e9) return (d / 1e9).toFixed(2) + ' G';
-            if (d >= 1e6) return (d / 1e6).toFixed(2) + ' M';
-            return d.toFixed(2);
-        }
-        // Start polling if stats elements exist on page
-        if (document.getElementById('stat-hashrate')) {
-            setInterval(pollStats, 10000);
-        }
-    </script>
+    <script src="/static/http/js/app.js"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

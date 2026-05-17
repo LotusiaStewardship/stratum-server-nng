@@ -12,6 +12,7 @@ struct FooterCtx {
 }
 
 struct WorkerRow {
+    id: i64,
     payout_address: String,
     payout_address_short: String,
     worker_suffix: String,
@@ -47,6 +48,7 @@ pub async fn miners_page(State(state): State<AppState>) -> impl IntoResponse {
         workers: workers
             .into_iter()
             .map(|w| WorkerRow {
+                id: w.id,
                 payout_address: w.payout_address.clone(),
                 payout_address_short: if w.payout_address.len() > 24 {
                     format!("{}...", &w.payout_address[..24])

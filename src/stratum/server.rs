@@ -265,6 +265,7 @@ pub async fn run_stratum_server(
     db: AccountingDb,
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
+    events_tx: crate::http::DashboardEventSender,
 ) -> Result<()> {
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
@@ -532,6 +533,7 @@ pub async fn run_stratum_server(
         let stats = stats.clone();
         let pool_scripts = pool_scripts.clone();
         let diff_cache = diff_cache.clone();
+        let events_tx = events_tx.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_conn(
                 socket,
@@ -542,6 +544,7 @@ pub async fn run_stratum_server(
                 adapter,
                 stats,
                 diff_cache,
+                events_tx,
             )
             .await
             {
@@ -815,6 +818,7 @@ async fn handle_conn(
     adapter: Arc<dyn NodeMiningAdapter>,
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
+    events_tx: crate::http::DashboardEventSender,
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
@@ -1439,6 +1443,24 @@ async fn handle_conn(
                                     stats
                                         .found_block_persist_ok_total
                                         .fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Emit block found event for real-time dashboard updates
+                                    if events_tx.is_enabled() {
+                                        use chrono::Utc;
+                                        use crate::http::BlockFoundEvent;
+                                        use crate::http::DashboardEvent;
+                                        
+                                        let event = BlockFoundEvent {
+                                            height: job.block_height as i64,
+                                            hash: submit_block_hash.clone(),
+                                            status: "confirmed".to_string(),
+                                            confirmations: 1,
+                                            found_by: submit.worker_name.clone(),
+                                            payout_address: worker_row.payout_address.clone(),
+                                            found_at: Utc::now(),
+                                        };
+                                        events_tx.send(DashboardEvent::BlockFound(event));
+                                    }
                                 }
                                 Err(err) => {
                                     stats

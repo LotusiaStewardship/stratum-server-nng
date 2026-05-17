@@ -7,7 +7,9 @@ use crate::accounting::AccountingDb;
 use crate::http::models::*;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use moka::future::Cache;
 use tracing::info;
+use std::time::Duration as StdDuration;
 
 /// Read-only database handle for HTTP dashboard
 #[derive(Clone)]
@@ -240,5 +242,73 @@ impl PublicDb {
 
     fn get_tip_height(&self) -> Result<i64> {
         self.inner.get_tip_height()
+    }
+}
+
+/// Cached database wrapper for expensive queries
+#[derive(Clone)]
+pub struct CachedDb {
+    inner: PublicDb,
+    stats_cache: Cache<String, PoolStats>,
+}
+
+impl CachedDb {
+    pub fn new(inner: PublicDb) -> Self {
+        let stats_cache = Cache::builder()
+            .max_capacity(10)
+            .time_to_live(StdDuration::from_secs(10))  // 2x broadcast interval for overlap
+            .build();
+        Self { inner, stats_cache }
+    }
+
+    /// Get pool stats with caching
+    pub async fn get_pool_stats(&self, network_difficulty: f64) -> Result<PoolStats> {
+        // Use rounded network_difficulty for cache key to avoid precision issues
+        // Network difficulty changes slowly, so 2 decimal places is sufficient
+        let cache_key = format!("stats:{:.2}", network_difficulty);
+        
+        // Try cache first
+        if let Some(cached) = self.stats_cache.get(&cache_key).await {
+            return Ok(cached);
+        }
+
+        // Query database
+        let stats = self.inner.get_pool_stats(network_difficulty)?;
+        
+        // Cache the result
+        self.stats_cache.insert(cache_key, stats.clone()).await;
+        
+        Ok(stats)
+    }
+
+    /// Delegate other methods to inner PublicDb
+    pub fn list_workers(&self, limit: u32, offset: u32) -> Result<Vec<WorkerStats>> {
+        self.inner.list_workers(limit, offset)
+    }
+
+    pub fn get_worker_by_address(&self, address: &str) -> Result<Option<MinerDetail>> {
+        self.inner.get_worker_by_address(address)
+    }
+
+    pub fn list_recent_rounds(&self, limit: u32) -> Result<Vec<RoundStats>> {
+        self.inner.list_recent_rounds(limit)
+    }
+
+    pub fn list_found_blocks(&self, limit: u32, status: Option<&str>) -> Result<Vec<BlockInfo>> {
+        self.inner.list_found_blocks(limit, status)
+    }
+
+    pub fn list_payout_batches(&self, limit: u32) -> Result<Vec<PayoutInfo>> {
+        self.inner.list_payout_batches(limit)
+    }
+
+    pub fn health_check(&self) -> Result<HealthResponse> {
+        self.inner.health_check()
+    }
+
+    /// Invalidate the stats cache - called when events are broadcast
+    /// This is synchronous (moka future::Cache uses async for get/insert, but invalidate_all is sync)
+    pub fn invalidate_stats_cache(&self) {
+        self.stats_cache.invalidate_all();
     }
 }

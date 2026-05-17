@@ -32,6 +32,7 @@ struct BlockRow {
 }
 
 struct WorkerRow {
+    id: i64,
     payout_address: String,
     payout_address_short: String,
     worker_suffix: String,
@@ -41,12 +42,14 @@ struct WorkerRow {
 }
 
 pub async fn home_page(State(state): State<AppState>) -> impl IntoResponse {
-    let db = PublicDb::new(state.db.clone());
-
     // Get network difficulty directly from DifficultyCache (live from NNG MiningTemplate)
     let network_difficulty = state.diff_cache.network_diff();
 
-    let stats = db.get_pool_stats(network_difficulty).unwrap_or_default();
+    // Use cached_db for stats (same cache as WebSocket broadcasts)
+    let stats = state.cached_db.get_pool_stats(network_difficulty).await.unwrap_or_default();
+    
+    // Use db directly for blocks/workers (these don't change as frequently)
+    let db = PublicDb::new(state.db.clone());
     let blocks = db.list_found_blocks(10, None).unwrap_or_default();
     let workers = db.list_workers(10, 0).unwrap_or_default();
 
@@ -79,6 +82,7 @@ pub async fn home_page(State(state): State<AppState>) -> impl IntoResponse {
         workers: workers
             .into_iter()
             .map(|w| WorkerRow {
+                id: w.id,
                 payout_address: w.payout_address.clone(),
                 payout_address_short: short_address(&w.payout_address),
                 worker_suffix: w.worker_suffix.unwrap_or_else(|| String::from("—")),

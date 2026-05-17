@@ -1,17 +1,17 @@
 //! GET /api/stats - Pool statistics
 
 use axum::{extract::State, Json};
-use crate::http::{AppState, PublicDb};
+use crate::http::AppState;
 use tracing::{error, info};
 
 pub async fn get_stats(State(state): State<AppState>) -> Json<crate::http::models::PoolStats> {
     info!("API request: GET /api/stats");
-    let db = PublicDb::new(state.db);
     
     // Get network difficulty directly from DifficultyCache (live from NNG MiningTemplate)
     let network_difficulty = state.diff_cache.network_diff();
     
-    match db.get_pool_stats(network_difficulty) {
+    // Use cached_db for consistent data with WebSocket broadcasts
+    match state.cached_db.get_pool_stats(network_difficulty).await {
         Ok(stats) => {
             info!(
                 active_miners = stats.active_miners,

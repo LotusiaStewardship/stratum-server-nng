@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+{% extends "http/base.html" %}
 
 {% block title %}{{ footer.pool_name }} - Lotus Mining Pool{% endblock %}
 
@@ -43,7 +43,7 @@
                     <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Time</th>
                 </tr>
             </thead>
-            <tbody class="divide-y divide-primary-700">
+            <tbody id="home-blocks-body" class="divide-y divide-primary-700">
                 {% for block in blocks %}
                 <tr class="hover:bg-primary-800 transition-colors">
                     <td class="px-4 py-4 text-primary-400 font-mono text-sm">{{ block.height }}</td>
@@ -87,18 +87,18 @@
                     <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Blocks</th>
                 </tr>
             </thead>
-            <tbody class="divide-y divide-primary-700">
+            <tbody id="home-workers-body" class="divide-y divide-primary-700">
                 {% for worker in workers %}
-                <tr class="hover:bg-primary-800 transition-colors">
+                <tr id="worker-{{ worker.id }}" class="hover:bg-primary-800 transition-colors">
                     <td class="px-4 py-4">
                         <a href="/miner/{{ worker.payout_address }}" class="text-primary-400 hover:text-primary-300 font-mono text-xs">
                             {{ worker.payout_address_short }}
                         </a>
                     </td>
                     <td class="px-4 py-4 text-gray-300 text-sm">{{ worker.worker_suffix }}</td>
-                    <td class="px-4 py-4 text-gray-300 text-sm">{{ worker.shares_accepted }}</td>
-                    <td class="px-4 py-4 text-gray-300 text-sm">{{ worker.shares_rejected }}</td>
-                    <td class="px-4 py-4 text-primary-400 text-sm">{{ worker.blocks_found }}</td>
+                    <td class="px-4 py-4 text-gray-300 text-sm shares-accepted">{{ worker.shares_accepted }}</td>
+                    <td class="px-4 py-4 text-gray-300 text-sm shares-rejected">{{ worker.shares_rejected }}</td>
+                    <td class="px-4 py-4 text-primary-400 text-sm blocks-found">{{ worker.blocks_found }}</td>
                 </tr>
                 {% endfor %}
             </tbody>

@@ -3,7 +3,7 @@ use clap::Parser;
 use stratum_server_nng::accounting::{AccountingDb, PayoutMethod};
 use stratum_server_nng::api::start_operator_api;
 use stratum_server_nng::config::{CliArgs, Config};
-use stratum_server_nng::http::start_http_dashboard;
+use stratum_server_nng::http::{start_http_dashboard, DashboardEventSender};
 use stratum_server_nng::payout::scheduler::run_payout_scheduler;
 use stratum_server_nng::stratum::diff_cache::DifficultyCache;
 use stratum_server_nng::stratum::network_diff::{DynamicDiffConfig, NetworkDifficultyTracker};
@@ -75,6 +75,9 @@ async fn main() -> Result<()> {
     let api_token = cfg.api_token.clone();
     let api_stats = stats.clone();
 
+    // HTTP dashboard event sender (only if enabled)
+    let events_tx = DashboardEventSender::new(cfg.http_enabled);
+    
     // HTTP dashboard
     let http_enabled = cfg.http_enabled;
     let http_db = db.clone();
@@ -82,6 +85,7 @@ async fn main() -> Result<()> {
     let http_stats = stats.clone();
     let http_pool_config = cfg.pool.clone();
     let http_diff_cache = diff_cache.clone();
+    let http_events_tx = events_tx.clone();
 
     let reconcile_db = db.clone();
     let reconcile_stats = stats.clone();
@@ -119,7 +123,7 @@ async fn main() -> Result<()> {
         );
     let http_task = tokio::spawn(async move {
         if http_enabled {
-            start_http_dashboard(http_bind, http_db, http_stats, http_pool_config, http_diff_cache).await
+            start_http_dashboard(http_bind, http_db, http_stats, http_pool_config, http_diff_cache, http_events_tx).await
         } else {
             tracing::info!("HTTP dashboard disabled by configuration");
             Ok(())
@@ -128,7 +132,7 @@ async fn main() -> Result<()> {
     let scheduler_task =
         tokio::spawn(async move { run_payout_scheduler(scheduler_cfg, scheduler_db).await });
     let stratum_task = tokio::spawn(async move {
-        run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache).await
+        run_stratum_server(stratum_cfg, stratum_db, stats.clone(), stratum_diff_cache, events_tx).await
     });
 
     let (api_res, stratum_res, _reconcile_res, scheduler_res, http_res) =
