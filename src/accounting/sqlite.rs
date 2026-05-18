@@ -1664,9 +1664,10 @@ impl AccountingDb {
         Ok(row)
     }
 
-    /// Calculate pool hashrate from recent shares (last 100 accepted shares)
+    /// Calculate pool hashrate and active miner count from recent shares.
     ///
-    /// Uses share-count-based window instead of time-based for statistical accuracy.
+    /// Uses share-count-based window (last 100 accepted shares) for statistical accuracy.
+    /// Both hashrate and active miner count use the same window for consistency.
     /// This matches lotusd's approach of using block-count windows for hashrate.
     ///
     /// # Returns
@@ -1715,12 +1716,12 @@ impl AccountingDb {
 
         // Edge case: if all shares have same timestamp or single share, return 0 hashrate
         if time_span <= 0.0 {
-            // Count active miners in last 10 minutes (time-based)
+            // Count active miners in the same share-count window for consistency
             let active_miners: i64 = conn.query_row(
                 "SELECT COUNT(DISTINCT worker_id) FROM shares
                  WHERE accepted = 1 AND stale = 0
-                 AND created_at >= datetime('now', '-10 minutes')",
-                [],
+                 ORDER BY created_at DESC LIMIT ?",
+                params![share_count],
                 |r| r.get(0),
             )?;
             return Ok((0.0, active_miners as u64));
@@ -1730,13 +1731,13 @@ impl AccountingDb {
         // 2^32 ≈ 4294967296 hashes per difficulty unit
         let hashrate = (total_work * 4294967296.0) / time_span;
 
-        // Count distinct active miners in last 10 minutes (time-based, not share-count)
-        // This ensures "active" means "submitted a share recently", not just "in last 100 shares"
+        // Count distinct active miners in the same share-count window for consistency
+        // Both hashrate and active miner count now use the last 100 accepted shares
         let active_miners: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT worker_id) FROM shares
              WHERE accepted = 1 AND stale = 0
-             AND created_at >= datetime('now', '-10 minutes')",
-            [],
+             ORDER BY created_at DESC LIMIT ?",
+            params![share_count],
             |r| r.get(0),
         )?;
 
@@ -2375,7 +2376,7 @@ mod tests {
 
         assert_eq!(active_miners, 2, "should have 2 active miners");
         assert!((hashrate - expected_hashrate).abs() < expected_hashrate * 0.01, 
-            "hashrate should be within 1%% of expected: expected {}, got {}", expected_hashrate, hashrate);
+            "hashrate should be within 1% of expected: expected {}, got {}", expected_hashrate, hashrate);
     }
 
     #[test]
@@ -2418,7 +2419,7 @@ mod tests {
         let expected_hashrate = expected_work * 4294967296.0 / 29.0;
 
         assert!((hashrate - expected_hashrate).abs() < expected_hashrate * 0.01, 
-            "hashrate should be within 1%% of expected: expected {}, got {}", expected_hashrate, hashrate);
+            "hashrate should be within 1% of expected: expected {}, got {}", expected_hashrate, hashrate);
     }
 
     #[test]
