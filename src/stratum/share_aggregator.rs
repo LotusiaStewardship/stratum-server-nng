@@ -191,8 +191,8 @@ impl ShareAggregator {
 
             // For each active worker, calculate hashrate and broadcast
             for (worker_id, accepted, rejected, stale, blocks, payout_address, worker_suffix) in active_workers {
-                // Query hashrate for this worker (5-min window)
-                let hashrate = match self.db.calculate_worker_hashrate(worker_id, 300) {
+                // Query hashrate for this worker (share-count-based window)
+                let hashrate = match self.db.calculate_worker_hashrate(worker_id) {
                     Ok(h) => h,
                     Err(e) => {
                         error!(worker_id, error = %e, "failed to calculate worker hashrate");

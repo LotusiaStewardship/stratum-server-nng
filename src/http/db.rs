@@ -30,7 +30,6 @@ impl PublicDb {
         let now = Utc::now();
         let day_ago = now - Duration::days(1);
         let week_ago = now - Duration::days(7);
-        let ten_min_ago = now - Duration::minutes(10);
 
         // Get block counts by status
         let block_summary = self.inner.found_block_state_summary().unwrap_or_else(|_| {
@@ -60,8 +59,8 @@ impl PublicDb {
             None => None,
         };
 
-        // Calculate pool hashrate from recent shares
-        let (hashrate, active_miners) = self.inner.calculate_pool_hashrate(&ten_min_ago.to_rfc3339())?;
+        // Calculate pool hashrate from recent shares (share-count-based window)
+        let (hashrate, active_miners) = self.inner.calculate_pool_hashrate()?;
 
         info!(
             hashrate = hashrate,

@@ -1664,58 +1664,144 @@ impl AccountingDb {
         Ok(row)
     }
 
-    /// Calculate pool hashrate from recent shares (last 10 minutes)
-    pub fn calculate_pool_hashrate(&self, since: &str) -> Result<(f64, u64)> {
+    /// Calculate pool hashrate from recent shares (last 100 accepted shares)
+    ///
+    /// Uses share-count-based window instead of time-based for statistical accuracy.
+    /// This matches lotusd's approach of using block-count windows for hashrate.
+    ///
+    /// # Returns
+    /// Tuple of (hashrate in H/s, active miner count)
+    pub fn calculate_pool_hashrate(&self) -> Result<(f64, u64)> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
 
-        // Total work = sum of accepted share difficulties in the time window
-        let total_work: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(difficulty), 0.0) FROM shares
-             WHERE accepted = 1 AND stale = 0 AND created_at >= ?",
-            params![since],
+        // Get the last 100 accepted shares to calculate time span
+        // This provides statistical significance while remaining responsive
+        let share_count: i64 = 100;
+
+        // First check if we have any shares
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shares WHERE accepted = 1 AND stale = 0",
+            [],
             |r| r.get(0),
         )?;
 
-        let active_miners: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT worker_id) FROM shares
-             WHERE accepted = 1 AND stale = 0 AND created_at >= ?",
-            params![since],
-            |r| r.get(0),
+        if count == 0 {
+            return Ok((0.0, 0));
+        }
+
+        // Get oldest and newest share timestamps, plus total work
+        let (total_work, min_time, max_time): (f64, String, String) = conn.query_row(
+            "SELECT COALESCE(SUM(difficulty), 0.0), MIN(created_at), MAX(created_at)
+             FROM (
+                 SELECT difficulty, created_at
+                 FROM shares
+                 WHERE accepted = 1 AND stale = 0
+                 ORDER BY created_at DESC
+                 LIMIT ?
+             )",
+            params![share_count],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+
+        // Parse timestamps and calculate actual time span
+        let min_dt = DateTime::parse_from_rfc3339(&min_time)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let max_dt = DateTime::parse_from_rfc3339(&max_time)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        let time_span = (max_dt - min_dt).num_seconds() as f64;
+
+        // Edge case: if all shares have same timestamp or single share, return 0 hashrate
+        if time_span <= 0.0 {
+            // Still count active miners even if no time delta
+            let active_miners: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT worker_id) FROM shares
+                 WHERE accepted = 1 AND stale = 0
+                 ORDER BY created_at DESC LIMIT ?",
+                params![share_count],
+                |r| r.get(0),
+            )?;
+            return Ok((0.0, active_miners as u64));
+        }
 
         // hashrate = total_work * 2^32 / time_window_seconds
         // 2^32 ≈ 4294967296 hashes per difficulty unit
-        let time_window = 600.0; // 10 minutes
-        let hashrate = (total_work * 4294967296.0) / time_window;
+        let hashrate = (total_work * 4294967296.0) / time_span;
+
+        // Count distinct active miners in the window
+        let active_miners: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT worker_id) FROM shares
+             WHERE accepted = 1 AND stale = 0
+             ORDER BY created_at DESC LIMIT ?",
+            params![share_count],
+            |r| r.get(0),
+        )?;
+
         Ok((hashrate, active_miners as u64))
     }
 
-    /// Calculate hashrate for a specific worker over a time window
+    /// Calculate hashrate for a specific worker using share-count-based window
+    ///
+    /// Uses last 50 accepted shares to calculate time span for statistical accuracy.
+    /// This matches lotusd's approach and provides accurate hashrate regardless of
+    /// worker hashrate level (high or low).
     ///
     /// # Arguments
     /// * `worker_id` - The worker ID to calculate hashrate for
-    /// * `window_secs` - Time window in seconds (e.g., 300 for 5 minutes)
     ///
     /// # Returns
-    /// Hashrate in hashes per second, or 0.0 if no shares found
-    pub fn calculate_worker_hashrate(&self, worker_id: i64, window_secs: u64) -> Result<f64> {
-        use chrono::Duration;
-        let now = chrono::Utc::now();
-        let window_start = now - Duration::seconds(window_secs as i64);
-
+    /// Hashrate in hashes per second, or 0.0 if no shares found or insufficient time delta
+    pub fn calculate_worker_hashrate(&self, worker_id: i64) -> Result<f64> {
         let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
 
-        // Total work = sum of accepted share difficulties in the time window
-        let total_work: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(difficulty), 0.0) FROM shares
-             WHERE worker_id = ?1 AND accepted = 1 AND stale = 0 AND created_at >= ?2",
-            params![worker_id, window_start.to_rfc3339()],
+        // Get the last 50 accepted shares for this worker
+        let share_count: i64 = 50;
+
+        // First check if we have any shares for this worker
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shares WHERE worker_id = ? AND accepted = 1 AND stale = 0",
+            params![worker_id],
             |r| r.get(0),
         )?;
 
+        if count == 0 {
+            return Ok(0.0);
+        }
+
+        // Get oldest and newest share timestamps, plus total work
+        let (total_work, min_time, max_time): (f64, String, String) = conn.query_row(
+            "SELECT COALESCE(SUM(difficulty), 0.0), MIN(created_at), MAX(created_at)
+             FROM (
+                 SELECT difficulty, created_at
+                 FROM shares
+                 WHERE worker_id = ? AND accepted = 1 AND stale = 0
+                 ORDER BY created_at DESC
+                 LIMIT ?
+             )",
+            params![worker_id, share_count],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+        // Parse timestamps and calculate actual time span
+        let min_dt = DateTime::parse_from_rfc3339(&min_time)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let max_dt = DateTime::parse_from_rfc3339(&max_time)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        let time_span = (max_dt - min_dt).num_seconds() as f64;
+
+        // Edge case: if all shares have same timestamp or only one share, return 0
+        if time_span <= 0.0 {
+            return Ok(0.0);
+        }
+
         // hashrate = total_work * 2^32 / time_window_seconds
         // 2^32 ≈ 4294967296 hashes per difficulty unit
-        let hashrate = (total_work * 4294967296.0) / (window_secs as f64);
+        let hashrate = (total_work * 4294967296.0) / time_span;
         Ok(hashrate)
     }
 
@@ -2223,5 +2309,159 @@ mod tests {
             assert!(!window_share_ids.contains(excluded_share_id), 
                 "share {} should be excluded", excluded_share_id);
         }
+    }
+
+    #[test]
+    fn test_pool_hashrate_share_count_based() {
+        use chrono::Duration;
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert test workers
+        let worker1 = db.upsert_worker("addr1", None).unwrap();
+        let worker2 = db.upsert_worker("addr2", None).unwrap();
+
+        // Insert shares with known difficulties over a known time span
+        // We'll insert shares at specific times to get a predictable hashrate
+        let base_time = Utc::now() - Duration::seconds(100);
+        let template_id = 1u64;
+
+        // Insert 50 shares for worker1 at difficulty 1.0 over 50 seconds
+        for i in 0..50 {
+            let share_time = base_time + Duration::seconds(i);
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    worker1.id,
+                    template_id as i64,
+                    1.0,
+                    1,
+                    0,
+                    format!("pool_hashrate_test_{}", i),
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+        }
+
+        // Insert 50 shares for worker2 at difficulty 2.0 over 50 seconds
+        for i in 0..50 {
+            let share_time = base_time + Duration::seconds(i);
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    worker2.id,
+                    template_id as i64,
+                    2.0,
+                    1,
+                    0,
+                    format!("pool_hashrate_test_w2_{}", i),
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+        }
+
+        // Calculate hashrate (should use last 100 shares = all 100 shares we inserted)
+        let (hashrate, active_miners) = db.calculate_pool_hashrate().unwrap();
+
+        // Expected: 50 shares * 1.0 + 50 shares * 2.0 = 150 total work
+        // Time window: 49 seconds (from second 0 to second 49)
+        // Hashrate: 150 * 2^32 / 49
+        let expected_work = 50.0 * 1.0 + 50.0 * 2.0;
+        let expected_hashrate = expected_work * 4294967296.0 / 49.0;
+
+        assert_eq!(active_miners, 2, "should have 2 active miners");
+        assert!((hashrate - expected_hashrate).abs() < expected_hashrate * 0.01, 
+            "hashrate should be within 1%% of expected: expected {}, got {}", expected_hashrate, hashrate);
+    }
+
+    #[test]
+    fn test_worker_hashrate_share_count_based() {
+        use chrono::Duration;
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Insert test worker
+        let worker = db.upsert_worker("addr1", None).unwrap();
+        let template_id = 1u64;
+
+        // Insert 30 shares at difficulty 1.0 over 30 seconds
+        let base_time = Utc::now() - Duration::seconds(30);
+        for i in 0..30 {
+            let share_time = base_time + Duration::seconds(i);
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    worker.id,
+                    template_id as i64,
+                    1.0,
+                    1,
+                    0,
+                    format!("worker_hashrate_test_{}", i),
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+        }
+
+        // Calculate hashrate (should use last 50 shares, but we only have 30)
+        let hashrate = db.calculate_worker_hashrate(worker.id).unwrap();
+
+        // Expected: 30 shares * 1.0 = 30 total work
+        // Time window: 29 seconds (from second 0 to second 29)
+        // Hashrate: 30 * 2^32 / 29
+        let expected_work = 30.0 * 1.0;
+        let expected_hashrate = expected_work * 4294967296.0 / 29.0;
+
+        assert!((hashrate - expected_hashrate).abs() < expected_hashrate * 0.01, 
+            "hashrate should be within 1%% of expected: expected {}, got {}", expected_hashrate, hashrate);
+    }
+
+    #[test]
+    fn test_hashrate_zero_shares() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // No shares inserted
+        let (hashrate, active_miners) = db.calculate_pool_hashrate().unwrap();
+        assert_eq!(hashrate, 0.0, "pool hashrate should be 0 with no shares");
+        assert_eq!(active_miners, 0, "active miners should be 0 with no shares");
+
+        let worker = db.upsert_worker("addr1", None).unwrap();
+        let hashrate = db.calculate_worker_hashrate(worker.id).unwrap();
+        assert_eq!(hashrate, 0.0, "worker hashrate should be 0 with no shares");
+    }
+
+    #[test]
+    fn test_hashrate_single_share() {
+        let f = NamedTempFile::new().unwrap();
+        let db = AccountingDb::open(f.path().to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        let worker = db.upsert_worker("addr1", None).unwrap();
+        let template_id = 1u64;
+
+        // Insert single share
+        db.conn.lock().unwrap().execute(
+            "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                worker.id,
+                template_id as i64,
+                1.0,
+                1,
+                0,
+                "single_share_test",
+                Utc::now().to_rfc3339()
+            ],
+        ).unwrap();
+
+        // Single share should return 0 hashrate (no time delta)
+        let hashrate = db.calculate_worker_hashrate(worker.id).unwrap();
+        assert_eq!(hashrate, 0.0, "single share should return 0 hashrate (no time delta)");
     }
 }
