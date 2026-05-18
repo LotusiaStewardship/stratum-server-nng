@@ -43,13 +43,13 @@ The Stratum server uses a **pub/sub notification + RPC fetch** pattern for minin
 │                        stratum-server-nng                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│      ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│      │   Stratum    │  │  Operator    │  │    Payout    │       │
-│      │    Server    │  │     API      │  │   Scheduler  │       │
-│      │  (TCP:3334)  │  │ (TCP:18080)  │  │   (Hourly)   │       │
-│      └──────┬───────┘  └──────────────┘  └──────┬───────┘       │
-│             │                                    │              │
-│      ┌──────▼────────────────────────────────────▼───────┐      │
+│       ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│       │   Stratum    │  │  Operator    │  │    Payout    │      │
+│       │    Server    │  │     API      │  │   Scheduler  │      │
+│       │  (TCP:3334)  │  │ (TCP:18080)  │  │   (Hourly)   │      │
+│       └──────┬───────┘  └──────────────┘  └──────┬───────┘      │
+│              │                                   │              │
+│      ┌───────▼───────────────────────────────────▼───────┐      │
 │      │              Accounting Database                  │      │
 │      │         (SQLite: stratum-accounting)              │      │
 │      │     - workers, shares, rounds, found_blocks       │      │
@@ -62,8 +62,8 @@ The Stratum server uses a **pub/sub notification + RPC fetch** pattern for minin
 │      │  - Pub/Sub       │              │  - getrawtx      │     │
 │      │                  │              │                  │     │
 │      │  Pub/Sub events: │              │                  │     │
-│      │  • miningwrkchg  │──fetches──►  │  MiningTemplate  │     │
-│      │  • blkconnected  │  template    │  (full payload)  │     │
+│      │  • miningwrkchg  │───fetches───►│  MiningTemplate  │     │
+│      │  • blkconnected  │   template   │  (full payload)  │     │
 │      │  • blkdisconctd  │              │                  │     │
 │      └──────────────────┘              └──────────────────┘     │
 │                                                                 │
