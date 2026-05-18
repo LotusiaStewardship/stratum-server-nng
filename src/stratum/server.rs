@@ -37,6 +37,8 @@ pub struct RuntimeStats {
     pub found_block_persist_ok_total: AtomicU64,
     pub found_block_persist_error_total: AtomicU64,
     pub found_block_observed_not_persisted_total: AtomicU64,
+    /// Current blockchain tip height (from node events)
+    pub tip_height: AtomicI64,
 }
 
 impl RuntimeStats {
@@ -58,6 +60,16 @@ impl RuntimeStats {
                 .found_block_observed_not_persisted_total
                 .load(Ordering::Relaxed),
         }
+    }
+
+    /// Get current blockchain tip height
+    pub fn get_tip_height(&self) -> i64 {
+        self.tip_height.load(Ordering::SeqCst)
+    }
+
+    /// Set blockchain tip height from node events
+    pub fn set_tip_height(&self, height: i64) {
+        self.tip_height.store(height, Ordering::SeqCst);
     }
 }
 
@@ -265,6 +277,8 @@ pub async fn run_stratum_server(
     db: AccountingDb,
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
+    events_tx: crate::http::DashboardEventSender,
+    share_aggregator: crate::stratum::share_aggregator::ShareAggregator,
 ) -> Result<()> {
     let listener = TcpListener::bind(&cfg.stratum_bind).await?;
     info!(bind = %cfg.stratum_bind, "stratum server listening");
@@ -302,7 +316,7 @@ pub async fn run_stratum_server(
 
     // Track tip height from blkconnected events for confirmation computation
     // Initialize from node's actual tip, not reconciliation result
-    let tip_height = Arc::new(AtomicI64::new(node_tip));
+    stats.set_tip_height(node_tip);
 
     let runtime = StratumRuntime::new(cfg.max_jobs_cache);
     refresh_job_from_node(
@@ -329,7 +343,7 @@ pub async fn run_stratum_server(
     let db_events = db.clone();
     let diff_cache_events = diff_cache.clone();
     let debug = cfg.debug;
-    let tip_height_events = tip_height.clone();
+
     let min_confirmations = cfg.pool.pplns.min_confirmations as i64;
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<NodeEvent>();
@@ -370,7 +384,7 @@ pub async fn run_stratum_server(
                             }
                             NodeEvent::BlockConnected { height, hash: _, prev_hash: _ } => {
                                 // Accounting only — process immediately, no debounce
-                                tip_height_events.store(*height, Ordering::SeqCst);
+                                stats_events.set_tip_height(*height);
                                 if let Err(err) = db_events.mark_blocks_matured(
                                     *height,
                                     min_confirmations,
@@ -414,7 +428,7 @@ pub async fn run_stratum_server(
                                     }
                                     Err(err) => error!(error = %err, "failed checking orphaned found_block"),
                                 }
-                                tip_height_events.store(height - 1, Ordering::SeqCst);
+                                stats_events.set_tip_height(height - 1);
                                 if let Err(err) = db_events.mark_blocks_matured(
                                     height - 1,
                                     min_confirmations,
@@ -457,7 +471,7 @@ pub async fn run_stratum_server(
                                 last_template_epoch = Some(template_epoch);
 
                                 // Update tip height tracker for confirmation computation
-                                tip_height_events.store(tip_height, Ordering::SeqCst);
+                                stats_events.set_tip_height(tip_height);
 
                                 // Mark matured blocks based on new tip using configured min_confirmations
                                 if let Err(err) = db_events.mark_blocks_matured(
@@ -532,6 +546,8 @@ pub async fn run_stratum_server(
         let stats = stats.clone();
         let pool_scripts = pool_scripts.clone();
         let diff_cache = diff_cache.clone();
+        let events_tx = events_tx.clone();
+        let share_aggregator = share_aggregator.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_conn(
                 socket,
@@ -542,6 +558,8 @@ pub async fn run_stratum_server(
                 adapter,
                 stats,
                 diff_cache,
+                events_tx,
+                share_aggregator,
             )
             .await
             {
@@ -815,6 +833,8 @@ async fn handle_conn(
     adapter: Arc<dyn NodeMiningAdapter>,
     stats: Arc<RuntimeStats>,
     diff_cache: DifficultyCache,
+    events_tx: crate::http::DashboardEventSender,
+    share_aggregator: crate::stratum::share_aggregator::ShareAggregator,
 ) -> Result<()> {
     let session_id = format!("s{:016x}", thread_rng().r#gen::<u64>());
     let mut session = SessionState::new(session_id.clone());
@@ -1075,6 +1095,13 @@ async fn handle_conn(
                         let round_id = db.resolve_round_for_template(job.template_id)?;
                         let Some(assigned) = assigned_jobs.get(job_id).cloned() else {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                true, // stale
+                            );
                             let _ = db.record_share_outcome(ShareOutcomeInsert {
                                 session_id: &session_id,
                                 worker_id: worker_row.id,
@@ -1108,6 +1135,13 @@ async fn handle_conn(
                         };
                         if submit.ntime_hex_6b != assigned.ntime_hex_6b {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, submit_ntime = %submit.ntime_hex_6b, assigned_ntime = %assigned.ntime_hex_6b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: ntime-mismatch");
                             let err = StratumResponse::rejected(req_id.clone(), 20, "ntime-mismatch");
                             send_json_line(&mut write_half, &err).await?;
@@ -1121,6 +1155,13 @@ async fn handle_conn(
                             share_difficulty,
                         ) {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, difficulty = share_difficulty, nonce = %submit.nonce_hex_8b, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: low-difficulty-share");
                             let err = StratumResponse::rejected(req_id.clone(), 23, "low-difficulty-share");
                             send_json_line(&mut write_half, &err).await?;
@@ -1251,6 +1292,13 @@ async fn handle_conn(
                             });
 
                             share_stats.accepted += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                true,
+                                false,
+                            );
                             info!(
                                 session_id = %session_id,
                                 req_id = %req_id,
@@ -1309,6 +1357,13 @@ async fn handle_conn(
                         };
                         if !merkle_matches_block {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(session_id = %session_id, req_id = %req_id, worker = %submit.worker_name, job_id = %submit.job_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, "submit rejected: bad-txnmrklroot");
                             let err = StratumResponse::rejected(req_id.clone(), 20, "bad-txnmrklroot");
                             send_json_line(&mut write_half, &err).await?;
@@ -1380,6 +1435,13 @@ async fn handle_conn(
 
                         if !share_accepted {
                             share_stats.rejected += 1;
+                            share_aggregator.record_share(
+                                worker_row.id,
+                                worker_row.payout_address.clone(),
+                                worker.worker_suffix.clone(),
+                                false,
+                                false, // not stale
+                            );
                             warn!(
                                 session_id = %session_id,
                                 req_id = %req_id,
@@ -1439,6 +1501,31 @@ async fn handle_conn(
                                     stats
                                         .found_block_persist_ok_total
                                         .fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Emit block found event for real-time dashboard updates
+                                    if events_tx.is_enabled() {
+                                        use chrono::Utc;
+                                        use crate::http::BlockFoundEvent;
+                                        use crate::http::DashboardEvent;
+                                        
+                                        let event = BlockFoundEvent {
+                                            height: job.block_height as i64,
+                                            hash: submit_block_hash.clone(),
+                                            status: "confirmed".to_string(),
+                                            confirmations: 1,
+                                            found_by: submit.worker_name.clone(),
+                                            payout_address: worker_row.payout_address.clone(),
+                                            found_at: Utc::now(),
+                                        };
+                                        events_tx.send(DashboardEvent::BlockFound(event));
+                                    }
+                                    
+                                    // Record block for share aggregation
+                                    share_aggregator.record_block(
+                                        worker_row.id,
+                                        worker_row.payout_address.clone(),
+                                        worker.worker_suffix.clone(),
+                                    );
                                 }
                                 Err(err) => {
                                     stats
@@ -1540,4 +1627,30 @@ async fn handle_conn(
 
     info!(session_id = %session_id, accepted = share_stats.accepted, rejected = share_stats.rejected, errored = share_stats.errored, authorized_workers = session.authorized_workers.len(), active_jobs = session.active_jobs.len(), assigned_jobs = assigned_jobs.len(), "stratum session ended");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_stats_tip_height() {
+        let stats = RuntimeStats::default();
+        
+        // Initial tip height should be 0
+        assert_eq!(stats.get_tip_height(), 0);
+        
+        // Set tip height to 100
+        stats.set_tip_height(100);
+        assert_eq!(stats.get_tip_height(), 100);
+        
+        // Update tip height to 200
+        stats.set_tip_height(200);
+        assert_eq!(stats.get_tip_height(), 200);
+        
+        // Verify confirmations calculation would work correctly
+        let block_height = 150;
+        let confirmations = stats.get_tip_height() - block_height + 1;
+        assert_eq!(confirmations, 51);
+    }
 }

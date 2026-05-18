@@ -1637,6 +1637,196 @@ impl AccountingDb {
             None => Ok(None),
         }
     }
+
+    /// Count found blocks since a given timestamp
+    pub fn count_blocks_since(&self, since: &str) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM found_blocks 
+             WHERE created_at >= ? AND status != 'orphaned'",
+            params![since],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Get last found block (non-orphaned)
+    pub fn get_last_found_block(&self) -> Result<Option<(i64, String, String)>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn.query_row(
+            "SELECT height, block_hash, created_at 
+             FROM found_blocks 
+             WHERE status != 'orphaned' 
+             ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Calculate pool hashrate from recent shares (last 10 minutes)
+    pub fn calculate_pool_hashrate(&self, since: &str) -> Result<(f64, u64)> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+
+        // Total work = sum of accepted share difficulties in the time window
+        let total_work: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(difficulty), 0.0) FROM shares
+             WHERE accepted = 1 AND stale = 0 AND created_at >= ?",
+            params![since],
+            |r| r.get(0),
+        )?;
+
+        let active_miners: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT worker_id) FROM shares
+             WHERE accepted = 1 AND stale = 0 AND created_at >= ?",
+            params![since],
+            |r| r.get(0),
+        )?;
+
+        // hashrate = total_work * 2^32 / time_window_seconds
+        // 2^32 ≈ 4294967296 hashes per difficulty unit
+        let time_window = 600.0; // 10 minutes
+        let hashrate = (total_work * 4294967296.0) / time_window;
+        Ok((hashrate, active_miners as u64))
+    }
+
+    /// Calculate hashrate for a specific worker over a time window
+    ///
+    /// # Arguments
+    /// * `worker_id` - The worker ID to calculate hashrate for
+    /// * `window_secs` - Time window in seconds (e.g., 300 for 5 minutes)
+    ///
+    /// # Returns
+    /// Hashrate in hashes per second, or 0.0 if no shares found
+    pub fn calculate_worker_hashrate(&self, worker_id: i64, window_secs: u64) -> Result<f64> {
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+        let window_start = now - Duration::seconds(window_secs as i64);
+
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+
+        // Total work = sum of accepted share difficulties in the time window
+        let total_work: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(difficulty), 0.0) FROM shares
+             WHERE worker_id = ?1 AND accepted = 1 AND stale = 0 AND created_at >= ?2",
+            params![worker_id, window_start.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+
+        // hashrate = total_work * 2^32 / time_window_seconds
+        // 2^32 ≈ 4294967296 hashes per difficulty unit
+        let hashrate = (total_work * 4294967296.0) / (window_secs as f64);
+        Ok(hashrate)
+    }
+
+    /// Get average network difficulty from recent shares
+    pub fn get_average_difficulty(&self, since: &str) -> Result<f64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let difficulty: f64 = conn.query_row(
+            "SELECT COALESCE(AVG(difficulty), 0.0) FROM shares
+             WHERE accepted = 1 AND stale = 0 AND created_at >= ?",
+            params![since],
+            |r| r.get(0),
+        )?;
+        Ok(difficulty)
+    }
+
+    /// Get last share time
+    pub fn get_last_share_time(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let row = conn.query_row(
+            "SELECT created_at FROM shares
+             ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Get current block tip height
+    pub fn get_tip_height(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let tip: i64 = conn.query_row(
+            "SELECT tip_height FROM block_tip LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .or_else(|_| {
+            // Fallback: use max height from found_blocks
+            conn.query_row(
+                "SELECT COALESCE(MAX(height), 0) FROM found_blocks",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0);
+        Ok(tip)
+    }
+
+    /// Count blocks found by a specific payout address
+    pub fn count_blocks_by_address(&self, payout_address: &str) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM found_blocks 
+             WHERE payout_address = ? AND status != 'orphaned'",
+            params![payout_address],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// List found blocks with optional status filter
+    pub fn list_found_blocks(&self, limit: u32, status: Option<&str>) -> Result<Vec<crate::accounting::FoundBlock>> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+
+        let mut query = String::from(
+            "SELECT fb.id, fb.round_id, fb.block_hash, fb.height, fb.status, 
+                    fb.template_id, fb.worker_id, fb.worker_name, fb.payout_address, 
+                    fb.persist_source, fb.disconnected_at, fb.orphan_reason, 
+                    fb.matured_at, fb.created_at
+             FROM found_blocks fb
+        ");
+
+        let mut params: Vec<String> = Vec::new();
+        if let Some(status_filter) = status {
+            if status_filter != "all" {
+                query.push_str(" WHERE fb.status = ?");
+                params.push(status_filter.to_string());
+            }
+        }
+
+        query.push_str(" ORDER BY fb.height DESC LIMIT ?");
+        params.push((limit as i64).to_string());
+
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |r| {
+            Ok(crate::accounting::FoundBlock {
+                id: r.get(0)?,
+                round_id: r.get(1)?,
+                block_hash: r.get(2)?,
+                height: r.get(3)?,
+                status: r.get(4)?,
+                template_id: r.get(5)?,
+                worker_id: r.get(6)?,
+                worker_name: r.get(7)?,
+                payout_address: r.get(8)?,
+                persist_source: r.get(9)?,
+                disconnected_at: r.get(10)?,
+                orphan_reason: r.get(11)?,
+                matured_at: r.get(12)?,
+                created_at: r.get(13)?,
+            })
+        })?;
+
+        let mut blocks = Vec::new();
+        for row in rows {
+            if let Ok(block) = row {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
+    }
 }
 
 pub struct ShareOutcomeInsert<'a> {

@@ -47,6 +47,20 @@ api_bind = "127.0.0.1:18080"
 # Can also be overridden by STRATUM_API_TOKEN in the environment.
 api_token = "devtoken"
 
+# -----------------------------------------------------------------------------
+# Public HTTP Dashboard Configuration
+# -----------------------------------------------------------------------------
+
+# Enable/disable the public HTTP dashboard
+http_enabled = true
+
+# HTTP server bind address (public-facing)
+# IMPORTANT: Use different ports for different networks:
+# - mainnet:  0.0.0.0:8080
+# - testnet:  0.0.0.0:18080
+# - regtest:  0.0.0.0:28080
+http_bind = "0.0.0.0:8080"
+
 # SQLite accounting database path.
 # Auto-derived from RPC port (see Network Configuration above).
 # Set explicitly to override auto-detection.
@@ -192,6 +206,9 @@ conn_idle_timeout_secs = 180
 
 # Bound how many jobs are kept in memory for stale-job / duplicate-request handling.
 max_jobs_cache = 512
+
+[pool]
+name = "Lotusia Pool"
 
 [pool.mining_identity]
 # The payout destination for block subsidies and mining rewards.

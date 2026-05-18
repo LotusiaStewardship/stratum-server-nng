@@ -9,7 +9,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.7", features = ["macros"] }
+askama = "0.12"
+askama_axum = "0.4"
+axum = { version = "0.7", features = ["macros", "ws"] }
 bitcoinsuite-bitcoind = { path = "../bitcoinsuite/bitcoinsuite-bitcoind" }
 bitcoinsuite-bitcoind-nng = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-nng" }
 bitcoinsuite-bitcoind-stratum = { path = "../bitcoinsuite/bitcoinsuite-bitcoind-stratum" }
@@ -17,7 +19,9 @@ bitcoinsuite-core = { path = "../bitcoinsuite/bitcoinsuite-core" }
 bitcoinsuite-ecc-secp256k1 = { path = "../bitcoinsuite/bitcoinsuite-ecc-secp256k1" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+dashmap = "6.1"
 hex = "0.4"
+moka = { version = "0.12", features = ["future"] }
 parking_lot = "0.12"
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json"] }
@@ -29,11 +33,14 @@ primitive-types = "0.12"
 thiserror = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
-url = "2"
+tower-http = { version = "0.5", features = ["compression-gzip", "trace", "fs"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 flatbuffers = "25"
+futures-util = "0.3"
+governor = { version = "0.6", features = ["std"] }
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

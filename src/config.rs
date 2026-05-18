@@ -19,6 +19,10 @@ pub struct Config {
     pub stratum_bind: String,
     pub api_bind: String,
     pub api_token: String,
+    #[serde(default = "default_http_enabled")]
+    pub http_enabled: bool,
+    #[serde(default = "default_http_bind")]
+    pub http_bind: String,
     #[serde(default)]
     pub sqlite_path: String,
     #[serde(default)]
@@ -37,6 +41,8 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
+    #[serde(default = "default_pool_name")]
+    pub name: String,
     pub mining_identity: MiningIdentityConfig,
     pub fee: FeeConfig,
     pub pplns: PplnsConfig,
@@ -119,6 +125,18 @@ fn default_invalid_percent() -> f64 {
 
 fn default_instance_id() -> String {
     "default".to_string()
+}
+
+fn default_http_enabled() -> bool {
+    true
+}
+
+fn default_http_bind() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_pool_name() -> String {
+    "Lotusia Pool".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
