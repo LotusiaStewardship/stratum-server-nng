@@ -1715,12 +1715,12 @@ impl AccountingDb {
 
         // Edge case: if all shares have same timestamp or single share, return 0 hashrate
         if time_span <= 0.0 {
-            // Still count active miners even if no time delta
+            // Count active miners in last 10 minutes (time-based)
             let active_miners: i64 = conn.query_row(
                 "SELECT COUNT(DISTINCT worker_id) FROM shares
                  WHERE accepted = 1 AND stale = 0
-                 ORDER BY created_at DESC LIMIT ?",
-                params![share_count],
+                 AND created_at >= datetime('now', '-10 minutes')",
+                [],
                 |r| r.get(0),
             )?;
             return Ok((0.0, active_miners as u64));
@@ -1730,12 +1730,13 @@ impl AccountingDb {
         // 2^32 ≈ 4294967296 hashes per difficulty unit
         let hashrate = (total_work * 4294967296.0) / time_span;
 
-        // Count distinct active miners in the window
+        // Count distinct active miners in last 10 minutes (time-based, not share-count)
+        // This ensures "active" means "submitted a share recently", not just "in last 100 shares"
         let active_miners: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT worker_id) FROM shares
              WHERE accepted = 1 AND stale = 0
-             ORDER BY created_at DESC LIMIT ?",
-            params![share_count],
+             AND created_at >= datetime('now', '-10 minutes')",
+            [],
             |r| r.get(0),
         )?;
 
