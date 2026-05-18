@@ -93,6 +93,9 @@ impl PublicDb {
                 // Get blocks found for this worker
                 let blocks_found = self.count_worker_blocks(&w.payout_address).unwrap_or(0);
 
+                // Calculate hashrate for this worker (uses share_outcomes table)
+                let hashrate = self.inner.calculate_worker_hashrate(w.worker_id).unwrap_or(0.0);
+
                 WorkerStats {
                     id: w.worker_id,
                     payout_address: w.payout_address,
@@ -101,7 +104,7 @@ impl PublicDb {
                     shares_rejected: w.rejected,
                     shares_stale: w.stale,
                     blocks_found,
-                    hashrate: 0.0, // TODO: Calculate from work_units
+                    hashrate,
                 }
             })
             .collect())
@@ -115,6 +118,8 @@ impl PublicDb {
             .filter(|w| w.payout_address == address)
             .map(|w| {
                 let blocks_found = self.count_worker_blocks(&w.payout_address).unwrap_or(0);
+                // Calculate hashrate for this worker (uses share_outcomes table)
+                let hashrate = self.inner.calculate_worker_hashrate(w.worker_id).unwrap_or(0.0);
                 WorkerStats {
                     id: w.worker_id,
                     payout_address: w.payout_address.clone(),
@@ -123,7 +128,7 @@ impl PublicDb {
                     shares_rejected: w.rejected,
                     shares_stale: w.stale,
                     blocks_found,
-                    hashrate: 0.0,
+                    hashrate,
                 }
             })
             .collect();
@@ -134,10 +139,12 @@ impl PublicDb {
 
         let total_shares: u64 = address_workers.iter().map(|w| w.shares_accepted).sum();
         let total_blocks: u64 = address_workers.iter().map(|w| w.blocks_found).sum();
+        // Calculate total hashrate by summing individual worker hashrates
+        let total_hashrate: f64 = address_workers.iter().map(|w| w.hashrate).sum();
 
         Ok(Some(MinerDetail {
             payout_address: address.to_string(),
-            total_hashrate: 0.0,
+            total_hashrate,
             workers: address_workers,
             total_shares_accepted: total_shares,
             total_blocks_found: total_blocks,

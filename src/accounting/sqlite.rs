@@ -1667,8 +1667,10 @@ impl AccountingDb {
     /// Calculate pool hashrate and active miner count from recent shares.
     ///
     /// Uses share-count-based window (last 100 accepted shares) for statistical accuracy.
-    /// Both hashrate and active miner count use the same window for consistency.
-    /// This matches lotusd's approach of using block-count windows for hashrate.
+    /// Queries share_outcomes table for status filtering (consistent with worker_accounting_summary),
+    /// JOINs with shares table for difficulty values.
+    ///
+    /// Active miner count uses time-based window (last 10 minutes) for accurate "active" definition.
     ///
     /// # Returns
     /// Tuple of (hashrate in H/s, active miner count)
@@ -1679,9 +1681,9 @@ impl AccountingDb {
         // This provides statistical significance while remaining responsive
         let share_count: i64 = 100;
 
-        // First check if we have any shares
+        // First check if we have any accepted shares in share_outcomes
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shares WHERE accepted = 1 AND stale = 0",
+            "SELECT COUNT(*) FROM share_outcomes WHERE status = 'accepted'",
             [],
             |r| r.get(0),
         )?;
@@ -1691,15 +1693,17 @@ impl AccountingDb {
         }
 
         // Get oldest and newest share timestamps, plus total work
+        // Use share_outcomes for status filtering, JOIN with shares for difficulty
         let (total_work, min_time, max_time): (f64, String, String) = conn.query_row(
-            "SELECT COALESCE(SUM(difficulty), 0.0), MIN(created_at), MAX(created_at)
+            "SELECT COALESCE(SUM(s.difficulty), 0.0), MIN(recent.created_at), MAX(recent.created_at)
              FROM (
-                 SELECT difficulty, created_at
-                 FROM shares
-                 WHERE accepted = 1 AND stale = 0
-                 ORDER BY created_at DESC
+                 SELECT so.share_id, so.created_at
+                 FROM share_outcomes so
+                 WHERE so.status = 'accepted'
+                 ORDER BY so.id DESC
                  LIMIT ?
-             )",
+             ) AS recent
+             JOIN shares s ON s.id = recent.share_id",
             params![share_count],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -1716,12 +1720,12 @@ impl AccountingDb {
 
         // Edge case: if all shares have same timestamp or single share, return 0 hashrate
         if time_span <= 0.0 {
-            // Count active miners in the same share-count window for consistency
+            // Count active miners using time-based window (last 10 minutes) for accurate "active" definition
             let active_miners: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT worker_id) FROM shares
-                 WHERE accepted = 1 AND stale = 0
-                 ORDER BY created_at DESC LIMIT ?",
-                params![share_count],
+                "SELECT COUNT(DISTINCT worker_id) FROM share_outcomes
+                 WHERE status = 'accepted'
+                 AND created_at >= datetime('now', '-10 minutes')",
+                [],
                 |r| r.get(0),
             )?;
             return Ok((0.0, active_miners as u64));
@@ -1731,13 +1735,13 @@ impl AccountingDb {
         // 2^32 ≈ 4294967296 hashes per difficulty unit
         let hashrate = (total_work * 4294967296.0) / time_span;
 
-        // Count distinct active miners in the same share-count window for consistency
-        // Both hashrate and active miner count now use the last 100 accepted shares
+        // Count active miners using time-based window (last 10 minutes)
+        // This provides accurate "currently active" count, not just "in last N shares"
         let active_miners: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT worker_id) FROM shares
-             WHERE accepted = 1 AND stale = 0
-             ORDER BY created_at DESC LIMIT ?",
-            params![share_count],
+            "SELECT COUNT(DISTINCT worker_id) FROM share_outcomes
+             WHERE status = 'accepted'
+             AND created_at >= datetime('now', '-10 minutes')",
+            [],
             |r| r.get(0),
         )?;
 
@@ -1746,9 +1750,9 @@ impl AccountingDb {
 
     /// Calculate hashrate for a specific worker using share-count-based window
     ///
-    /// Uses last 50 accepted shares to calculate time span for statistical accuracy.
-    /// This matches lotusd's approach and provides accurate hashrate regardless of
-    /// worker hashrate level (high or low).
+    /// Uses last 50 accepted shares from share_outcomes table (consistent with worker_accounting_summary),
+    /// JOINs with shares table for difficulty values.
+    /// Provides accurate hashrate regardless of worker hashrate level (high or low).
     ///
     /// # Arguments
     /// * `worker_id` - The worker ID to calculate hashrate for
@@ -1761,9 +1765,9 @@ impl AccountingDb {
         // Get the last 50 accepted shares for this worker
         let share_count: i64 = 50;
 
-        // First check if we have any shares for this worker
+        // First check if we have any shares for this worker in share_outcomes
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shares WHERE worker_id = ? AND accepted = 1 AND stale = 0",
+            "SELECT COUNT(*) FROM share_outcomes WHERE worker_id = ? AND status = 'accepted'",
             params![worker_id],
             |r| r.get(0),
         )?;
@@ -1773,15 +1777,17 @@ impl AccountingDb {
         }
 
         // Get oldest and newest share timestamps, plus total work
+        // Use share_outcomes for status filtering, JOIN with shares for difficulty
         let (total_work, min_time, max_time): (f64, String, String) = conn.query_row(
-            "SELECT COALESCE(SUM(difficulty), 0.0), MIN(created_at), MAX(created_at)
+            "SELECT COALESCE(SUM(s.difficulty), 0.0), MIN(recent.created_at), MAX(recent.created_at)
              FROM (
-                 SELECT difficulty, created_at
-                 FROM shares
-                 WHERE worker_id = ? AND accepted = 1 AND stale = 0
-                 ORDER BY created_at DESC
+                 SELECT so.share_id, so.created_at
+                 FROM share_outcomes so
+                 WHERE so.worker_id = ? AND so.status = 'accepted'
+                 ORDER BY so.id DESC
                  LIMIT ?
-             )",
+             ) AS recent
+             JOIN shares s ON s.id = recent.share_id",
             params![worker_id, share_count],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -2332,6 +2338,8 @@ mod tests {
         // Insert 50 shares for worker1 at difficulty 1.0 over 50 seconds
         for i in 0..50 {
             let share_time = base_time + Duration::seconds(i);
+            let dedupe_key = format!("pool_hashrate_test_{}", i);
+            // Insert into shares table
             db.conn.lock().unwrap().execute(
                 "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2341,7 +2349,31 @@ mod tests {
                     1.0,
                     1,
                     0,
-                    format!("pool_hashrate_test_{}", i),
+                    &dedupe_key,
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+            // Insert corresponding share_outcome
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO share_outcomes(session_id, worker_id, worker_name, payout_address, template_id, template_epoch, job_id, round_id, dedupe_key, status, reject_reason, node_result, low_diff_ok, network_target_ok, block_hash, share_id, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    "test_session",
+                    worker1.id,
+                    "worker1",
+                    "addr1",
+                    template_id as i64,
+                    1i64,
+                    "test_job",
+                    1i64,
+                    &dedupe_key,
+                    "accepted",
+                    None::<String>,
+                    "accepted",
+                    1,
+                    1,
+                    None::<String>,
+                    db.conn.lock().unwrap().last_insert_rowid(),
                     share_time.to_rfc3339()
                 ],
             ).unwrap();
@@ -2350,6 +2382,8 @@ mod tests {
         // Insert 50 shares for worker2 at difficulty 2.0 over 50 seconds
         for i in 0..50 {
             let share_time = base_time + Duration::seconds(i);
+            let dedupe_key = format!("pool_hashrate_test_w2_{}", i);
+            // Insert into shares table
             db.conn.lock().unwrap().execute(
                 "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2359,7 +2393,31 @@ mod tests {
                     2.0,
                     1,
                     0,
-                    format!("pool_hashrate_test_w2_{}", i),
+                    &dedupe_key,
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+            // Insert corresponding share_outcome
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO share_outcomes(session_id, worker_id, worker_name, payout_address, template_id, template_epoch, job_id, round_id, dedupe_key, status, reject_reason, node_result, low_diff_ok, network_target_ok, block_hash, share_id, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    "test_session",
+                    worker2.id,
+                    "worker2",
+                    "addr2",
+                    template_id as i64,
+                    1i64,
+                    "test_job",
+                    1i64,
+                    &dedupe_key,
+                    "accepted",
+                    None::<String>,
+                    "accepted",
+                    1,
+                    1,
+                    None::<String>,
+                    db.conn.lock().unwrap().last_insert_rowid(),
                     share_time.to_rfc3339()
                 ],
             ).unwrap();
@@ -2394,6 +2452,8 @@ mod tests {
         let base_time = Utc::now() - Duration::seconds(30);
         for i in 0..30 {
             let share_time = base_time + Duration::seconds(i);
+            let dedupe_key = format!("worker_hashrate_test_{}", i);
+            // Insert into shares table
             db.conn.lock().unwrap().execute(
                 "INSERT INTO shares(worker_id, template_id, difficulty, accepted, stale, dedupe_key, created_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2403,7 +2463,31 @@ mod tests {
                     1.0,
                     1,
                     0,
-                    format!("worker_hashrate_test_{}", i),
+                    &dedupe_key,
+                    share_time.to_rfc3339()
+                ],
+            ).unwrap();
+            // Insert corresponding share_outcome
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO share_outcomes(session_id, worker_id, worker_name, payout_address, template_id, template_epoch, job_id, round_id, dedupe_key, status, reject_reason, node_result, low_diff_ok, network_target_ok, block_hash, share_id, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    "test_session",
+                    worker.id,
+                    "test_worker",
+                    "addr1",
+                    template_id as i64,
+                    1i64,
+                    "test_job",
+                    1i64,
+                    &dedupe_key,
+                    "accepted",
+                    None::<String>,
+                    "accepted",
+                    1,
+                    1,
+                    None::<String>,
+                    db.conn.lock().unwrap().last_insert_rowid(),
                     share_time.to_rfc3339()
                 ],
             ).unwrap();
