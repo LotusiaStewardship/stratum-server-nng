@@ -2,6 +2,7 @@ use anyhow::Result;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 use tracing::info;
+use rusqlite::Connection;
 
 /// Graceful shutdown coordinator for managing server lifecycle.
 ///
@@ -11,6 +12,7 @@ pub struct ShutdownCoordinator {
     shutdown_tx: broadcast::Sender<()>,
     shutdown_timeout_secs: u64,
     flush_timeout_secs: u64,
+    db_conn: Option<std::sync::Arc<parking_lot::Mutex<Connection>>>,
 }
 
 impl ShutdownCoordinator {
@@ -26,6 +28,20 @@ impl ShutdownCoordinator {
             shutdown_tx,
             shutdown_timeout_secs: 30,
             flush_timeout_secs: 5,
+            db_conn: None,
+        }
+    }
+
+    /// Create a new shutdown coordinator with database connection for WAL checkpoint.
+    pub fn with_db_conn(
+        db_conn: std::sync::Arc<parking_lot::Mutex<Connection>>,
+    ) -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1024);
+        Self {
+            shutdown_tx,
+            shutdown_timeout_secs: 30,
+            flush_timeout_secs: 5,
+            db_conn: Some(db_conn),
         }
     }
 
@@ -42,21 +58,40 @@ impl ShutdownCoordinator {
         let _ = self.shutdown_tx.send(());
     }
 
+    /// Initiate emergency shutdown - immediate exit without flush.
+    pub fn initiate_emergency_shutdown(&self) {
+        info!("initiating emergency shutdown (no flush, no cleanup)");
+        let _ = self.shutdown_tx.send(());
+        // Don't wait for tasks - just exit
+    }
+
     /// Wait for all tasks to complete shutdown (max timeout).
+    /// Performs WAL checkpoint on database connection if available.
     pub async fn wait_for_completion(&self) -> Result<()> {
         info!(
             timeout_secs = self.shutdown_timeout_secs,
             "waiting for tasks to complete shutdown"
         );
 
-        // For Slice 1, we just wait for the timeout
-        // Future slices will track task handles and wait for them
+        // Wait for tasks to complete (with timeout)
         timeout(
             Duration::from_secs(self.shutdown_timeout_secs),
             tokio::time::sleep(Duration::from_millis(100)),
         )
         .await
         .map_err(|_| anyhow::anyhow!("shutdown timeout exceeded"))?;
+
+        // Perform WAL checkpoint if database connection is available
+        if let Some(conn) = &self.db_conn {
+            info!("performing WAL checkpoint");
+            let conn_guard = conn.lock();
+            conn_guard
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap_or_else(|e| {
+                    info!(error = %e, "WAL checkpoint failed (non-fatal)");
+                });
+            info!("WAL checkpoint complete");
+        }
 
         info!("shutdown complete");
         Ok(())

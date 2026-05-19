@@ -4,11 +4,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
+use parking_lot::Mutex;
+use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
 use crate::stratum_protocol::session::SessionState;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
+use crate::accounting::{ShareRepository, WorkerRepository, Share};
 
 /// TCP Stratum V1 server that accepts miner connections.
 pub struct StratumServer {
@@ -17,6 +20,8 @@ pub struct StratumServer {
     connected_miners: Arc<RwLock<u64>>,
     job_cache: Arc<crate::node_integration::JobCache>,
     shutdown_tx: broadcast::Sender<()>,
+    share_repo: Option<ShareRepository>,
+    worker_repo: Option<WorkerRepository>,
 }
 
 impl StratumServer {
@@ -25,13 +30,21 @@ impl StratumServer {
         bind_address: SocketAddr,
         job_cache: Arc<crate::node_integration::JobCache>,
         shutdown_tx: broadcast::Sender<()>,
+        db_conn: Option<Arc<Mutex<Connection>>>,
     ) -> Self {
+        let (share_repo, worker_repo) = if let Some(conn) = db_conn {
+            (Some(ShareRepository::new(conn.clone())), Some(WorkerRepository::new(conn)))
+        } else {
+            (None, None)
+        };
         Self {
             bind_address,
             session_counter: Arc::new(RwLock::new(0)),
             connected_miners: Arc::new(RwLock::new(0)),
             job_cache,
             shutdown_tx,
+            share_repo,
+            worker_repo,
         }
     }
 
@@ -60,6 +73,8 @@ impl StratumServer {
                             let connected_miners = self.connected_miners.clone();
                             let job_cache = self.job_cache.clone();
                             let shutdown_rx = shutdown_rx.resubscribe();
+                            let share_repo = self.share_repo.clone();
+                            let worker_repo = self.worker_repo.clone();
                             
                             tokio::spawn(async move {
                                 // Increment connected miners
@@ -71,6 +86,8 @@ impl StratumServer {
                                     session,
                                     job_cache,
                                     shutdown_rx,
+                                    share_repo,
+                                    worker_repo,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
                                 }
@@ -108,6 +125,8 @@ async fn handle_connection(
     mut session: SessionState,
     job_cache: Arc<crate::node_integration::JobCache>,
     mut shutdown_signal: broadcast::Receiver<()>,
+    share_repo: Option<ShareRepository>,
+    worker_repo: Option<WorkerRepository>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -163,7 +182,12 @@ async fn handle_connection(
                             Method::Submit => {
                                 // For Slice 1/2, accept all valid submits
                                 // Validation comes in Slice 3
-                                session.handle_submit(&req)
+                                handle_submit(
+                                    &req,
+                                    &session,
+                                    share_repo.as_ref(),
+                                    worker_repo.as_ref(),
+                                ).await
                             }
                             Method::Ping => {
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
@@ -223,6 +247,71 @@ fn create_notify(job: &MiningJob, _session_id: &str) -> serde_json::Value {
     })
 }
 
+/// Handle a mining.submit request and persist the share.
+async fn handle_submit(
+    req: &crate::stratum_protocol::protocol::StratumRequest,
+    session: &SessionState,
+    share_repo: Option<&ShareRepository>,
+    worker_repo: Option<&WorkerRepository>,
+) -> StratumResponse {
+    // First validate the submit shape via session
+    let session_resp = session.handle_submit(req);
+    
+    // If session validation failed, return the error
+    if !session_resp.error.is_null() {
+        return session_resp;
+    }
+    
+    // Extract submit parameters
+    let arr = req.params.as_array().cloned().unwrap_or_default();
+    let worker_name = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
+    let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+    let extranonce2 = arr.get(2).and_then(|v| v.as_str()).unwrap_or_default();
+    let ntime_hex = arr.get(3).and_then(|v| v.as_str()).unwrap_or_default();
+    let nonce_hex = arr.get(4).and_then(|v| v.as_str()).unwrap_or_default();
+    
+    // Parse worker name to get payout address and suffix
+    let worker_parsed = match crate::stratum_protocol::session::parse_worker_name(worker_name) {
+        Ok(w) => w,
+        Err(_) => {
+            return StratumResponse::rejected(req.id.clone(), 24, "unauthorized-worker");
+        }
+    };
+    
+    // Persist share if repositories are available
+    if let (Some(share_repo), Some(worker_repo)) = (share_repo, worker_repo) {
+        // Upsert worker to get worker_id
+        match worker_repo.upsert(&worker_parsed.payout_address, worker_parsed.worker_suffix.as_deref()) {
+            Ok(worker) => {
+                // Create share record
+                let share = Share {
+                    id: 0,
+                    worker_id: worker.id,
+                    session_id: session.session_id.clone(),
+                    job_id: job_id.to_string(),
+                    extranonce2: extranonce2.to_string(),
+                    ntime_hex_6b: ntime_hex.to_string(),
+                    nonce_hex_8b: nonce_hex.to_string(),
+                    difficulty: 1.0, // Fixed difficulty for Slice 1
+                    status: "accepted".to_string(), // All shares accepted in Slice 1
+                    reject_reason: None,
+                };
+                
+                // Insert share
+                if let Err(e) = share_repo.insert(&share) {
+                    warn!(error = %e, "failed to persist share");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to upsert worker");
+            }
+        }
+    }
+    
+    // Return success
+    StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +345,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None);
         
         // Server should start without error
         // (We can't easily test the full loop without blocking)
@@ -268,7 +357,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None);
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -302,7 +391,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
         
         // Spawn server in background
         let server_handle = tokio::spawn(async move {
@@ -367,7 +456,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -402,7 +491,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
         
         let server_handle = tokio::spawn(async move {
             server.run().await

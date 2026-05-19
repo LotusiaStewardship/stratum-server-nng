@@ -1,13 +1,13 @@
 use anyhow::Result;
 use rusqlite::Connection;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use parking_lot::Mutex;
-use tokio::signal;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use stratum_server_nng::config::Config;
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
@@ -24,23 +24,26 @@ async fn main() -> Result<()> {
 
     info!("stratum-server-nng starting (Slice 1 & 2: Minimal Server + NNG Integration)");
 
-    // Configuration
-    let nng_rpc_url = std::env::var("NNG_RPC_URL")
-        .unwrap_or_else(|_| "ipc:///tmp/lotusd.rpc".to_string());
-    let stratum_bind: SocketAddr = "0.0.0.0:3334".parse()?;
-    let http_bind: SocketAddr = "127.0.0.1:18080".parse()?;
-    let db_path = std::env::var("DATABASE_PATH")
-        .unwrap_or_else(|_| "stratum.db".to_string());
-
-    // Create shutdown coordinator
-    let shutdown = Arc::new(ShutdownCoordinator::new());
-    let shutdown_tx = shutdown.broadcast_channel();
+    // Load configuration
+    let config = Config::load()?;
+    info!(
+        stratum_bind = %config.stratum_bind,
+        api_bind = %config.api_bind,
+        nng_rpc_url = %config.nng_rpc_url,
+        sqlite_path = %config.sqlite_path,
+        "loaded configuration"
+    );
 
     // Initialize database
-    info!(path = %db_path, "initializing database");
-    let db_conn = Connection::open(&db_path)?;
+    info!(path = %config.sqlite_path, "initializing database");
+    let db_conn = Connection::open(&config.sqlite_path)?;
     init_schema(&db_conn)?;
     info!("database initialized");
+
+    // Create shutdown coordinator with database connection for WAL checkpoint
+    let db_conn_arc = Arc::new(Mutex::new(db_conn));
+    let shutdown = Arc::new(ShutdownCoordinator::with_db_conn(db_conn_arc.clone()));
+    let shutdown_tx = shutdown.broadcast_channel();
 
     // Create shared state
     let stats = Arc::new(RwLock::new(ServerStats::default()));
@@ -49,11 +52,11 @@ async fn main() -> Result<()> {
     };
 
     // Create NNG RPC client and job cache
-    let nng_client = Arc::new(NngRpcClient::new(nng_rpc_url.clone()));
+    let nng_client = Arc::new(NngRpcClient::new(config.nng_rpc_url.clone()));
     let job_cache = Arc::new(JobCache::new(512));
 
     // Connect to lotusd and fetch initial template
-    info!(url = %nng_rpc_url, "connecting to lotusd");
+    info!(url = %config.nng_rpc_url, "connecting to lotusd");
     nng_client.connect().await?;
     
     info!("fetching initial mining template");
@@ -65,7 +68,7 @@ async fn main() -> Result<()> {
     );
 
     // Convert template to job and cache it
-    let job = template_to_job(&template, "00000000");
+    let job = template_to_job(&template);
     job_cache.insert(job.clone()).await;
     info!(job_id = %job.job_id, "cached mining job");
 
@@ -75,16 +78,15 @@ async fn main() -> Result<()> {
         s.network_difficulty = Some(job.network_target_hex.clone());
     }
 
-    // Wrap database connection for thread-safe access
-    let _db_conn = Arc::new(Mutex::new(db_conn)); // Kept for future slices (share recording)
+    // Database connection already wrapped above for shutdown coordinator
 
     // Start HTTP API server
     let http_state = app_state.clone();
     let http_shutdown_signal = shutdown.signal();
     let http_handle = tokio::spawn(async move {
         let router = http_api::create_router(http_state);
-        let listener = tokio::net::TcpListener::bind(http_bind).await?;
-        info!(bind = %http_bind, "HTTP API listening");
+        let listener = tokio::net::TcpListener::bind(config.api_bind).await?;
+        info!(bind = %config.api_bind, "HTTP API listening");
 
         let mut shutdown_signal = http_shutdown_signal;
         
@@ -103,9 +105,10 @@ async fn main() -> Result<()> {
     // Start Stratum TCP server
     let stratum_shutdown_signal = shutdown.signal();
     let stratum_server = Arc::new(StratumServer::new(
-        stratum_bind,
+        config.stratum_bind,
         job_cache.clone(),
         shutdown_tx.clone(),
+        Some(db_conn_arc.clone()),
     ));
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {
@@ -146,22 +149,54 @@ async fn main() -> Result<()> {
     });
 
     // Wait for shutdown signal
-    info!(stratum = %stratum_bind, http = %http_bind, "server ready");
-    info!("press Ctrl+C to shutdown");
-    signal_ctrl_c(shutdown.clone()).await?;
+    info!(stratum = %config.stratum_bind, http = %config.api_bind, "server ready");
+    info!("press Ctrl+C for graceful shutdown, Ctrl+\\ for emergency shutdown");
+    let shutdown_type = wait_for_shutdown_signal().await?;
 
-    // Initiate graceful shutdown
-    shutdown.initiate_shutdown();
-
-    // Wait for tasks to complete
-    let _ = tokio::join!(http_handle, stratum_handle, stats_handle);
-
-    info!("server shutdown complete");
+    // Initiate shutdown (graceful or emergency)
+    match shutdown_type {
+        ShutdownType::Graceful => {
+            info!("initiating graceful shutdown");
+            shutdown.initiate_shutdown();
+            
+            // Wait for tasks to complete
+            let _ = tokio::join!(http_handle, stratum_handle, stats_handle);
+            
+            info!("server shutdown complete");
+        }
+        ShutdownType::Emergency => {
+            info!("initiating emergency shutdown (no flush)");
+            shutdown.initiate_emergency_shutdown();
+            // Exit immediately without waiting for tasks
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 
-async fn signal_ctrl_c(_shutdown: Arc<ShutdownCoordinator>) -> Result<()> {
-    signal::ctrl_c().await?;
-    info!("received SIGINT");
-    Ok(())
+#[derive(Debug, Clone, Copy)]
+enum ShutdownType {
+    Graceful,
+    Emergency,
+}
+
+async fn wait_for_shutdown_signal() -> Result<ShutdownType> {
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigquit = signal(SignalKind::quit())?;
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            info!("received SIGINT");
+            Ok(ShutdownType::Graceful)
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM");
+            Ok(ShutdownType::Graceful)
+        }
+        _ = sigquit.recv() => {
+            info!("received SIGQUIT");
+            Ok(ShutdownType::Emergency)
+        }
+    }
 }

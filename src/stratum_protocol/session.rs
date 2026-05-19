@@ -1,6 +1,7 @@
 use crate::stratum_protocol::protocol::{Method, StratumRequest, StratumResponse};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use rand::Rng;
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
@@ -15,9 +16,11 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(session_id: String) -> Self {
+        // Generate random extranonce1 (4 bytes = 8 hex chars)
+        let extranonce1 = format!("{:08x}", rand::thread_rng().gen::<u32>());
         Self {
             session_id,
-            extranonce1: "00000000".to_string(),
+            extranonce1,
             extranonce2_size: 4,
             is_subscribed: false,
             is_authorized: false,
@@ -118,7 +121,9 @@ mod tests {
         
         assert!(resp.error.is_null());
         assert!(session.is_subscribed);
-        assert_eq!(session.extranonce1, "00000000");
+        // extranonce1 should be 8 hex characters (4 bytes)
+        assert_eq!(session.extranonce1.len(), 8);
+        assert!(session.extranonce1.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(session.extranonce2_size, 4);
     }
 
@@ -214,5 +219,23 @@ mod tests {
     #[test]
     fn test_parse_worker_name_empty_suffix() {
         assert!(parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.").is_err());
+    }
+
+    #[test]
+    fn test_unique_extranonce1_per_session() {
+        // Create multiple sessions and verify they get different extranonce1 values
+        let session1 = SessionState::new("sess-1".to_string());
+        let session2 = SessionState::new("sess-2".to_string());
+        let session3 = SessionState::new("sess-3".to_string());
+        
+        // All should have valid 8-char hex extranonce1
+        assert_eq!(session1.extranonce1.len(), 8);
+        assert_eq!(session2.extranonce1.len(), 8);
+        assert_eq!(session3.extranonce1.len(), 8);
+        
+        // They should be different (probability of collision is extremely low)
+        assert_ne!(session1.extranonce1, session2.extranonce1);
+        assert_ne!(session2.extranonce1, session3.extranonce1);
+        assert_ne!(session1.extranonce1, session3.extranonce1);
     }
 }

@@ -3,7 +3,10 @@ use bitcoinsuite_bitcoind_nng::MiningTemplate;
 use bitcoinsuite_core::Hashed;
 
 /// Convert a MiningTemplate from lotusd into a MiningJob for stratum protocol.
-pub fn template_to_job(template: &MiningTemplate, _extranonce1: &str) -> MiningJob {
+/// 
+/// The coinbase1/coinbase2 from the template are used as-is. Each miner session
+/// has its own extranonce1 which the miner inserts between coinbase1 and coinbase2.
+pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
     MiningJob {
         job_id: format!("job-{}", template.template_id),
         template_id: template.template_id,
@@ -55,7 +58,7 @@ mod tests {
     #[test]
     fn test_template_to_job_basic_conversion() {
         let template = create_test_template();
-        let job = template_to_job(&template, "00000000");
+        let job = template_to_job(&template);
 
         assert_eq!(job.job_id, "job-42");
         assert_eq!(job.template_id, 42);
@@ -80,7 +83,7 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF,
         ]);
 
-        let job = template_to_job(&template, "00000000");
+        let job = template_to_job(&template);
 
         assert_eq!(
             job.network_target_hex,
@@ -97,7 +100,7 @@ mod tests {
             "branch3".to_string(),
         ];
 
-        let job = template_to_job(&template, "00000000");
+        let job = template_to_job(&template);
 
         assert_eq!(job.merkle_branches.len(), 3);
         assert_eq!(job.merkle_branches[0], "branch1");

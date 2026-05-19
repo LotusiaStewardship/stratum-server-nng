@@ -11,6 +11,7 @@ pub struct Worker {
     pub worker_suffix: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct WorkerRepository {
     conn: Arc<Mutex<Connection>>,
 }

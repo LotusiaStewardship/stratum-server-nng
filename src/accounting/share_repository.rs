@@ -18,6 +18,7 @@ pub struct Share {
     pub reject_reason: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ShareRepository {
     conn: Arc<Mutex<Connection>>,
 }
