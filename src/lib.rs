@@ -1,7 +1,6 @@
-pub mod accounting;
-pub mod api;
 pub mod config;
-pub mod http;
-pub mod nng;
-pub mod payout;
-pub mod stratum;
+pub mod stratum_protocol;
+pub mod share_processing;
+pub mod accounting;
+pub mod http_api;
+pub mod shutdown;

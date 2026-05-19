@@ -1,0 +1,143 @@
+use anyhow::Result;
+use rusqlite::{Connection, params};
+
+#[derive(Debug, Clone)]
+pub struct Worker {
+    pub id: i64,
+    pub payout_address: String,
+    pub worker_suffix: Option<String>,
+}
+
+pub struct WorkerRepository<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> WorkerRepository<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    pub fn upsert(&self, payout_address: &str, worker_suffix: Option<&str>) -> Result<Worker> {
+        // Convert empty string to NULL for storage
+        let suffix_value = worker_suffix.filter(|s| !s.is_empty());
+        
+        // Insert or get existing
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO workers (payout_address, worker_suffix) 
+             VALUES (?1, ?2) 
+             ON CONFLICT(payout_address, worker_suffix) DO UPDATE SET 
+             payout_address = excluded.payout_address
+             RETURNING id, payout_address, worker_suffix",
+        )?;
+
+        let worker = stmt.query_row(
+            params![payout_address, suffix_value],
+            |row| {
+                Ok(Worker {
+                    id: row.get(0)?,
+                    payout_address: row.get(1)?,
+                    worker_suffix: row.get(2)?,
+                })
+            },
+        )?;
+
+        Ok(worker)
+    }
+
+    pub fn get_by_id(&self, id: i64) -> Result<Option<Worker>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, payout_address, worker_suffix FROM workers WHERE id = ?1")?;
+
+        let worker = stmt.query_row([id], |row| {
+            Ok(Worker {
+                id: row.get(0)?,
+                payout_address: row.get(1)?,
+                worker_suffix: row.get(2)?,
+            })
+        });
+
+        match worker {
+            Ok(w) => Ok(Some(w)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounting::schema::init_schema;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_upsert_new_worker() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = WorkerRepository::new(&conn);
+        let worker = repo
+            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .unwrap();
+
+        assert_eq!(
+            worker.payout_address,
+            "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+        );
+        assert_eq!(worker.worker_suffix, Some("rig1".to_string()));
+        assert_eq!(worker.id, 1);
+    }
+
+    #[test]
+    fn test_upsert_existing_worker() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = WorkerRepository::new(&conn);
+        let worker1 = repo
+            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .unwrap();
+        let worker2 = repo
+            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .unwrap();
+
+        // Same ID, not a duplicate
+        assert_eq!(worker1.id, worker2.id);
+    }
+
+    #[test]
+    fn test_upsert_worker_no_suffix() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = WorkerRepository::new(&conn);
+        let worker = repo
+            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", None)
+            .unwrap();
+
+        assert_eq!(worker.worker_suffix, None);
+    }
+
+    #[test]
+    fn test_get_by_id() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = WorkerRepository::new(&conn);
+        let worker = repo
+            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .unwrap();
+
+        let fetched = repo.get_by_id(worker.id).unwrap().unwrap();
+        assert_eq!(fetched.id, worker.id);
+        assert_eq!(fetched.payout_address, worker.payout_address);
+
+        let not_found = repo.get_by_id(999).unwrap();
+        assert!(not_found.is_none());
+    }
+}
