@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Graceful shutdown coordinator for managing server lifecycle.
 ///

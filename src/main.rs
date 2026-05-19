@@ -7,16 +7,22 @@ use tracing_subscriber::FmtSubscriber;
 
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
+use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    let _subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
 
-    info!("stratum-server-nng starting (Slice 1: Minimal Server)");
+    info!("stratum-server-nng starting (Slice 2: NNG Template Integration)");
+
+    // Configuration
+    let nng_rpc_url = std::env::var("NNG_RPC_URL")
+        .unwrap_or_else(|_| "ipc:///tmp/lotusd.rpc".to_string());
+    let http_bind = "127.0.0.1:18080";
 
     // Create shutdown coordinator
     let shutdown = Arc::new(ShutdownCoordinator::new());
@@ -27,8 +33,34 @@ async fn main() -> Result<()> {
         stats: stats.clone(),
     };
 
+    // Create NNG RPC client and job cache
+    let nng_client = Arc::new(NngRpcClient::new(nng_rpc_url.clone()));
+    let job_cache = Arc::new(JobCache::new(512));
+
+    // Connect to lotusd and fetch initial template
+    info!(url = %nng_rpc_url, "connecting to lotusd");
+    nng_client.connect().await?;
+    
+    info!("fetching initial mining template");
+    let template = nng_client.get_mining_template().await?;
+    info!(
+        template_id = template.template_id,
+        height = template.height,
+        "fetched mining template"
+    );
+
+    // Convert template to job and cache it
+    let job = template_to_job(&template, "00000000");
+    job_cache.insert(job.clone()).await;
+    info!(job_id = %job.job_id, "cached mining job");
+
+    // Update stats with network difficulty
+    {
+        let mut s = stats.write().await;
+        s.network_difficulty = Some(job.network_target_hex.clone());
+    }
+
     // Start HTTP API server
-    let http_bind = "127.0.0.1:18080";
     let http_state = app_state.clone();
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {
@@ -84,7 +116,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn signal_ctrl_c(shutdown: Arc<ShutdownCoordinator>) -> Result<()> {
+async fn signal_ctrl_c(_shutdown: Arc<ShutdownCoordinator>) -> Result<()> {
     signal::ctrl_c().await?;
     info!("received SIGINT");
     Ok(())

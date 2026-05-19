@@ -1,6 +1,5 @@
 use axum::{
     extract::State,
-    http::StatusCode,
     response::Json,
     routing::get,
     Router,
@@ -21,6 +20,7 @@ pub struct ServerStats {
     pub total_shares: i64,
     pub accepted_shares: i64,
     pub rejected_shares: i64,
+    pub network_difficulty: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -36,6 +36,7 @@ pub struct StatsResponse {
     pub accepted_shares: i64,
     pub rejected_shares: i64,
     pub accepted_pct: f64,
+    pub network_difficulty: Option<String>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -67,6 +68,7 @@ async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
         accepted_shares: stats.accepted_shares,
         rejected_shares: stats.rejected_shares,
         accepted_pct,
+        network_difficulty: stats.network_difficulty.clone(),
     })
 }
 
@@ -123,5 +125,23 @@ mod tests {
 
         assert_eq!(response.total_shares, 0);
         assert_eq!(response.accepted_pct, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_stats_response_with_network_difficulty() {
+        let stats = ServerStats {
+            total_shares: 100,
+            accepted_shares: 95,
+            rejected_shares: 5,
+            network_difficulty: Some("ffffffff".to_string()),
+            ..Default::default()
+        };
+
+        let response = stats_handler(State(AppState {
+            stats: Arc::new(RwLock::new(stats)),
+        }))
+        .await;
+
+        assert_eq!(response.network_difficulty, Some("ffffffff".to_string()));
     }
 }

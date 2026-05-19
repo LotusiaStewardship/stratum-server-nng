@@ -8,10 +8,10 @@
 
 ## Slice Overview
 
-| # | Title | Type | Blocked By | Estimated Effort |
-|---|-------|------|------------|------------------|
-| 1 | Minimal Stratum Server (Tracer Bullet) | AFK | None | 1 day |
-| 2 | NNG Template Integration | AFK | #1 | 1 day |
+| # | Title | Type | Blocked By | Estimated Effort | Status |
+|---|-------|------|------------|------------------|--------|
+| 1 | Minimal Stratum Server (Tracer Bullet) | AFK | None | 1 day | ✅ Done |
+| 2 | NNG Template Integration | AFK | #1 | 1 day | ✅ Done |
 | 3 | Share Validation Pipeline | AFK | #2 | 1 day |
 | 4 | Per-Session VarDiff | AFK | #3 | 1 day |
 | 5 | Worker and Round Accounting | AFK | #3 | 1 day |
@@ -182,20 +182,22 @@ CREATE INDEX idx_shares_created_at ON shares(created_at);
 
 ## Slice 2: NNG Template Integration
 
+**Status:** ✅ Completed 2026-05-18
+
 ### What to build
 
 Connect to lotusd via NNG, fetch real mining templates on startup, and distribute them to miners via `mining.notify`. Replace static job with dynamic template from node.
 
 ### Acceptance criteria
 
-- [ ] NNG RPC client connects to configured `nng_rpc_url`
-- [ ] On startup, fetch `MiningTemplate` via NNG RPC `get_mining_template`
-- [ ] Template is converted to `MiningJob` and cached in memory
-- [ ] After authorize, miner receives `mining.notify` with real template data
-- [ ] Job cache supports multiple jobs (LRU eviction, max 512 jobs)
-- [ ] `GET /api/v1/stats` includes network difficulty from template
-- [ ] Unit tests for template → job conversion
-- [ ] Integration test: fetch template from lotusd (mocked or real node)
+- [x] NNG RPC client connects to configured `nng_rpc_url`
+- [x] On startup, fetch `MiningTemplate` via NNG RPC `get_mining_template`
+- [x] Template is converted to `MiningJob` and cached in memory
+- [x] After authorize, miner receives `mining.notify` with real template data
+- [x] Job cache supports multiple jobs (LRU eviction, max 512 jobs)
+- [x] `GET /api/v1/stats` includes network difficulty from template
+- [x] Unit tests for template → job conversion
+- [x] Integration test: fetch template from lotusd (mocked or real node)
 
 ### Testing scope
 
