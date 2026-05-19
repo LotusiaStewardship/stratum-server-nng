@@ -1,6 +1,6 @@
 use crate::stratum_protocol::job::MiningJob;
 use bitcoinsuite_bitcoind_nng::MiningTemplate;
-use bitcoinsuite_core::Hashed;
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 
 /// Convert a MiningTemplate from lotusd into a MiningJob for stratum protocol.
 /// 
@@ -13,6 +13,21 @@ use bitcoinsuite_core::Hashed;
 /// increasing counter from lotusd (not a unix timestamp despite the name).
 /// On subsequent `miningwrkchg` events (Slice 6), the epoch is incremented.
 pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
+    // Extract header fields from serialized LotusHeader bytes
+    let (epoch_hash, extended_metadata_hash, block_size) = if !template.header.is_empty() {
+        let mut data = Bytes::from_slice(&template.header);
+        match LotusHeader::deser(&mut data) {
+            Ok(header) => (
+                header.epoch_hash.to_hex_be(),
+                header.extended_metadata_hash.to_hex_be(),
+                header.size,
+            ),
+            Err(_) => (String::new(), String::new(), 0),
+        }
+    } else {
+        (String::new(), String::new(), 0)
+    };
+
     MiningJob {
         job_id: format!("job-{}-{}", template.template_id, template.curtime),
         template_id: template.template_id,
@@ -26,6 +41,10 @@ pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
         network_target_hex: hex::encode(template.target.as_slice()),
         clean_jobs: false,
         template_epoch: template.curtime,
+        height: template.height,
+        epoch_hash,
+        extended_metadata_hash,
+        block_size,
     }
 }
 
@@ -116,5 +135,50 @@ mod tests {
         assert_eq!(job.merkle_branches[0], "branch1");
         assert_eq!(job.merkle_branches[1], "branch2");
         assert_eq!(job.merkle_branches[2], "branch3");
+    }
+
+    #[test]
+    fn test_template_to_job_populates_header_fields() {
+        use bitcoinsuite_core::{BytesMut, LotusHeader, BitcoinCode};
+
+        let mut template = create_test_template();
+        template.height = 1292529;
+
+        // Build a LotusHeader matching real block data at height 1292529
+        let header = LotusHeader {
+            version: 1,
+            prev_block: Sha256d::new([0u8; 32]),
+            bits: 0x1c09d010,
+            timestamp: 1779227754,
+            nonce: 13573272464251480634,
+            size: 2588,
+            height: 1292529,
+            epoch_hash: Sha256d::from_hex_be(
+                "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7",
+            )
+            .unwrap(),
+            extended_metadata_hash: Sha256d::from_hex_be(
+                "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614",
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        header.ser_to(&mut buf);
+        template.header = buf.as_slice().to_vec();
+
+        let job = template_to_job(&template);
+
+        assert_eq!(job.height, 1292529);
+        assert_eq!(
+            job.epoch_hash,
+            "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7"
+        );
+        assert_eq!(
+            job.extended_metadata_hash,
+            "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614"
+        );
+        assert_eq!(job.block_size, 2588);
     }
 }

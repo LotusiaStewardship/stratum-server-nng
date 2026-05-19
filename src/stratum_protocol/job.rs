@@ -14,6 +14,10 @@ pub struct MiningJob {
     pub network_target_hex: String,
     pub clean_jobs: bool,
     pub template_epoch: u64,
+    pub height: i32,
+    pub epoch_hash: String,
+    pub extended_metadata_hash: String,
+    pub block_size: u64,
 }
 
 impl MiningJob {

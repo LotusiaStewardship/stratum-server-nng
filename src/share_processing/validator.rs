@@ -1,8 +1,8 @@
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::session::SessionState;
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, header_meets_difficulty};
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 use primitive_types::U256;
-use sha2::{Digest, Sha256};
 
 /// Result of validating a share submission.
 ///
@@ -24,7 +24,7 @@ pub struct ValidationResult {
 
 impl ValidationResult {
     /// Create a rejected validation result with the given reason.
-    fn rejected(reason: &str) -> Self {
+    pub(crate) fn rejected(reason: &str) -> Self {
         Self {
             accepted: false,
             reject_reason: Some(reason.to_string()),
@@ -130,20 +130,25 @@ pub fn validate_share(
         &job.nbits,
         ntime,
         nonce,
-        None, // height — not available in submit context
-        None, // epoch_hash — not available in submit context
-        None, // extended_metadata_hash — not available in submit context
-        None, // size — not available in submit context
+        Some(job.height),
+        Some(&job.epoch_hash),
+        Some(&job.extended_metadata_hash),
+        Some(job.block_size),
     ) {
         Ok(h) => h,
         Err(_) => return ValidationResult::rejected("invalid-submit-shape"),
     };
 
-    // Compute double-SHA256 hash of the header
-    let hash_bytes = double_sha256(&header_bytes);
+    // Compute the Lotus-specific block hash (merkle-tree-style, not SHA256d)
+    let hash_le = match LotusHeader::deser(&mut Bytes::from_slice(&header_bytes)) {
+        Ok(header) => header.calc_hash().as_slice().to_vec(),
+        Err(_) => return ValidationResult::rejected("invalid-submit-shape"),
+    };
 
     // Convert hash to big-endian for U256 difficulty comparison
     // (header_meets_difficulty expects big-endian)
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&hash_le);
     let mut hash_be = hash_bytes;
     hash_be.reverse();
 
@@ -176,8 +181,12 @@ pub fn validate_share(
     let meets_network = hash_u256 <= ntarget_u256;
 
     // 8. Build the final result
+    // Convert hash to big-endian for block hash display (standard hex format)
+    let mut hash_be_display = [0u8; 32];
+    hash_be_display.copy_from_slice(&hash_le);
+    hash_be_display.reverse();
     let block_hash = if meets_network {
-        Some(hex::encode(hash_bytes))
+        Some(hex::encode(hash_be_display))
     } else {
         None
     };
@@ -189,15 +198,6 @@ pub fn validate_share(
         network_target_ok: meets_network,
         block_hash,
     }
-}
-
-/// Compute double-SHA256 hash of input data.
-fn double_sha256(data: &[u8]) -> [u8; 32] {
-    let hash1 = Sha256::digest(data);
-    let hash2 = Sha256::digest(&hash1);
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&hash2);
-    result
 }
 
 #[cfg(test)]
@@ -225,6 +225,10 @@ mod tests {
             network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
             clean_jobs: true,
             template_epoch: 100,
+            height: 1292529,
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
+            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            block_size: 2588,
         }
     }
 
@@ -434,6 +438,119 @@ mod tests {
 
         assert!(!result.accepted);
         assert_eq!(result.reject_reason.as_deref(), Some("invalid-submit-shape"));
+    }
+
+    #[test]
+    fn test_known_valid_share_accepted() {
+        // Deterministic test using the actual block-finding share data.
+        // The block at height 1292529 was found with:
+        //   extranonce1=79aca8e7, extranonce2=00000003, nonce=13573272464251480634
+        //   block_hash=0000000008c2e07a429d877d5f35c07893f2b4693fb708033cf293f52568a3cc
+        // Extracted from the block's real coinbase script (inserted between coinbase1/2):
+        //   coinbase1 ends '...2f', then extranonce1+extranonce2 '79aca8e700000003', then coinbase2
+        let job = create_test_job();
+
+        // Real block-finding share params (from lotusd at height 1292529)
+        let worker_name = "lotus_16PSJM7tLsgvi6BNER9VKtb8duMiuFfs2ab7Q1sQd.mainnet";
+        let extranonce1 = "79aca8e7";
+        let extranonce2 = "00000003";
+        let ntime = "6adc0c6a0000";
+        // Nonce 13573272464251480634 as LE bytes (matches Lotus header serialization)
+        let nonce = hex::encode(13573272464251480634u64.to_le_bytes());
+
+        // Build the session with the exact extranonce1 from the block-finding share
+        let mut session = SessionState::new("sess-finder".to_string());
+        session.is_subscribed = true;
+        session.is_authorized = true;
+        session.extranonce1 = extranonce1.to_string();
+        // Authorize the exact worker that submitted the block-finding share
+        session.authorized_workers.insert(worker_name.to_string());
+        session.record_assigned_job(
+            "job-890-100".to_string(),
+            0.5887084205325228,
+            ntime.to_string(),
+        );
+
+        let result = validate_share(
+            worker_name,
+            "job-890-100",
+            extranonce2,
+            ntime,
+            &nonce,
+            &session,
+            &job,
+        );
+
+        assert!(
+            result.accepted,
+            "block-finding share rejected: reason={:?} low_diff={:?} net_ok={:?} hash={:?}",
+            result.reject_reason,
+            result.low_diff_ok,
+            result.network_target_ok,
+            result.block_hash,
+        );
+        assert!(result.low_diff_ok);
+        assert!(result.network_target_ok, "block-finding share must meet network target");
+        assert!(result.reject_reason.is_none());
+        assert!(
+            result.block_hash.is_some(),
+            "block-finding share must have a block_hash"
+        );
+        // Verify the block hash matches
+        assert_eq!(
+            result.block_hash.as_deref(),
+            Some("0000000008c2e07a429d877d5f35c07893f2b4693fb708033cf293f52568a3cc"),
+            "block hash must match expected"
+        );
+    }
+
+    #[test]
+    fn test_header_fields_affect_hash() {
+        // Verify that build_stratum_header produces different output
+        // when real header fields (height, epoch_hash, etc.) are provided
+        // vs when None is passed for them.
+        let job = create_test_job();
+
+        let header_with_fields = build_stratum_header(
+            &job.coinbase1,
+            "00112233",
+            "00000003",
+            &job.coinbase2,
+            &job.merkle_branches,
+            &job.prevhash,
+            &job.version,
+            &job.nbits,
+            "6adc0c6a0000",
+            "B02B4ABB3DD6E835",
+            Some(job.height),
+            Some(&job.epoch_hash),
+            Some(&job.extended_metadata_hash),
+            Some(job.block_size),
+        )
+        .unwrap();
+
+        let header_without_fields = build_stratum_header(
+            &job.coinbase1,
+            "00112233",
+            "00000003",
+            &job.coinbase2,
+            &job.merkle_branches,
+            &job.prevhash,
+            &job.version,
+            &job.nbits,
+            "6adc0c6a0000",
+            "B02B4ABB3DD6E835",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(
+            header_with_fields, header_without_fields,
+            "header with real height/epoch_hash/ext_metadata/size should differ from defaults"
+        );
     }
 
     #[test]

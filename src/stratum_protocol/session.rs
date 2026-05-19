@@ -105,42 +105,6 @@ impl SessionState {
             .map(|j| j.p_diff)
             .unwrap_or(1.0)
     }
-
-    pub fn handle_submit(&self, req: &StratumRequest) -> StratumResponse {
-        if !self.is_subscribed {
-            return StratumResponse::err(req.id.clone(), 25, "not-subscribed");
-        }
-        let arr = req.params.as_array().cloned().unwrap_or_default();
-        let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
-
-        if !self.authorized_workers.contains(worker) {
-            return StratumResponse::rejected(req.id.clone(), 24, "unauthorized-worker");
-        }
-
-        // Validate submit shape (5 params minimum: worker, job_id, extranonce2, ntime, nonce)
-        if arr.len() < 5 {
-            return StratumResponse::rejected(req.id.clone(), 20, "invalid-submit-shape");
-        }
-
-        // Validate ntime matches frozen ntime from assigned job (ntime-mismatch check per UBQ)
-        let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
-        let ntime = arr.get(3).and_then(|v| v.as_str()).unwrap_or_default();
-
-        if let Some(assigned) = self.get_assigned_job(job_id) {
-            if ntime != assigned.ntime {
-                return StratumResponse::rejected(
-                    req.id.clone(),
-                    21,
-                    "ntime-mismatch",
-                );
-            }
-        } else {
-            // Job not in assigned_jobs → stale
-            return StratumResponse::rejected(req.id.clone(), 22, "stale-job");
-        }
-
-        StratumResponse::ok(req.id.clone(), Value::Bool(true))
-    }
 }
 
 pub fn parse_worker_name(input: &str) -> anyhow::Result<WorkerName> {
@@ -222,91 +186,6 @@ mod tests {
         assert!(resp.error.is_null());
         assert!(session.is_authorized);
         assert!(session.authorized_workers.contains("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig"));
-    }
-
-    #[test]
-    fn test_submit_requires_authorize() {
-        let mut session = SessionState::new("sess-4".to_string());
-        session.is_subscribed = true;
-        
-        let req = StratumRequest {
-            id: Value::Number(3.into()),
-            method: Method::Submit,
-            params: serde_json::json!(["worker", "job1", "00112233", "001122334455", "0011223344556677"]).into(),
-        };
-        
-        let resp = session.handle_submit(&req);
-        
-        assert!(!resp.error.is_null());
-        assert_eq!(resp.result, Value::Bool(false));
-    }
-
-    #[test]
-    fn test_submit_with_authorized_worker() {
-        let mut session = SessionState::new("sess-5".to_string());
-        session.is_subscribed = true;
-        session.is_authorized = true;
-        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
-        // Record an assigned job so ntime check passes
-        session.record_assigned_job("job1".to_string(), 1.0, "001122334455".to_string());
-        
-        let req = StratumRequest {
-            id: Value::Number(3.into()),
-            method: Method::Submit,
-            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "job1", "00112233", "001122334455", "0011223344556677"]).into(),
-        };
-        
-        let resp = session.handle_submit(&req);
-        
-        assert!(resp.error.is_null());
-        assert_eq!(resp.result, Value::Bool(true));
-    }
-
-    #[test]
-    fn test_submit_stale_job() {
-        let mut session = SessionState::new("sess-6".to_string());
-        session.is_subscribed = true;
-        session.is_authorized = true;
-        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
-        // No assigned jobs recorded → submit against unknown job = stale
-        
-        let req = StratumRequest {
-            id: Value::Number(3.into()),
-            method: Method::Submit,
-            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "unknown-job", "00112233", "001122334455", "0011223344556677"]).into(),
-        };
-        
-        let resp = session.handle_submit(&req);
-        
-        assert!(!resp.error.is_null());
-        assert_eq!(resp.result, Value::Bool(false));
-        // Should have stale-job error
-        let error_arr = resp.error.as_array().unwrap();
-        assert_eq!(error_arr[1], "stale-job");
-    }
-
-    #[test]
-    fn test_submit_ntime_mismatch() {
-        let mut session = SessionState::new("sess-7".to_string());
-        session.is_subscribed = true;
-        session.is_authorized = true;
-        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
-        // Record assigned job with ntime="abc123"
-        session.record_assigned_job("job1".to_string(), 1.0, "abc123".to_string());
-        
-        // Submit with different ntime
-        let req = StratumRequest {
-            id: Value::Number(3.into()),
-            method: Method::Submit,
-            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "job1", "00112233", "different", "0011223344556677"]).into(),
-        };
-        
-        let resp = session.handle_submit(&req);
-        
-        assert!(!resp.error.is_null());
-        assert_eq!(resp.result, Value::Bool(false));
-        let error_arr = resp.error.as_array().unwrap();
-        assert_eq!(error_arr[1], "ntime-mismatch");
     }
 
     #[test]

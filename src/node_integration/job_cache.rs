@@ -106,6 +106,10 @@ mod tests {
             network_target_hex: "ffffffff".to_string(),
             clean_jobs: false,
             template_epoch: 0,
+            height: 0,
+            epoch_hash: String::new(),
+            extended_metadata_hash: String::new(),
+            block_size: 0,
         }
     }
 

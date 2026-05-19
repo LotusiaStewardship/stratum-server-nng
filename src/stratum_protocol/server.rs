@@ -318,13 +318,12 @@ async fn handle_submit(
     share_repo: Option<&ShareRepository>,
     worker_repo: Option<&WorkerRepository>,
 ) -> StratumResponse {
-    // Phase 1: Protocol-level session checks (rapid rejection)
-    let session_resp = session.handle_submit(req);
-    if !session_resp.error.is_null() {
-        return session_resp;
+    // Fast path: reject unsubscribed miners before any validation or persistence.
+    if !session.is_subscribed {
+        return StratumResponse::err(req.id.clone(), 25, "not-subscribed");
     }
 
-    // Phase 2: Extract submit parameters
+    // Extract submit parameters
     let arr = req.params.as_array().cloned().unwrap_or_default();
     let worker_name = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
     let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
@@ -332,45 +331,58 @@ async fn handle_submit(
     let ntime_hex = arr.get(3).and_then(|v| v.as_str()).unwrap_or_default();
     let nonce_hex = arr.get(4).and_then(|v| v.as_str()).unwrap_or_default();
 
-    // Phase 3: Get the job from the cache to get template data for header building
-    let job = match job_cache.get(job_id).await {
-        Some(j) => j,
-        None => {
-            // Job not in cache — even though session has it in assigned_jobs,
-            // the cache may have evicted it. Treat as stale.
-            return StratumResponse::rejected(req.id.clone(), 22, "stale-job");
-        }
-    };
-
-    // Phase 4: Run the full validation pipeline
-    let validation = validator::validate_share(
-        worker_name,
-        job_id,
-        extranonce2,
-        ntime_hex,
-        nonce_hex,
-        session,
-        &job,
-    );
-
-    // Phase 5: Persist share + outcome atomically if repositories are available
-    if let (Some(share_repo), Some(worker_repo)) = (share_repo, worker_repo) {
-        // Parse worker name to get payout address and suffix
-        let worker_parsed = match crate::stratum_protocol::session::parse_worker_name(worker_name) {
-            Ok(w) => w,
-            Err(_) => {
-                return StratumResponse::rejected(req.id.clone(), 24, "unauthorized-worker");
-            }
+    // Get the job from the cache to get template data for header building.
+    // If not found, create a stale validation result directly.
+    let (validation, template_id, template_epoch, share_diff) =
+        if let Some(job) = job_cache.get(job_id).await {
+            // Run the full validation pipeline
+            let validation = validator::validate_share(
+                worker_name,
+                job_id,
+                extranonce2,
+                ntime_hex,
+                nonce_hex,
+                session,
+                &job,
+            );
+            (
+                validation,
+                job.template_id as i64,
+                job.template_epoch as i64,
+                // Per UBQ: share difficulty = P_diff at assignment time, not submission time.
+                // Look up the specific assigned job's P_diff rather than using the latest.
+                session.get_assigned_job(job_id)
+                    .map(|a| a.p_diff)
+                    .unwrap_or_else(|| session.current_difficulty()),
+            )
+        } else {
+            // Job not in cache — treat as stale.
+            // Use defaults for template metadata since the job isn't available.
+            (
+                validator::ValidationResult::rejected("stale-job"),
+                0i64,
+                0i64,
+                session.current_difficulty(),
+            )
         };
 
-        // Upsert worker to get a persistent worker_id
-        match worker_repo.upsert(&worker_parsed.payout_address, worker_parsed.worker_suffix.as_deref()) {
-            Ok(worker) => {
-                // Build dedupe key per UBQ format: worker_id:template_id:template_epoch:extranonce2:ntime:nonce
+    // Persist share + outcome atomically if repositories are available.
+    // This runs for ALL submissions (accepted or rejected) per UBQ.
+    if let (Some(share_repo), Some(worker_repo)) = (share_repo, worker_repo) {
+        // Parse worker name to get payout address and suffix.
+        // If unparseable, we cannot persist (need a worker_id for FK).
+        if let Ok(worker_parsed) =
+            crate::stratum_protocol::session::parse_worker_name(worker_name)
+        {
+            if let Ok(worker) = worker_repo.upsert(
+                &worker_parsed.payout_address,
+                worker_parsed.worker_suffix.as_deref(),
+            ) {
+                // Build dedupe key per UBQ format
                 let dedupe_key = ShareRepository::build_dedupe_key(
                     worker.id,
-                    job.template_id as i64,
-                    job.template_epoch as i64,
+                    template_id,
+                    template_epoch,
                     extranonce2,
                     ntime_hex,
                     nonce_hex,
@@ -382,25 +394,30 @@ async fn handle_submit(
                     worker_id: worker.id,
                     session_id: session.session_id.clone(),
                     job_id: job_id.to_string(),
-                    template_id: job.template_id as i64,
-                    template_epoch: job.template_epoch as i64,
+                    template_id,
+                    template_epoch,
                     extranonce2: extranonce2.to_string(),
                     ntime_hex_6b: ntime_hex.to_string(),
                     nonce_hex_8b: nonce_hex.to_string(),
-                    difficulty: session.current_difficulty(),
+                    difficulty: share_diff,
                     dedupe_key: dedupe_key.clone(),
                 };
 
                 // Create share outcome based on validation result
                 let outcome = ShareOutcome {
                     id: 0,
-                    share_id: 0, // Will be resolved by atomic insert
+                    share_id: 0,
                     session_id: session.session_id.clone(),
                     worker_id: worker.id,
                     job_id: job_id.to_string(),
                     round_id: None,
                     dedupe_key: dedupe_key.clone(),
-                    status: if validation.accepted { "accepted" } else { "rejected" }.to_string(),
+                    status: if validation.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    }
+                    .to_string(),
                     reject_reason: validation.reject_reason.clone(),
                     node_result: None,
                     low_diff_ok: Some(validation.low_diff_ok),
@@ -409,17 +426,16 @@ async fn handle_submit(
                 };
 
                 // Insert atomically
-                if let Err(e) = share_repo.insert_share_and_outcome_atomic(&share, &outcome) {
+                if let Err(e) =
+                    share_repo.insert_share_and_outcome_atomic(&share, &outcome)
+                {
                     warn!(error = %e, "failed to atomically persist share and outcome");
                 }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to upsert worker");
             }
         }
     }
 
-    // Phase 6: Return protocol response based on validation result
+    // Return protocol response based on validation result
     if validation.accepted {
         StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
     } else {
@@ -462,6 +478,10 @@ mod tests {
             network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
             clean_jobs: false,
             template_epoch: 100,
+            height: 1292529,
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
+            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            block_size: 2588,
         }
     }
 
@@ -770,5 +790,291 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "authorization event should be recorded");
+    }
+
+    /// Integration test: rejected share (unauthorized worker) persists share_outcome.
+    #[tokio::test]
+    async fn test_rejected_share_unauthorized_persists_outcome() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::init_schema;
+        use parking_lot::Mutex;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13340".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13340").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Do NOT authorize. Submit with a valid Lotus address that was never authorized.
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJHGmfZkU8zFrzU8Gw198o4j2XUryNnrMccuvZ.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
+
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        // Must be rejected
+        assert!(
+            resp["result"] == serde_json::Value::Bool(false),
+            "expected rejected (false), got {:?}",
+            resp,
+        );
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify outcome was persisted with correct reject_reason
+        let share_repo = ShareRepository::new(db_conn_arc.clone());
+        let total = share_repo.total_outcome_count().unwrap();
+        assert_eq!(total, 1, "share outcome should be persisted for unauthorized worker");
+        let reasons = share_repo.count_rejected_by_reason().unwrap();
+        assert_eq!(reasons.get("unauthorized-worker"), Some(&1));
+    }
+
+    /// Integration test: rejected share (stale job) persists share_outcome.
+    #[tokio::test]
+    async fn test_rejected_share_stale_job_persists_outcome() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::init_schema;
+        use parking_lot::Mutex;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13341".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13341").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe and authorize
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Submit against a non-existent job — job not in session's assigned_jobs
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"nonexistent-job\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
+
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            resp["result"] == serde_json::Value::Bool(false),
+            "expected rejected (false), got {:?}",
+            resp,
+        );
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify outcome was persisted
+        let share_repo = ShareRepository::new(db_conn_arc.clone());
+        let total = share_repo.total_outcome_count().unwrap();
+        assert!(total >= 1, "share outcome should be persisted for stale job");
+        let reasons = share_repo.count_rejected_by_reason().unwrap();
+        assert_eq!(reasons.get("stale-job"), Some(&1));
+    }
+
+    /// Integration test: rejected share (ntime-mismatch) persists share_outcome.
+    #[tokio::test]
+    async fn test_rejected_share_ntime_mismatch_persists_outcome() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::init_schema;
+        use parking_lot::Mutex;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13342".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13342").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe and authorize
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Wait for mining.notify (assigned_jobs records job with frozen ntime)
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Submit with a different ntime than what was assigned
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\",\"00000003\",\"aaaaaaaaaaaa\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
+
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            resp["result"] == serde_json::Value::Bool(false),
+            "expected rejected (false), got {:?}",
+            resp,
+        );
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify outcome was persisted
+        let share_repo = ShareRepository::new(db_conn_arc.clone());
+        let total = share_repo.total_outcome_count().unwrap();
+        assert!(total >= 1, "share outcome should be persisted for ntime mismatch");
+        let reasons = share_repo.count_rejected_by_reason().unwrap();
+        assert_eq!(reasons.get("ntime-mismatch"), Some(&1));
+    }
+
+    /// Integration test: rejected share (invalid-submit-shape) persists share_outcome.
+    #[tokio::test]
+    async fn test_rejected_share_invalid_shape_persists_outcome() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::init_schema;
+        use parking_lot::Mutex;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13343".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13343").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe and authorize
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Submit with only 2 params (missing extranonce2, ntime, nonce) → invalid-submit-shape
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\"]}\n").await.unwrap();
+
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            resp["result"] == serde_json::Value::Bool(false),
+            "expected rejected (false), got {:?}",
+            resp,
+        );
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify outcome was persisted
+        let share_repo = ShareRepository::new(db_conn_arc.clone());
+        let total = share_repo.total_outcome_count().unwrap();
+        assert!(total >= 1, "share outcome should be persisted for invalid shape");
+        let reasons = share_repo.count_rejected_by_reason().unwrap();
+        assert_eq!(reasons.get("invalid-submit-shape"), Some(&1));
     }
 }
