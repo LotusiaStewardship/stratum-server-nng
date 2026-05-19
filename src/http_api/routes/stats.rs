@@ -3,6 +3,7 @@ use axum::{
     response::Json,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
@@ -11,6 +12,7 @@ pub struct StatsResponse {
     pub accepted_shares: i64,
     pub rejected_shares: i64,
     pub accepted_pct: f64,
+    pub rejection_breakdown: HashMap<String, i64>,
     pub network_difficulty: Option<String>,
 }
 
@@ -18,14 +20,16 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
     let stats = state.stats.read().await;
     
     // Query actual share outcome counts from repository if available
-    let (total_shares, accepted_shares, rejected_shares) = if let Some(ref share_repo) = state.share_repo {
-        let total = share_repo.total_outcome_count().unwrap_or(0);
-        let accepted = share_repo.count_outcomes_by_status("accepted").unwrap_or(0);
-        let rejected = share_repo.count_outcomes_by_status("rejected").unwrap_or(0);
-        (total, accepted, rejected)
-    } else {
-        (stats.total_shares, stats.accepted_shares, stats.rejected_shares)
-    };
+    let (total_shares, accepted_shares, rejected_shares, rejection_breakdown) =
+        if let Some(ref share_repo) = state.share_repo {
+            let total = share_repo.total_outcome_count().unwrap_or(0);
+            let accepted = share_repo.count_outcomes_by_status("accepted").unwrap_or(0);
+            let rejected = share_repo.count_outcomes_by_status("rejected").unwrap_or(0);
+            let reasons = share_repo.count_rejected_by_reason().unwrap_or_default();
+            (total, accepted, rejected, reasons)
+        } else {
+            (stats.total_shares, stats.accepted_shares, stats.rejected_shares, HashMap::new())
+        };
     
     let accepted_pct = if total_shares > 0 {
         (accepted_shares as f64 / total_shares as f64) * 100.0
@@ -38,6 +42,7 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
         accepted_shares,
         rejected_shares,
         accepted_pct,
+        rejection_breakdown,
         network_difficulty: stats.network_difficulty.clone(),
     })
 }
@@ -168,5 +173,6 @@ mod tests {
         assert_eq!(response.accepted_shares, 2);
         assert_eq!(response.rejected_shares, 1);
         assert!((response.accepted_pct - 66.67).abs() < 0.01);
+        assert_eq!(response.rejection_breakdown.get("low-difficulty-share"), Some(&1));
     }
 }

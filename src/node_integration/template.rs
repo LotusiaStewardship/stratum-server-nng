@@ -35,29 +35,32 @@ mod tests {
     use bitcoinsuite_core::Sha256d;
 
     fn create_test_template() -> MiningTemplate {
+        // Real-world template data (lotusd block height 1292529)
         MiningTemplate {
-            template_id: 42,
+            template_id: 890,
             block: vec![],
             header: vec![],
             previous_block_hash: Sha256d::new([0u8; 32]),
             height: 1000,
-            version: 536870912,
+            version: 1,
             bits: 486604799,
             target: Sha256d::new([0u8; 32]),
-            curtime: 1234567890,
-            mintime: 1234567800,
-            maxtime: 1234567900,
+            curtime: 100,
+            mintime: 0,
+            maxtime: 0,
             coinbase_value: 5000000000,
             coinbase_tx: vec![],
             transactions: vec![],
-            coinbase1: "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff".to_string(),
-            coinbase2: "ffffffff0200f2052a010000001976a914000000000000000000000000000000000000000088ac0000000000000000266a24aa21a9ed00000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            coinbase1: "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f".to_string(),
+            coinbase2: "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000".to_string(),
             merkle_branches: vec![
-                "aa21a9ed0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                "796f6be745741765f8b19cfa4209ff68447d9e76198fee5d33fbe2c944224f16".to_string(),
+                "4b0ce2ddbf0f5352b721b7688109a1e1007722f96fa07f61ea8e655ac804964f".to_string(),
+                "c3899f315bc3b284015819a8d77404b4e179528d62559886babf89884966a172".to_string(),
             ],
-            prev_hash_stratum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            nbits_stratum: "1d00ffff".to_string(),
-            ntime_stratum: "5f5f5f5f".to_string(),
+            prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            nbits_stratum: "10d0091c".to_string(),
+            ntime_stratum: "6adc0c6a0000".to_string(),
         }
     }
 
@@ -67,13 +70,13 @@ mod tests {
         let job = template_to_job(&template);
 
         // Job ID format per UBQ: job-{template_id}-{epoch}
-        assert_eq!(job.job_id, "job-42-1234567890");
-        assert_eq!(job.template_id, 42);
+        assert_eq!(job.job_id, "job-890-100");
+        assert_eq!(job.template_id, 890);
         assert_eq!(job.prevhash, template.prev_hash_stratum);
         assert_eq!(job.coinbase1, template.coinbase1);
         assert_eq!(job.coinbase2, template.coinbase2);
         assert_eq!(job.merkle_branches, template.merkle_branches);
-        assert_eq!(job.version, "20000000"); // 536870912 in hex
+        assert_eq!(job.version, "00000001"); // version=1 in hex
         assert_eq!(job.nbits, template.nbits_stratum);
         assert_eq!(job.ntime, template.ntime_stratum);
         assert_eq!(job.template_epoch, template.curtime);

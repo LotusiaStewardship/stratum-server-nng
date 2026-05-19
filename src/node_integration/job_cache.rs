@@ -102,7 +102,7 @@ mod tests {
             merkle_branches: vec![],
             version: "00000000".to_string(),
             nbits: "1d00ffff".to_string(),
-            ntime: "00000000".to_string(),
+            ntime: "6adc0c6a0000".to_string(),
             network_target_hex: "ffffffff".to_string(),
             clean_jobs: false,
             template_epoch: 0,

@@ -13,7 +13,7 @@
 |---|-------|------|------------|------------------|--------|
 | 1 | Minimal Stratum Server (Tracer Bullet) | AFK | None | 1 day | ✅ Done (UBQ-aligned) |
 | 2 | NNG Template Integration | AFK | #1 | 1 day | ✅ Done (UBQ-aligned) |
-| 3 | Share Validation Pipeline | AFK | #2 | 1 day |
+| 3 | Share Validation Pipeline | AFK | #2 | 1 day | ✅ Done (UBQ-aligned) |
 | 4 | Per-Session VarDiff | AFK | #3 | 1 day |
 | 5 | Worker and Round Accounting | AFK | #3 | 1 day |
 | 6 | Found Blocks and Reorg Handling | AFK | #5 | 1 day |

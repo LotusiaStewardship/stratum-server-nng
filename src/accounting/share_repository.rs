@@ -203,6 +203,123 @@ impl ShareRepository {
         Ok(count)
     }
 
+    /// Insert both raw share and share outcome atomically in a single transaction.
+    ///
+    /// This ensures that a share and its outcome are always persisted together.
+    /// If either insert fails (e.g., constraint violation), both are rolled back.
+    /// Returns (share_id, outcome_id) or (None, None) if duplicate.
+    pub fn insert_share_and_outcome_atomic(
+        &self,
+        share: &Share,
+        outcome: &ShareOutcome,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        let conn = self.conn.lock();
+
+        // Use SQLite transaction for atomicity
+        conn.execute_batch("BEGIN TRANSACTION")?;
+
+        let result = (|| -> Result<(Option<i64>, Option<i64>)> {
+            // Insert share
+            let share_id = {
+                let mut stmt = conn.prepare(
+                    "INSERT OR IGNORE INTO shares
+                     (worker_id, session_id, job_id, template_id, template_epoch,
+                      extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )?;
+
+                let rows = stmt.execute([
+                    share.worker_id.to_sql()?,
+                    share.session_id.to_sql()?,
+                    share.job_id.to_sql()?,
+                    share.template_id.to_sql()?,
+                    share.template_epoch.to_sql()?,
+                    share.extranonce2.to_sql()?,
+                    share.ntime_hex_6b.to_sql()?,
+                    share.nonce_hex_8b.to_sql()?,
+                    share.difficulty.to_sql()?,
+                    share.dedupe_key.to_sql()?,
+                ])?;
+
+                if rows == 0 {
+                    // Duplicate — get the existing ID
+                    let mut query = conn.prepare("SELECT id FROM shares WHERE dedupe_key = ?1")?;
+                    let id: i64 = query.query_row([&share.dedupe_key], |row| row.get(0))?;
+                    id
+                } else {
+                    conn.last_insert_rowid()
+                }
+            };
+
+            // Insert share outcome
+            let outcome_id = {
+                let mut stmt = conn.prepare(
+                    "INSERT OR IGNORE INTO share_outcomes
+                     (share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                      status, reject_reason, node_result, low_diff_ok, network_target_ok, block_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                )?;
+
+                let rows = stmt.execute([
+                    share_id.to_sql()?,
+                    outcome.session_id.to_sql()?,
+                    outcome.worker_id.to_sql()?,
+                    outcome.job_id.to_sql()?,
+                    outcome.round_id.to_sql()?,
+                    outcome.dedupe_key.to_sql()?,
+                    outcome.status.to_sql()?,
+                    outcome.reject_reason.to_sql()?,
+                    outcome.node_result.to_sql()?,
+                    outcome.low_diff_ok.to_sql()?,
+                    outcome.network_target_ok.to_sql()?,
+                    outcome.block_hash.to_sql()?,
+                ])?;
+
+                if rows == 0 {
+                    // Duplicate — get the existing ID
+                    let mut query =
+                        conn.prepare("SELECT id FROM share_outcomes WHERE dedupe_key = ?1")?;
+                    let id: i64 = query.query_row([&outcome.dedupe_key], |row| row.get(0))?;
+                    id
+                } else {
+                    conn.last_insert_rowid()
+                }
+            };
+
+            Ok((Some(share_id), Some(outcome_id)))
+        })();
+
+        match result {
+            Ok(val) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(val)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Count rejected share_outcomes grouped by reject_reason.
+    pub fn count_rejected_by_reason(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT reject_reason, COUNT(*) FROM share_outcomes WHERE status = 'rejected' GROUP BY reject_reason"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let reason: Option<String> = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((reason.unwrap_or_else(|| "unknown".to_string()), count))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (reason, count) = row?;
+            *map.entry(reason).or_insert(0) += count;
+        }
+        Ok(map)
+    }
+
     /// Total number of raw share records.
     pub fn total_count(&self) -> Result<i64> {
         let conn = self.conn.lock();
@@ -416,6 +533,46 @@ mod tests {
         repo.insert_share(&create_test_share(1, 1, 101, "dk2")).unwrap();
 
         assert_eq!(repo.total_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_count_rejected_by_reason() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "test_address", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+
+        // Insert shares and outcomes with various rejection reasons
+        let s1 = create_test_share(1, 1, 100, "dk1");
+        let sid1 = repo.insert_share(&s1).unwrap().unwrap();
+        let mut o1 = create_test_outcome(sid1, 1, "dk1", "rejected");
+        o1.reject_reason = Some("stale-job".to_string());
+        repo.insert_share_outcome(&o1).unwrap();
+
+        let s2 = create_test_share(1, 1, 101, "dk2");
+        let sid2 = repo.insert_share(&s2).unwrap().unwrap();
+        let mut o2 = create_test_outcome(sid2, 1, "dk2", "rejected");
+        o2.reject_reason = Some("low-difficulty-share".to_string());
+        repo.insert_share_outcome(&o2).unwrap();
+
+        let s3 = create_test_share(1, 1, 102, "dk3");
+        let sid3 = repo.insert_share(&s3).unwrap().unwrap();
+        let mut o3 = create_test_outcome(sid3, 1, "dk3", "rejected");
+        o3.reject_reason = Some("low-difficulty-share".to_string());
+        repo.insert_share_outcome(&o3).unwrap();
+
+        let s4 = create_test_share(1, 1, 103, "dk4");
+        let sid4 = repo.insert_share(&s4).unwrap().unwrap();
+        repo.insert_share_outcome(&create_test_outcome(sid4, 1, "dk4", "accepted")).unwrap();
+
+        let reasons = repo.count_rejected_by_reason().unwrap();
+
+        assert_eq!(reasons.get("stale-job"), Some(&1));
+        assert_eq!(reasons.get("low-difficulty-share"), Some(&2));
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.get("accepted").is_none());
     }
 
     #[test]
