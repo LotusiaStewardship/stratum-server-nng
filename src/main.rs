@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
 
         Ok::<_, anyhow::Error>(())
     });
+    shutdown.register_task(http_handle);
 
     // Start Stratum TCP server
     let stratum_shutdown_signal = shutdown.signal();
@@ -125,6 +126,7 @@ async fn main() -> Result<()> {
 
         Ok::<_, anyhow::Error>(())
     });
+    shutdown.register_task(stratum_handle);
 
     // Stats updater - syncs connected miners count from Stratum server
     let stats_clone = stats.clone();
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
             }
         }
     });
+    shutdown.register_task(stats_handle);
 
     // Wait for shutdown signal
     info!(stratum = %config.stratum_bind, http = %config.api_bind, "server ready");
@@ -159,8 +162,11 @@ async fn main() -> Result<()> {
             info!("initiating graceful shutdown");
             shutdown.initiate_shutdown();
             
-            // Wait for tasks to complete
-            let _ = tokio::join!(http_handle, stratum_handle, stats_handle);
+            // Wait for all registered tasks to complete
+            shutdown.wait_for_completion().await?;
+            
+            // Disconnect from lotusd
+            nng_client.disconnect().await;
             
             info!("server shutdown complete");
         }

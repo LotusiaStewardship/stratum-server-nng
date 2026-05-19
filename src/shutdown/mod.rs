@@ -1,18 +1,21 @@
 use anyhow::Result;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tracing::info;
 use rusqlite::Connection;
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 /// Graceful shutdown coordinator for managing server lifecycle.
 ///
 /// Broadcasts shutdown signal to all registered tasks and waits for them to complete.
-#[derive(Clone)]
 pub struct ShutdownCoordinator {
     shutdown_tx: broadcast::Sender<()>,
     shutdown_timeout_secs: u64,
     flush_timeout_secs: u64,
-    db_conn: Option<std::sync::Arc<parking_lot::Mutex<Connection>>>,
+    db_conn: Option<Arc<Mutex<Connection>>>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl ShutdownCoordinator {
@@ -29,12 +32,13 @@ impl ShutdownCoordinator {
             shutdown_timeout_secs: 30,
             flush_timeout_secs: 5,
             db_conn: None,
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Create a new shutdown coordinator with database connection for WAL checkpoint.
     pub fn with_db_conn(
-        db_conn: std::sync::Arc<parking_lot::Mutex<Connection>>,
+        db_conn: Arc<Mutex<Connection>>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1024);
         Self {
@@ -42,6 +46,7 @@ impl ShutdownCoordinator {
             shutdown_timeout_secs: 30,
             flush_timeout_secs: 5,
             db_conn: Some(db_conn),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -65,6 +70,15 @@ impl ShutdownCoordinator {
         // Don't wait for tasks - just exit
     }
 
+    /// Register a task handle to be awaited during shutdown.
+    pub fn register_task<T: Send + 'static>(&self, handle: JoinHandle<T>) {
+        // We use a type-erased approach - store as JoinHandle<()> by mapping the result
+        let handle_erased = tokio::spawn(async move {
+            let _ = handle.await;
+        });
+        self.tasks.lock().push(handle_erased);
+    }
+
     /// Wait for all tasks to complete shutdown (max timeout).
     /// Performs WAL checkpoint on database connection if available.
     pub async fn wait_for_completion(&self) -> Result<()> {
@@ -73,13 +87,31 @@ impl ShutdownCoordinator {
             "waiting for tasks to complete shutdown"
         );
 
-        // Wait for tasks to complete (with timeout)
-        timeout(
-            Duration::from_secs(self.shutdown_timeout_secs),
-            tokio::time::sleep(Duration::from_millis(100)),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("shutdown timeout exceeded"))?;
+        // Wait for all registered tasks to complete (with timeout)
+        let tasks = {
+            let mut tasks_guard = self.tasks.lock();
+            std::mem::take(&mut *tasks_guard)
+        };
+
+        if !tasks.is_empty() {
+            info!(task_count = tasks.len(), "awaiting tasks to complete");
+            
+            // Wait for all tasks with overall timeout
+            let wait_all = async {
+                for task in tasks {
+                    let _ = task.await;
+                }
+            };
+            
+            timeout(
+                Duration::from_secs(self.shutdown_timeout_secs),
+                wait_all,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("shutdown timeout exceeded"))?;
+            
+            info!("all tasks completed");
+        }
 
         // Perform WAL checkpoint if database connection is available
         if let Some(conn) = &self.db_conn {
@@ -179,5 +211,34 @@ mod tests {
         let result = coordinator.wait_for_completion().await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_awaits_tasks() {
+        use tokio::sync::Mutex;
+
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        let completed = Arc::new(Mutex::new(false));
+        let completed_clone = completed.clone();
+        let coordinator_clone = coordinator.clone();
+
+        // Register a task that takes 500ms to complete
+        let task = tokio::spawn(async move {
+            let mut signal = coordinator_clone.signal();
+            signal.recv().await; // Wait for shutdown signal
+            tokio::time::sleep(Duration::from_millis(500)).await; // Simulate cleanup
+            *completed_clone.lock().await = true;
+        });
+
+        // Give task time to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Initiate shutdown and wait
+        coordinator.initiate_shutdown();
+        coordinator.register_task(task);
+        let result = coordinator.wait_for_completion().await;
+
+        assert!(result.is_ok());
+        assert!(*completed.lock().await, "task should have completed before wait_for_completion returned");
     }
 }

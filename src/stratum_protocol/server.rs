@@ -318,7 +318,7 @@ mod tests {
     use crate::node_integration::JobCache;
     use std::net::SocketAddr;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
     fn create_test_job() -> MiningJob {
@@ -403,7 +403,7 @@ mod tests {
         
         // Connect as miner
         let stream = TcpStream::connect("127.0.0.1:13334").await.unwrap();
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         
         // Send mining.subscribe
@@ -466,7 +466,7 @@ mod tests {
         
         // Connect and try to authorize without subscribe
         let stream = TcpStream::connect("127.0.0.1:13335").await.unwrap();
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
@@ -501,7 +501,7 @@ mod tests {
         
         // Send invalid JSON
         let stream = TcpStream::connect("127.0.0.1:13336").await.unwrap();
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         
         write_half.write_all(b"not valid json\n").await.unwrap();
@@ -515,5 +515,82 @@ mod tests {
         // Shutdown
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
+    }
+
+    /// Integration test: verify shares submitted during graceful shutdown are persisted
+    #[tokio::test]
+    async fn test_graceful_shutdown_persists_in_flight_shares() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::{init_schema, ShareRepository};
+        use parking_lot::Mutex;
+
+        // Create temporary database
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let db_conn = Connection::open(&db_path).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        // Start server with database
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+        
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13337".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+        
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+        
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        // Connect as miner
+        let stream = TcpStream::connect("127.0.0.1:13337").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Authorize
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+        
+        // Submit share
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-1\",\"00112233\",\"001122334455\",\"0011223344556677\"]}\n").await.unwrap();
+        
+        // Wait for share response (confirms share was processed and persisted)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(resp["error"].is_null(), "share should be accepted");
+        
+        // Now initiate shutdown immediately after share is persisted
+        shutdown_tx.send(()).unwrap();
+        
+        // Wait for server to shut down
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+        
+        // Verify share was persisted
+        let share_repo = ShareRepository::new(db_conn_arc.clone());
+        let total_shares = share_repo.total_count().unwrap();
+        
+        assert_eq!(total_shares, 1, "share submitted during shutdown should be persisted");
     }
 }

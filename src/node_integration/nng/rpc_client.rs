@@ -57,6 +57,17 @@ impl NngRpcClient {
         guard.is_some()
     }
 
+    /// Disconnect from lotusd, closing the NNG RPC connection.
+    pub async fn disconnect(&self) {
+        let mut guard = self.interface.write().await;
+        if let Some(interface) = guard.take() {
+            info!(url = %self.rpc_url, "disconnecting from lotusd");
+            // RpcInterface is dropped here, which closes the NNG connection
+            drop(interface);
+            info!("disconnected from lotusd");
+        }
+    }
+
     /// Run a background task that periodically fetches templates.
     /// This is a placeholder for Slice 6 (event-driven refresh).
     pub async fn run_template_fetcher(
