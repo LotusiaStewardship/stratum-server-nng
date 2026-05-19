@@ -17,11 +17,11 @@ pub struct StatsResponse {
 pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
     let stats = state.stats.read().await;
     
-    // Query actual share counts from repository if available
+    // Query actual share outcome counts from repository if available
     let (total_shares, accepted_shares, rejected_shares) = if let Some(ref share_repo) = state.share_repo {
-        let total = share_repo.total_count().unwrap_or(0);
-        let accepted = share_repo.count_by_status("accepted").unwrap_or(0);
-        let rejected = share_repo.count_by_status("rejected").unwrap_or(0);
+        let total = share_repo.total_outcome_count().unwrap_or(0);
+        let accepted = share_repo.count_outcomes_by_status("accepted").unwrap_or(0);
+        let rejected = share_repo.count_outcomes_by_status("rejected").unwrap_or(0);
         (total, accepted, rejected)
     } else {
         (stats.total_shares, stats.accepted_shares, stats.rejected_shares)
@@ -109,31 +109,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_response_queries_repository() {
-        // Create test database with known share data
+        // Create test database with known share outcome data
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         
-        // Insert a worker first
+        // Insert a worker
         db_conn.execute(
             "INSERT INTO workers (id, payout_address, worker_suffix) VALUES (1, 'test_addr', 'rig1')",
             [],
         ).unwrap();
         
-        // Insert shares with different statuses
+        // Insert raw shares (one per outcome)
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, status, reject_reason) 
-             VALUES (1, 'sess-1', 'job-1', '00112233', '001122334455', '0011223344556677', 1.0, 'accepted', NULL)",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 100, '00112233', '001122334455', '0011223344556677', 1.0, 'dk1')",
             [],
         ).unwrap();
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, status, reject_reason) 
-             VALUES (1, 'sess-1', 'job-1', '00112234', '001122334456', '0011223344556678', 1.0, 'accepted', NULL)",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 101, '00112234', '001122334456', '0011223344556678', 1.0, 'dk2')",
             [],
         ).unwrap();
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, status, reject_reason) 
-             VALUES (1, 'sess-1', 'job-1', '00112235', '001122334457', '0011223344556679', 1.0, 'rejected', 'low-difficulty-share')",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 102, '00112235', '001122334457', '0011223344556679', 1.0, 'dk3')",
+            [],
+        ).unwrap();
+        
+        // Insert share outcomes (what stats queries)
+        db_conn.execute(
+            "INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, low_diff_ok, network_target_ok) 
+             VALUES (1, 'sess-1', 1, 'job-1', 'dk1', 'accepted', 1, 0)",
+            [],
+        ).unwrap();
+        db_conn.execute(
+            "INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, low_diff_ok, network_target_ok) 
+             VALUES (2, 'sess-1', 1, 'job-1', 'dk2', 'accepted', 1, 0)",
+            [],
+        ).unwrap();
+        db_conn.execute(
+            "INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, reject_reason, low_diff_ok, network_target_ok) 
+             VALUES (3, 'sess-1', 1, 'job-1', 'dk3', 'rejected', 'low-difficulty-share', 0, 0)",
             [],
         ).unwrap();
 
@@ -146,7 +163,7 @@ mod tests {
         }))
         .await;
 
-        // Should query actual database counts
+        // Should query actual database counts from share_outcomes
         assert_eq!(response.total_shares, 3);
         assert_eq!(response.accepted_shares, 2);
         assert_eq!(response.rejected_shares, 1);

@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::stratum_protocol::session::SessionState;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
-use crate::accounting::{ShareRepository, WorkerRepository, Share};
+use crate::accounting::{ShareRepository, WorkerRepository, Share, ShareOutcome, AuthorizationEvent};
 
 /// TCP Stratum V1 server that accepts miner connections.
 pub struct StratumServer {
@@ -132,9 +132,6 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
-    // Send initial difficulty (optional, per spec)
-    // For now, we skip this and let miners use default
-
     loop {
         line.clear();
         
@@ -177,11 +174,17 @@ async fn handle_connection(
                                 session.handle_subscribe(&req)
                             }
                             Method::Authorize => {
-                                session.handle_authorize(&req)
+                                let auth_resp = session.handle_authorize(&req);
+                                // Record authorization event per UBQ §Authorization Event
+                                record_authorization_event(
+                                    &req,
+                                    &session,
+                                    &auth_resp,
+                                    share_repo.as_ref(),
+                                ).await;
+                                auth_resp
                             }
                             Method::Submit => {
-                                // For Slice 1/2, accept all valid submits
-                                // Validation comes in Slice 3
                                 handle_submit(
                                     &req,
                                     &session,
@@ -212,13 +215,29 @@ async fn handle_connection(
                         writer.write_all(b"\n").await?;
                         
                         // If authorized, send mining.notify with current job
+                        // and record the assigned job in session (per UBQ §Assigned Job)
                         if session.is_authorized && req.method == Method::Authorize {
                             if let Some(job) = job_cache.get_latest().await {
                                 let notify = create_notify(&job, &session.session_id);
                                 let notify_line = serde_json::to_string(&notify)?;
                                 writer.write_all(notify_line.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
-                                debug!(session = %session.session_id, job = %job.job_id, "sent mining.notify");
+                                
+                                // Record assigned job with current P_diff and frozen ntime
+                                // Per UBQ: P_diff at assignment time becomes share difficulty
+                                let p_diff = session.current_difficulty();
+                                session.record_assigned_job(
+                                    job.job_id.clone(),
+                                    p_diff,
+                                    job.ntime.clone(),
+                                );
+                                debug!(
+                                    session = %session.session_id,
+                                    job = %job.job_id,
+                                    p_diff = p_diff,
+                                    ntime = %job.ntime,
+                                    "sent mining.notify and recorded assigned job",
+                                );
                             }
                         }
                     }
@@ -247,14 +266,54 @@ fn create_notify(job: &MiningJob, _session_id: &str) -> serde_json::Value {
     })
 }
 
-/// Handle a mining.submit request and persist the share.
+/// Record an authorization event (immutable audit log per UBQ).
+/// Every mining.authorize attempt produces one record, regardless of success/failure.
+async fn record_authorization_event(
+    req: &crate::stratum_protocol::protocol::StratumRequest,
+    session: &SessionState,
+    auth_resp: &StratumResponse,
+    share_repo: Option<&ShareRepository>,
+) {
+    let arr = req.params.as_array().cloned().unwrap_or_default();
+    let worker_name = arr.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    let (payout_address, worker_suffix) = match crate::stratum_protocol::session::parse_worker_name(&worker_name) {
+        Ok(w) => (w.payout_address, w.worker_suffix),
+        Err(_) => (worker_name.clone(), None),
+    };
+
+    let authorized = auth_resp.error.is_null();
+    let reason = if !authorized {
+        auth_resp.error.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_str()).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    if let Some(repo) = share_repo {
+        let event = AuthorizationEvent {
+            id: 0,
+            session_id: session.session_id.clone(),
+            worker_name,
+            payout_address,
+            worker_suffix,
+            authorized,
+            reason,
+        };
+        if let Err(e) = repo.insert_authorization_event(&event) {
+            warn!(error = %e, "failed to record authorization event");
+        }
+    }
+}
+
+/// Handle a mining.submit request and persist the share + outcome.
+/// Per UBQ: inserts into both `shares` (raw submission) and `share_outcomes` (validation result).
 async fn handle_submit(
     req: &crate::stratum_protocol::protocol::StratumRequest,
     session: &SessionState,
     share_repo: Option<&ShareRepository>,
     worker_repo: Option<&WorkerRepository>,
 ) -> StratumResponse {
-    // First validate the submit shape via session
+    // First validate the submit shape and session state via session
     let session_resp = session.handle_submit(req);
     
     // If session validation failed, return the error
@@ -278,28 +337,71 @@ async fn handle_submit(
         }
     };
     
-    // Persist share if repositories are available
+    // Look up the assigned job to get template_id, template_epoch, and difficulty
+    // Per UBQ: share difficulty = P_diff at assignment time (from assigned_jobs)
+    let assigned_job = session.get_assigned_job(job_id);
+    let difficulty = assigned_job.map(|a| a.p_diff).unwrap_or(1.0);
+    
+    // Persist share + outcome if repositories are available
     if let (Some(share_repo), Some(worker_repo)) = (share_repo, worker_repo) {
         // Upsert worker to get worker_id
         match worker_repo.upsert(&worker_parsed.payout_address, worker_parsed.worker_suffix.as_deref()) {
             Ok(worker) => {
-                // Create share record
+                // Build dedupe key per UBQ format
+                // For Slice 1 (static jobs), template_id and template_epoch are 0
+                let dedupe_key = ShareRepository::build_dedupe_key(
+                    worker.id,
+                    0,  // template_id — resolved properly in Slice 2+
+                    0,  // template_epoch
+                    extranonce2,
+                    ntime_hex,
+                    nonce_hex,
+                );
+                
+                // Create and insert raw share record
                 let share = Share {
                     id: 0,
                     worker_id: worker.id,
                     session_id: session.session_id.clone(),
                     job_id: job_id.to_string(),
+                    template_id: 0,   // Placeholder for Slice 1 (static job)
+                    template_epoch: 0,
                     extranonce2: extranonce2.to_string(),
                     ntime_hex_6b: ntime_hex.to_string(),
                     nonce_hex_8b: nonce_hex.to_string(),
-                    difficulty: 1.0, // Fixed difficulty for Slice 1
-                    status: "accepted".to_string(), // All shares accepted in Slice 1
-                    reject_reason: None,
+                    difficulty,
+                    dedupe_key: dedupe_key.clone(),
                 };
                 
-                // Insert share
-                if let Err(e) = share_repo.insert(&share) {
-                    warn!(error = %e, "failed to persist share");
+                match share_repo.insert_share(&share) {
+                    Ok(Some(share_id)) => {
+                        // Create and insert share outcome (Slice 1: all accepted)
+                        let outcome = ShareOutcome {
+                            id: 0,
+                            share_id,
+                            session_id: session.session_id.clone(),
+                            worker_id: worker.id,
+                            job_id: job_id.to_string(),
+                            round_id: None,
+                            dedupe_key,
+                            status: "accepted".to_string(),
+                            reject_reason: None,
+                            node_result: None,
+                            low_diff_ok: Some(true),
+                            network_target_ok: Some(false),
+                            block_hash: None,
+                        };
+                        
+                        if let Err(e) = share_repo.insert_share_outcome(&outcome) {
+                            warn!(error = %e, "failed to persist share outcome");
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(dedupe_key = %dedupe_key, "duplicate share ignored (dedupe_key)");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to persist raw share");
+                    }
                 }
             }
             Err(e) => {
@@ -323,7 +425,7 @@ mod tests {
 
     fn create_test_job() -> MiningJob {
         MiningJob {
-            job_id: "job-1".to_string(),
+            job_id: "job-1-1234567890".to_string(),
             template_id: 1,
             prevhash: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             coinbase1: "0100000001".to_string(),
@@ -348,7 +450,6 @@ mod tests {
         let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None);
         
         // Server should start without error
-        // (We can't easily test the full loop without blocking)
         assert_eq!(server.connected_miners().await, 0);
     }
 
@@ -377,7 +478,7 @@ mod tests {
         assert_eq!(notify["id"], serde_json::Value::Null);
         
         let params = notify["params"].as_array().unwrap();
-        assert_eq!(params[0], "job-1"); // job_id
+        assert_eq!(params[0], "job-1-1234567890"); // job_id with epoch
         assert_eq!(params[1], job.prevhash); // prevhash
         assert_eq!(params.len(), 9); // 9 params total
     }
@@ -393,38 +494,33 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
         let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
         
-        // Spawn server in background
         let server_handle = tokio::spawn(async move {
             server.run().await
         });
         
-        // Give server time to start
         tokio::time::sleep(Duration::from_millis(100)).await;
         
-        // Connect as miner
         let stream = TcpStream::connect("127.0.0.1:13334").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         
-        // Send mining.subscribe
+        // Subscribe
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
-        
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"].as_array().unwrap().len(), 3);
         
-        // Send mining.authorize
+        // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
-        
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"], serde_json::Value::Bool(true));
         
-        // Should receive mining.notify after authorize
+        // Receive mining.notify after authorize
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
             .await
@@ -432,10 +528,10 @@ mod tests {
             .unwrap();
         let notify: serde_json::Value = serde_json::from_str(&response.trim()).unwrap();
         assert_eq!(notify["method"], "mining.notify");
-        assert_eq!(notify["params"][0], "job-1");
+        assert_eq!(notify["params"][0], "job-1-1234567890");
         
-        // Send mining.submit
-        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-1\",\"00112233\",\"001122334455\",\"0011223344556677\"]}\n").await.unwrap();
+        // Submit with the correct ntime that matches the job
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-1-1234567890\",\"00112233\",\"5f5f5f5f\",\"0011223344556677\"]}\n").await.unwrap();
         
         response.clear();
         reader.read_line(&mut response).await.unwrap();
@@ -443,14 +539,12 @@ mod tests {
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"], serde_json::Value::Bool(true));
         
-        // Shutdown server
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
 
     #[tokio::test]
     async fn test_authorize_requires_subscribe() {
-        // Start server
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
         
@@ -464,7 +558,6 @@ mod tests {
         
         tokio::time::sleep(Duration::from_millis(100)).await;
         
-        // Connect and try to authorize without subscribe
         let stream = TcpStream::connect("127.0.0.1:13335").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -478,14 +571,12 @@ mod tests {
         assert!(!resp["error"].is_null());
         assert_eq!(resp["error"].as_array().unwrap()[1], "not-subscribed");
         
-        // Shutdown
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
 
     #[tokio::test]
     async fn test_invalid_json_request() {
-        // Start server
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
         
@@ -499,7 +590,6 @@ mod tests {
         
         tokio::time::sleep(Duration::from_millis(100)).await;
         
-        // Send invalid JSON
         let stream = TcpStream::connect("127.0.0.1:13336").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -512,26 +602,23 @@ mod tests {
         
         assert!(!resp["error"].is_null());
         
-        // Shutdown
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
 
-    /// Integration test: verify shares submitted during graceful shutdown are persisted
+    /// Integration test: verify shares persisted during graceful shutdown
     #[tokio::test]
     async fn test_graceful_shutdown_persists_in_flight_shares() {
         use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, ShareRepository};
         use parking_lot::Mutex;
 
-        // Create temporary database
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
         let db_conn = Connection::open(&db_path).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
 
-        // Start server with database
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
         
@@ -550,7 +637,6 @@ mod tests {
         
         tokio::time::sleep(Duration::from_millis(100)).await;
         
-        // Connect as miner
         let stream = TcpStream::connect("127.0.0.1:13337").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -572,25 +658,91 @@ mod tests {
             .expect("should receive mining.notify")
             .unwrap();
         
-        // Submit share
-        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-1\",\"00112233\",\"001122334455\",\"0011223344556677\"]}\n").await.unwrap();
+        // Submit share with correct ntime from job
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-1-1234567890\",\"00112233\",\"5f5f5f5f\",\"0011223344556677\"]}\n").await.unwrap();
         
-        // Wait for share response (confirms share was processed and persisted)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null(), "share should be accepted");
         
-        // Now initiate shutdown immediately after share is persisted
         shutdown_tx.send(()).unwrap();
-        
-        // Wait for server to shut down
         let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
         
-        // Verify share was persisted
+        // Verify both share and share_outcome were persisted
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total_shares = share_repo.total_count().unwrap();
+        let total_outcomes = share_repo.total_outcome_count().unwrap();
         
-        assert_eq!(total_shares, 1, "share submitted during shutdown should be persisted");
+        assert_eq!(total_shares, 1, "raw share should be persisted");
+        assert_eq!(total_outcomes, 1, "share outcome should be persisted");
+    }
+
+    /// Integration test: verify authorizing records an authorization event
+    #[tokio::test]
+    async fn test_authorization_event_recorded() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::init_schema;
+        use parking_lot::Mutex;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+        
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13338".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(db_conn_arc.clone()),
+        );
+        
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+        
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        let stream = TcpStream::connect("127.0.0.1:13338").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Authorize with valid worker
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+        
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+        
+        // Verify auth event was recorded
+        // Query the authorization_events table directly
+        let conn = db_conn_arc.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_events WHERE session_id = 'sess-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "authorization event should be recorded");
     }
 }

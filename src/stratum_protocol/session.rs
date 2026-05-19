@@ -1,7 +1,19 @@
-use crate::stratum_protocol::protocol::{Method, StratumRequest, StratumResponse};
+use crate::stratum_protocol::protocol::{StratumRequest, StratumResponse};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use rand::Rng;
+
+/// Maximum assigned jobs per session (per UBQ invariant). See UBQ §Assigned Job.
+const MAX_ASSIGNED_JOBS_PER_SESSION: usize = 128;
+
+/// A record of a job that was dispatched to the miner via mining.notify.
+/// Per UBQ §Assigned Job: each assigned job captures (job_id, P_diff, ntime).
+#[derive(Debug, Clone)]
+pub struct AssignedJob {
+    pub job_id: String,
+    pub p_diff: f64,
+    pub ntime: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
@@ -11,7 +23,9 @@ pub struct SessionState {
     pub is_subscribed: bool,
     pub is_authorized: bool,
     pub authorized_workers: HashSet<String>,
-    pub active_jobs: HashSet<String>,
+    /// Per UBQ §Assigned Job: tracks (job_id, P_diff, ntime) for every dispatched mining.notify.
+    /// Capped at MAX_ASSIGNED_JOBS_PER_SESSION (default 128) to bound memory.
+    pub assigned_jobs: VecDeque<AssignedJob>,
 }
 
 impl SessionState {
@@ -25,7 +39,7 @@ impl SessionState {
             is_subscribed: false,
             is_authorized: false,
             authorized_workers: HashSet::new(),
-            active_jobs: HashSet::new(),
+            assigned_jobs: VecDeque::new(),
         }
     }
 
@@ -48,15 +62,48 @@ impl SessionState {
         }
         let arr = req.params.as_array().cloned().unwrap_or_default();
         let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
-        
+
         // Validate worker name format
         if parse_worker_name(worker).is_err() {
             return StratumResponse::err(req.id.clone(), 24, "unauthorized-worker");
         }
-        
+
         self.authorized_workers.insert(worker.to_string());
         self.is_authorized = true;
         StratumResponse::ok(req.id.clone(), Value::Bool(true))
+    }
+
+    /// Record an assigned job (dispatched mining.notify) in the session.
+    /// Per UBQ: tracks (job_id, P_diff, ntime) and caps at MAX_ASSIGNED_JOBS_PER_SESSION.
+    pub fn record_assigned_job(&mut self, job_id: String, p_diff: f64, ntime: String) {
+        if self.assigned_jobs.len() >= MAX_ASSIGNED_JOBS_PER_SESSION {
+            self.assigned_jobs.pop_front();
+        }
+        self.assigned_jobs.push_back(AssignedJob {
+            job_id,
+            p_diff,
+            ntime,
+        });
+    }
+
+    /// Get an assigned job by job_id.
+    pub fn get_assigned_job(&self, job_id: &str) -> Option<&AssignedJob> {
+        self.assigned_jobs.iter().find(|j| j.job_id == job_id)
+    }
+
+    /// Clear all assigned jobs (called on clean_jobs=true).
+    /// Per UBQ: when clean_jobs=true, ALL previous jobs become stale immediately.
+    pub fn clear_assigned_jobs(&mut self) {
+        self.assigned_jobs.clear();
+    }
+
+    /// Get the current P_diff (from the most recent assigned job, or 1.0 if none).
+    /// Used for share difficulty recording.
+    pub fn current_difficulty(&self) -> f64 {
+        self.assigned_jobs
+            .back()
+            .map(|j| j.p_diff)
+            .unwrap_or(1.0)
     }
 
     pub fn handle_submit(&self, req: &StratumRequest) -> StratumResponse {
@@ -65,17 +112,33 @@ impl SessionState {
         }
         let arr = req.params.as_array().cloned().unwrap_or_default();
         let worker = arr.first().and_then(|v| v.as_str()).unwrap_or_default();
-        
+
         if !self.authorized_workers.contains(worker) {
             return StratumResponse::rejected(req.id.clone(), 24, "unauthorized-worker");
         }
-        
-        // Validate submit shape (5 params minimum)
+
+        // Validate submit shape (5 params minimum: worker, job_id, extranonce2, ntime, nonce)
         if arr.len() < 5 {
             return StratumResponse::rejected(req.id.clone(), 20, "invalid-submit-shape");
         }
-        
-        // For Slice 1, accept all valid submits (validation in Slice 3)
+
+        // Validate ntime matches frozen ntime from assigned job (ntime-mismatch check per UBQ)
+        let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+        let ntime = arr.get(3).and_then(|v| v.as_str()).unwrap_or_default();
+
+        if let Some(assigned) = self.get_assigned_job(job_id) {
+            if ntime != assigned.ntime {
+                return StratumResponse::rejected(
+                    req.id.clone(),
+                    21,
+                    "ntime-mismatch",
+                );
+            }
+        } else {
+            // Job not in assigned_jobs → stale
+            return StratumResponse::rejected(req.id.clone(), 22, "stale-job");
+        }
+
         StratumResponse::ok(req.id.clone(), Value::Bool(true))
     }
 }
@@ -107,6 +170,7 @@ pub struct WorkerName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stratum_protocol::protocol::Method;
 
     #[test]
     fn test_subscribe_creates_session() {
@@ -183,6 +247,8 @@ mod tests {
         session.is_subscribed = true;
         session.is_authorized = true;
         session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
+        // Record an assigned job so ntime check passes
+        session.record_assigned_job("job1".to_string(), 1.0, "001122334455".to_string());
         
         let req = StratumRequest {
             id: Value::Number(3.into()),
@@ -194,6 +260,108 @@ mod tests {
         
         assert!(resp.error.is_null());
         assert_eq!(resp.result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_submit_stale_job() {
+        let mut session = SessionState::new("sess-6".to_string());
+        session.is_subscribed = true;
+        session.is_authorized = true;
+        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
+        // No assigned jobs recorded → submit against unknown job = stale
+        
+        let req = StratumRequest {
+            id: Value::Number(3.into()),
+            method: Method::Submit,
+            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "unknown-job", "00112233", "001122334455", "0011223344556677"]).into(),
+        };
+        
+        let resp = session.handle_submit(&req);
+        
+        assert!(!resp.error.is_null());
+        assert_eq!(resp.result, Value::Bool(false));
+        // Should have stale-job error
+        let error_arr = resp.error.as_array().unwrap();
+        assert_eq!(error_arr[1], "stale-job");
+    }
+
+    #[test]
+    fn test_submit_ntime_mismatch() {
+        let mut session = SessionState::new("sess-7".to_string());
+        session.is_subscribed = true;
+        session.is_authorized = true;
+        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
+        // Record assigned job with ntime="abc123"
+        session.record_assigned_job("job1".to_string(), 1.0, "abc123".to_string());
+        
+        // Submit with different ntime
+        let req = StratumRequest {
+            id: Value::Number(3.into()),
+            method: Method::Submit,
+            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "job1", "00112233", "different", "0011223344556677"]).into(),
+        };
+        
+        let resp = session.handle_submit(&req);
+        
+        assert!(!resp.error.is_null());
+        assert_eq!(resp.result, Value::Bool(false));
+        let error_arr = resp.error.as_array().unwrap();
+        assert_eq!(error_arr[1], "ntime-mismatch");
+    }
+
+    #[test]
+    fn test_assigned_jobs_cap() {
+        let mut session = SessionState::new("sess-8".to_string());
+        // Record more than MAX_ASSIGNED_JOBS_PER_SESSION jobs
+        for i in 0..MAX_ASSIGNED_JOBS_PER_SESSION + 10 {
+            session.record_assigned_job(
+                format!("job-{}", i),
+                1.0,
+                format!("ntime-{}", i),
+            );
+        }
+        
+        // Should be capped at MAX_ASSIGNED_JOBS_PER_SESSION
+        assert_eq!(session.assigned_jobs.len(), MAX_ASSIGNED_JOBS_PER_SESSION);
+        
+        // Oldest jobs should be evicted
+        assert!(session.get_assigned_job("job-0").is_none());
+        assert!(session.get_assigned_job("job-1").is_none());
+        
+        // Recent jobs should still be present
+        assert!(session.get_assigned_job(
+            &format!("job-{}", MAX_ASSIGNED_JOBS_PER_SESSION + 9)
+        ).is_some());
+    }
+
+    #[test]
+    fn test_clear_assigned_jobs() {
+        let mut session = SessionState::new("sess-9".to_string());
+        session.record_assigned_job("job-1".to_string(), 1.0, "ntime-1".to_string());
+        session.record_assigned_job("job-2".to_string(), 1.0, "ntime-2".to_string());
+        
+        assert_eq!(session.assigned_jobs.len(), 2);
+        
+        session.clear_assigned_jobs();
+        
+        assert_eq!(session.assigned_jobs.len(), 0);
+        assert!(session.get_assigned_job("job-1").is_none());
+    }
+
+    #[test]
+    fn test_current_difficulty() {
+        let mut session = SessionState::new("sess-10".to_string());
+        
+        // Default when no jobs assigned
+        assert!((session.current_difficulty() - 1.0).abs() < f64::EPSILON);
+        
+        // After recording a job with specific difficulty
+        session.record_assigned_job("job-1".to_string(), 512.0, "ntime".to_string());
+        assert!((session.current_difficulty() - 512.0).abs() < f64::EPSILON);
+        
+        // After recording another job, should return latest
+        session.record_assigned_job("job-2".to_string(), 256.0, "ntime2".to_string());
+        assert!((session.current_difficulty() - 256.0).abs() < f64::EPSILON);
     }
 
     #[test]

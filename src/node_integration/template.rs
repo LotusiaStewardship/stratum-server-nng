@@ -6,9 +6,15 @@ use bitcoinsuite_core::Hashed;
 /// 
 /// The coinbase1/coinbase2 from the template are used as-is. Each miner session
 /// has its own extranonce1 which the miner inserts between coinbase1 and coinbase2.
+///
+/// # Job ID format (per UBQ §Job)
+/// `job-{template_id}-{epoch}` — e.g., `job-42-1234567890`.
+/// The epoch comes from the template's `curtime` field, which is a monotonically
+/// increasing counter from lotusd (not a unix timestamp despite the name).
+/// On subsequent `miningwrkchg` events (Slice 6), the epoch is incremented.
 pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
     MiningJob {
-        job_id: format!("job-{}", template.template_id),
+        job_id: format!("job-{}-{}", template.template_id, template.curtime),
         template_id: template.template_id,
         prevhash: template.prev_hash_stratum.clone(),
         coinbase1: template.coinbase1.clone(),
@@ -60,7 +66,8 @@ mod tests {
         let template = create_test_template();
         let job = template_to_job(&template);
 
-        assert_eq!(job.job_id, "job-42");
+        // Job ID format per UBQ: job-{template_id}-{epoch}
+        assert_eq!(job.job_id, "job-42-1234567890");
         assert_eq!(job.template_id, 42);
         assert_eq!(job.prevhash, template.prev_hash_stratum);
         assert_eq!(job.coinbase1, template.coinbase1);
