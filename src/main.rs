@@ -12,7 +12,7 @@ use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
 use stratum_server_nng::stratum_protocol::server::StratumServer;
-use stratum_server_nng::accounting::init_schema;
+use stratum_server_nng::accounting::{init_schema, ShareRepository};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,8 +47,10 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let stats = Arc::new(RwLock::new(ServerStats::default()));
+    let share_repo = ShareRepository::new(db_conn_arc.clone());
     let app_state = AppState {
         stats: stats.clone(),
+        share_repo: Some(share_repo),
     };
 
     // Create NNG RPC client and job cache

@@ -7,11 +7,11 @@ use tokio::sync::RwLock;
 /// Job cache with LRU eviction for mining jobs.
 ///
 /// Stores up to `max_size` jobs. When full, oldest jobs are evicted first.
+/// Uses Moka's built-in LRU for eviction, with VecDeque only for tracking latest job.
 pub struct JobCache {
     cache: Cache<String, MiningJob>,
     job_order: Arc<RwLock<VecDeque<String>>>,
     max_size: u64,
-    current_size: Arc<RwLock<usize>>,
 }
 
 impl JobCache {
@@ -21,7 +21,6 @@ impl JobCache {
             cache: Cache::new(max_size),
             job_order: Arc::new(RwLock::new(VecDeque::new())),
             max_size,
-            current_size: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -29,23 +28,19 @@ impl JobCache {
     pub async fn insert(&self, job: MiningJob) {
         let job_id = job.job_id.clone();
 
-        // Insert into cache
-        self.cache.insert(job_id.clone(), job).await;
-
-        // Track insertion order and size
+        // Track insertion order
         let mut order = self.job_order.write().await;
-        let mut size = self.current_size.write().await;
-        
         order.push_back(job_id.clone());
-        *size += 1;
-
-        // Evict oldest if over capacity
+        
+        // Evict oldest if over capacity (synchronous LRU)
         while order.len() > self.max_size as usize {
             if let Some(oldest_id) = order.pop_front() {
                 self.cache.invalidate(&oldest_id).await;
-                *size -= 1;
             }
         }
+        
+        // Insert into cache
+        self.cache.insert(job_id.clone(), job).await;
     }
 
     /// Get a job by ID.
@@ -75,21 +70,21 @@ impl JobCache {
 
     /// Get the number of jobs currently in the cache.
     pub async fn len(&self) -> usize {
-        *self.current_size.read().await
+        let order = self.job_order.read().await;
+        order.len()
     }
 
     /// Check if the cache is empty.
     pub async fn is_empty(&self) -> bool {
-        *self.current_size.read().await == 0
+        let order = self.job_order.read().await;
+        order.is_empty()
     }
 
     /// Clear all jobs from the cache.
     pub async fn clear(&self) {
         self.cache.invalidate_all();
         let mut order = self.job_order.write().await;
-        let mut size = self.current_size.write().await;
         order.clear();
-        *size = 0;
     }
 }
 
@@ -232,5 +227,41 @@ mod tests {
         assert!(cache.get("job-3").await.is_some());
         assert!(cache.get("job-4").await.is_some());
         assert!(cache.get("job-5").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_returns_most_recent() {
+        let cache = JobCache::new(10);
+
+        // Initially empty
+        assert!(cache.get_latest().await.is_none());
+
+        // Insert jobs in order
+        cache.insert(create_test_job("job-1", 1)).await;
+        let latest = cache.get_latest().await;
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().job_id, "job-1");
+
+        cache.insert(create_test_job("job-2", 2)).await;
+        let latest = cache.get_latest().await;
+        assert_eq!(latest.unwrap().job_id, "job-2");
+
+        cache.insert(create_test_job("job-3", 3)).await;
+        let latest = cache.get_latest().await;
+        assert_eq!(latest.unwrap().job_id, "job-3");
+    }
+
+    #[tokio::test]
+    async fn test_len_matches_cache_size() {
+        let cache = JobCache::new(10);
+        
+        assert_eq!(cache.len().await, 0);
+        
+        cache.insert(create_test_job("job-1", 1)).await;
+        assert_eq!(cache.len().await, 1);
+        
+        cache.insert(create_test_job("job-2", 2)).await;
+        cache.insert(create_test_job("job-3", 3)).await;
+        assert_eq!(cache.len().await, 3);
     }
 }
