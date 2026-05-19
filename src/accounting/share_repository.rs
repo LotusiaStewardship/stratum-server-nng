@@ -1,5 +1,8 @@
 use anyhow::Result;
-use rusqlite::{Connection, ToSql};
+use rusqlite::Connection;
+use rusqlite::ToSql;
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Share {
@@ -15,17 +18,18 @@ pub struct Share {
     pub reject_reason: Option<String>,
 }
 
-pub struct ShareRepository<'a> {
-    conn: &'a Connection,
+pub struct ShareRepository {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl<'a> ShareRepository<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+impl ShareRepository {
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     pub fn insert(&self, share: &Share) -> Result<i64> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "INSERT INTO shares (worker_id, session_id, job_id, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, status, reject_reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
@@ -46,8 +50,8 @@ impl<'a> ShareRepository<'a> {
     }
 
     pub fn count_by_worker(&self, worker_id: i64) -> Result<i64> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock();
+        let mut stmt = conn
             .prepare("SELECT COUNT(*) FROM shares WHERE worker_id = ?1")?;
 
         let count: i64 = stmt.query_row([worker_id], |row| row.get(0))?;
@@ -55,8 +59,8 @@ impl<'a> ShareRepository<'a> {
     }
 
     pub fn count_by_status(&self, status: &str) -> Result<i64> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock();
+        let mut stmt = conn
             .prepare("SELECT COUNT(*) FROM shares WHERE status = ?1")?;
 
         let count: i64 = stmt.query_row([status], |row| row.get(0))?;
@@ -64,7 +68,8 @@ impl<'a> ShareRepository<'a> {
     }
 
     pub fn total_count(&self) -> Result<i64> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM shares")?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM shares")?;
         let count: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(count)
     }
@@ -106,7 +111,7 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_worker(&conn, 1);
 
-        let share_repo = ShareRepository::new(&conn);
+        let share_repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         let share = create_test_share(1, "accepted");
 
         let id = share_repo.insert(&share).unwrap();
@@ -120,7 +125,7 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_worker(&conn, 1);
 
-        let share_repo = ShareRepository::new(&conn);
+        let share_repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         let mut share = create_test_share(1, "rejected");
         share.reject_reason = Some("low-difficulty-share".to_string());
 
@@ -136,7 +141,7 @@ mod tests {
         setup_worker(&conn, 1);
         setup_worker(&conn, 2);
 
-        let share_repo = ShareRepository::new(&conn);
+        let share_repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         share_repo.insert(&create_test_share(1, "accepted")).unwrap();
         share_repo.insert(&create_test_share(1, "accepted")).unwrap();
         share_repo.insert(&create_test_share(2, "accepted")).unwrap();
@@ -152,7 +157,7 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_worker(&conn, 1);
 
-        let share_repo = ShareRepository::new(&conn);
+        let share_repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         share_repo.insert(&create_test_share(1, "accepted")).unwrap();
         share_repo.insert(&create_test_share(1, "accepted")).unwrap();
         share_repo.insert(&create_test_share(1, "rejected")).unwrap();
@@ -168,7 +173,7 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_worker(&conn, 1);
 
-        let share_repo = ShareRepository::new(&conn);
+        let share_repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         assert_eq!(share_repo.total_count().unwrap(), 0);
 
         share_repo.insert(&create_test_share(1, "accepted")).unwrap();

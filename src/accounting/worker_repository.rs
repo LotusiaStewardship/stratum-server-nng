@@ -1,5 +1,8 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
+use rusqlite::params;
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Worker {
@@ -8,12 +11,12 @@ pub struct Worker {
     pub worker_suffix: Option<String>,
 }
 
-pub struct WorkerRepository<'a> {
-    conn: &'a Connection,
+pub struct WorkerRepository {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl<'a> WorkerRepository<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+impl WorkerRepository {
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
@@ -21,8 +24,10 @@ impl<'a> WorkerRepository<'a> {
         // Convert empty string to NULL for storage
         let suffix_value = worker_suffix.filter(|s| !s.is_empty());
         
+        let conn = self.conn.lock();
+        
         // Insert or get existing
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "INSERT INTO workers (payout_address, worker_suffix) 
              VALUES (?1, ?2) 
              ON CONFLICT(payout_address, worker_suffix) DO UPDATE SET 
@@ -45,8 +50,8 @@ impl<'a> WorkerRepository<'a> {
     }
 
     pub fn get_by_id(&self, id: i64) -> Result<Option<Worker>> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock();
+        let mut stmt = conn
             .prepare("SELECT id, payout_address, worker_suffix FROM workers WHERE id = ?1")?;
 
         let worker = stmt.query_row([id], |row| {
@@ -77,7 +82,7 @@ mod tests {
         let conn = Connection::open(f.path()).unwrap();
         init_schema(&conn).unwrap();
 
-        let repo = WorkerRepository::new(&conn);
+        let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker = repo
             .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
             .unwrap();
@@ -96,7 +101,7 @@ mod tests {
         let conn = Connection::open(f.path()).unwrap();
         init_schema(&conn).unwrap();
 
-        let repo = WorkerRepository::new(&conn);
+        let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker1 = repo
             .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
             .unwrap();
@@ -114,7 +119,7 @@ mod tests {
         let conn = Connection::open(f.path()).unwrap();
         init_schema(&conn).unwrap();
 
-        let repo = WorkerRepository::new(&conn);
+        let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker = repo
             .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", None)
             .unwrap();
@@ -128,7 +133,7 @@ mod tests {
         let conn = Connection::open(f.path()).unwrap();
         init_schema(&conn).unwrap();
 
-        let repo = WorkerRepository::new(&conn);
+        let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker = repo
             .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
             .unwrap();

@@ -53,6 +53,15 @@ impl JobCache {
         self.cache.get(job_id).await
     }
 
+    /// Get the most recently inserted job.
+    pub async fn get_latest(&self) -> Option<MiningJob> {
+        let order = self.job_order.read().await;
+        if let Some(latest_job_id) = order.back() {
+            return self.cache.get(latest_job_id).await;
+        }
+        None
+    }
+
     /// Get the current network difficulty target from the most recent job.
     pub async fn get_latest_target_hex(&self) -> Option<String> {
         let order = self.job_order.read().await;

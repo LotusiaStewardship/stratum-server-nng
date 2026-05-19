@@ -14,6 +14,12 @@ pub struct ShutdownCoordinator {
 }
 
 impl ShutdownCoordinator {
+    /// Get a clone of the broadcast sender for external use.
+    pub fn broadcast_channel(&self) -> broadcast::Sender<()> {
+        self.shutdown_tx.clone()
+    }
+
+    /// Create a new shutdown coordinator.
     pub fn new() -> Self {
         let (shutdown_tx, _) = broadcast::channel(1024);
         Self {
