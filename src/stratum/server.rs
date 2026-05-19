@@ -596,6 +596,8 @@ async fn refresh_job_from_node(
             nbits = %template.nbits_stratum,
             ntime = %template.ntime_stratum,
             target = %template.target.to_hex_be(),
+            coinbase1 = template.coinbase1,
+            coinbase2 = template.coinbase2,
             coinbase1_len = template.coinbase1.len(),
             coinbase2_len = template.coinbase2.len(),
             merkle_branches_count = template.merkle_branches.len(),
