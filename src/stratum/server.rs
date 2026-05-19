@@ -600,6 +600,7 @@ async fn refresh_job_from_node(
             coinbase2 = template.coinbase2,
             coinbase1_len = template.coinbase1.len(),
             coinbase2_len = template.coinbase2.len(),
+            merkle_branches = format!("{:?}", template.merkle_branches),
             merkle_branches_count = template.merkle_branches.len(),
             block_size = template.block.len(),
             version = template.version,
