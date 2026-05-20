@@ -1,3 +1,4 @@
+use crate::share_processing::VarDiffConfig;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::session::SessionState;
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, header_meets_difficulty};
@@ -233,7 +234,7 @@ mod tests {
     }
 
     fn create_authorized_session() -> SessionState {
-        let mut session = SessionState::new("sess-1".to_string());
+        let mut session = SessionState::new("sess-1".to_string(), VarDiffConfig::default(), 100.0);
         session.is_subscribed = true;
         session.is_authorized = true;
         session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
@@ -404,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_validate_share_rejects_when_not_authorized() {
-        let session = SessionState::new("sess-unauth".to_string());
+        let session = SessionState::new("sess-unauth".to_string(), VarDiffConfig::default(), 100.0);
         let job = create_test_job();
 
         let result = validate_share(
@@ -459,7 +460,7 @@ mod tests {
         let nonce = hex::encode(13573272464251480634u64.to_le_bytes());
 
         // Build the session with the exact extranonce1 from the block-finding share
-        let mut session = SessionState::new("sess-finder".to_string());
+        let mut session = SessionState::new("sess-finder".to_string(), VarDiffConfig::default(), 100.0);
         session.is_subscribed = true;
         session.is_authorized = true;
         session.extranonce1 = extranonce1.to_string();

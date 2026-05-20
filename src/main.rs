@@ -11,6 +11,7 @@ use stratum_server_nng::config::Config;
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
+use stratum_server_nng::share_processing::VarDiffConfig;
 use stratum_server_nng::stratum_protocol::server::StratumServer;
 use stratum_server_nng::accounting::{init_schema, ShareRepository};
 
@@ -112,6 +113,7 @@ async fn main() -> Result<()> {
         job_cache.clone(),
         shutdown_tx.clone(),
         Some(db_conn_arc.clone()),
+        config.vardiff.into(),
     ));
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {

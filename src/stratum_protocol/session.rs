@@ -1,6 +1,8 @@
+use crate::share_processing::{VarDiff, VarDiffConfig};
 use crate::stratum_protocol::protocol::{StratumRequest, StratumResponse};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
+use std::time::Instant;
 use rand::Rng;
 
 /// Maximum assigned jobs per session (per UBQ invariant). See UBQ §Assigned Job.
@@ -26,10 +28,12 @@ pub struct SessionState {
     /// Per UBQ §Assigned Job: tracks (job_id, P_diff, ntime) for every dispatched mining.notify.
     /// Capped at MAX_ASSIGNED_JOBS_PER_SESSION (default 128) to bound memory.
     pub assigned_jobs: VecDeque<AssignedJob>,
+    /// Per-session variable difficulty controller.
+    pub vardiff: VarDiff,
 }
 
 impl SessionState {
-    pub fn new(session_id: String) -> Self {
+    pub fn new(session_id: String, vardiff_config: VarDiffConfig, n_diff: f64) -> Self {
         // Generate random extranonce1 (4 bytes = 8 hex chars)
         let extranonce1 = format!("{:08x}", rand::thread_rng().gen::<u32>());
         Self {
@@ -40,6 +44,7 @@ impl SessionState {
             is_authorized: false,
             authorized_workers: HashSet::new(),
             assigned_jobs: VecDeque::new(),
+            vardiff: VarDiff::new(vardiff_config, n_diff, Instant::now()),
         }
     }
 
@@ -97,13 +102,10 @@ impl SessionState {
         self.assigned_jobs.clear();
     }
 
-    /// Get the current P_diff (from the most recent assigned job, or 1.0 if none).
+    /// Get the current P_diff from the VarDiff controller.
     /// Used for share difficulty recording.
     pub fn current_difficulty(&self) -> f64 {
-        self.assigned_jobs
-            .back()
-            .map(|j| j.p_diff)
-            .unwrap_or(1.0)
+        self.vardiff.current()
     }
 }
 
@@ -136,9 +138,13 @@ mod tests {
     use super::*;
     use crate::stratum_protocol::protocol::Method;
 
+    fn test_session(id: &str) -> SessionState {
+        SessionState::new(id.to_string(), VarDiffConfig::default(), 100.0)
+    }
+
     #[test]
     fn test_subscribe_creates_session() {
-        let mut session = SessionState::new("sess-1".to_string());
+        let mut session = test_session("sess-1");
         let req = StratumRequest {
             id: Value::Number(1.into()),
             method: Method::Subscribe,
@@ -149,7 +155,6 @@ mod tests {
         
         assert!(resp.error.is_null());
         assert!(session.is_subscribed);
-        // extranonce1 should be 8 hex characters (4 bytes)
         assert_eq!(session.extranonce1.len(), 8);
         assert!(session.extranonce1.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(session.extranonce2_size, 4);
@@ -157,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_authorize_requires_subscribe() {
-        let mut session = SessionState::new("sess-2".to_string());
+        let mut session = test_session("sess-2");
         let req = StratumRequest {
             id: Value::Number(2.into()),
             method: Method::Authorize,
@@ -172,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_authorize_with_valid_worker() {
-        let mut session = SessionState::new("sess-3".to_string());
+        let mut session = test_session("sess-3");
         session.is_subscribed = true;
         
         let req = StratumRequest {
@@ -190,8 +195,7 @@ mod tests {
 
     #[test]
     fn test_assigned_jobs_cap() {
-        let mut session = SessionState::new("sess-8".to_string());
-        // Record more than MAX_ASSIGNED_JOBS_PER_SESSION jobs
+        let mut session = test_session("sess-8");
         for i in 0..MAX_ASSIGNED_JOBS_PER_SESSION + 10 {
             session.record_assigned_job(
                 format!("job-{}", i),
@@ -200,14 +204,9 @@ mod tests {
             );
         }
         
-        // Should be capped at MAX_ASSIGNED_JOBS_PER_SESSION
         assert_eq!(session.assigned_jobs.len(), MAX_ASSIGNED_JOBS_PER_SESSION);
-        
-        // Oldest jobs should be evicted
         assert!(session.get_assigned_job("job-0").is_none());
         assert!(session.get_assigned_job("job-1").is_none());
-        
-        // Recent jobs should still be present
         assert!(session.get_assigned_job(
             &format!("job-{}", MAX_ASSIGNED_JOBS_PER_SESSION + 9)
         ).is_some());
@@ -215,32 +214,32 @@ mod tests {
 
     #[test]
     fn test_clear_assigned_jobs() {
-        let mut session = SessionState::new("sess-9".to_string());
+        let mut session = test_session("sess-9");
         session.record_assigned_job("job-1".to_string(), 1.0, "ntime-1".to_string());
         session.record_assigned_job("job-2".to_string(), 1.0, "ntime-2".to_string());
         
         assert_eq!(session.assigned_jobs.len(), 2);
-        
         session.clear_assigned_jobs();
-        
         assert_eq!(session.assigned_jobs.len(), 0);
         assert!(session.get_assigned_job("job-1").is_none());
     }
 
     #[test]
     fn test_current_difficulty() {
-        let mut session = SessionState::new("sess-10".to_string());
-        
-        // Default when no jobs assigned
-        assert!((session.current_difficulty() - 1.0).abs() < f64::EPSILON);
-        
-        // After recording a job with specific difficulty
+        let mut session = test_session("sess-10");
+        // Default: initial_pct (0.01) * N_diff (100.0) = 1.0
+        assert!(
+            (session.current_difficulty() - 1.0).abs() < f64::EPSILON,
+            "expected default P_diff = 1.0, got {}",
+            session.current_difficulty()
+        );
+        // current_difficulty() comes from VarDiff, not from assigned_jobs
         session.record_assigned_job("job-1".to_string(), 512.0, "ntime".to_string());
-        assert!((session.current_difficulty() - 512.0).abs() < f64::EPSILON);
-        
-        // After recording another job, should return latest
-        session.record_assigned_job("job-2".to_string(), 256.0, "ntime2".to_string());
-        assert!((session.current_difficulty() - 256.0).abs() < f64::EPSILON);
+        assert!(
+            (session.current_difficulty() - 1.0).abs() < f64::EPSILON,
+            "current_difficulty should still return VarDiff P_diff (1.0), got {}",
+            session.current_difficulty()
+        );
     }
 
     #[test]
@@ -270,17 +269,14 @@ mod tests {
 
     #[test]
     fn test_unique_extranonce1_per_session() {
-        // Create multiple sessions and verify they get different extranonce1 values
-        let session1 = SessionState::new("sess-1".to_string());
-        let session2 = SessionState::new("sess-2".to_string());
-        let session3 = SessionState::new("sess-3".to_string());
+        let session1 = test_session("sess-1");
+        let session2 = test_session("sess-2");
+        let session3 = test_session("sess-3");
         
-        // All should have valid 8-char hex extranonce1
         assert_eq!(session1.extranonce1.len(), 8);
         assert_eq!(session2.extranonce1.len(), 8);
         assert_eq!(session3.extranonce1.len(), 8);
         
-        // They should be different (probability of collision is extremely low)
         assert_ne!(session1.extranonce1, session2.extranonce1);
         assert_ne!(session2.extranonce1, session3.extranonce1);
         assert_ne!(session1.extranonce1, session3.extranonce1);

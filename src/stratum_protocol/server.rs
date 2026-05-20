@@ -1,6 +1,9 @@
 use anyhow::Result;
+use bitcoinsuite_bitcoind_stratum::target_to_difficulty;
+use crate::share_processing::VarDiffConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
@@ -23,6 +26,7 @@ pub struct StratumServer {
     shutdown_tx: broadcast::Sender<()>,
     share_repo: Option<ShareRepository>,
     worker_repo: Option<WorkerRepository>,
+    vardiff_config: VarDiffConfig,
 }
 
 impl StratumServer {
@@ -32,6 +36,7 @@ impl StratumServer {
         job_cache: Arc<crate::node_integration::JobCache>,
         shutdown_tx: broadcast::Sender<()>,
         db_conn: Option<Arc<Mutex<Connection>>>,
+        vardiff_config: VarDiffConfig,
     ) -> Self {
         let (share_repo, worker_repo) = if let Some(conn) = db_conn {
             (Some(ShareRepository::new(conn.clone())), Some(WorkerRepository::new(conn)))
@@ -46,6 +51,7 @@ impl StratumServer {
             shutdown_tx,
             share_repo,
             worker_repo,
+            vardiff_config,
         }
     }
 
@@ -68,7 +74,22 @@ impl StratumServer {
                         Ok((stream, addr)) => {
                             debug!(addr = %addr, "new miner connection");
                             let session_id = self.generate_session_id().await;
-                            let session = SessionState::new(session_id.clone());
+                            // Compute N_diff from the latest job's network target
+                            let n_diff = self
+                                .job_cache
+                                .get_latest()
+                                .await
+                                .and_then(|job| {
+                                    let target_bytes = hex::decode(&job.network_target_hex).ok()?;
+                                    let target_arr: [u8; 32] = target_bytes.as_slice().try_into().ok()?;
+                                    target_to_difficulty(&target_arr).ok()
+                                })
+                                .unwrap_or(1.0);
+                            let session = SessionState::new(
+                                session_id.clone(),
+                                self.vardiff_config.clone(),
+                                n_diff,
+                            );
                             
                             // Clone Arcs for the connection handler
                             let connected_miners = self.connected_miners.clone();
@@ -186,13 +207,30 @@ async fn handle_connection(
                                 auth_resp
                             }
                             Method::Submit => {
-                                handle_submit(
+                                let (resp, new_diff) = handle_submit(
                                     &req,
-                                    &session,
+                                    &mut session,
                                     &job_cache,
                                     share_repo.as_ref(),
                                     worker_repo.as_ref(),
-                                ).await
+                                ).await;
+                                // If VarDiff retargeted, send mining.set_difficulty to miner
+                                if let Some(diff) = new_diff {
+                                    let set_diff = serde_json::json!({
+                                        "id": null,
+                                        "method": "mining.set_difficulty",
+                                        "params": [diff]
+                                    });
+                                    let set_diff_line = serde_json::to_string(&set_diff)?;
+                                    writer.write_all(set_diff_line.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    debug!(
+                                        session = %session.session_id,
+                                        new_diff = diff,
+                                        "sent mining.set_difficulty after retarget",
+                                    );
+                                }
+                                resp
                             }
                             Method::Ping => {
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
@@ -311,16 +349,19 @@ async fn record_authorization_event(
 ///
 /// Per UBQ: inserts into both `shares` (raw submission) and `share_outcomes` (validation result).
 /// The validation pipeline checks format, authorization, staleness, ntime-mismatch, and difficulty.
+///
+/// Returns the protocol response and an optional new P_diff if VarDiff retargeted.
+/// When `Some(new_diff)` is returned, the caller should send `mining.set_difficulty` to the miner.
 async fn handle_submit(
     req: &crate::stratum_protocol::protocol::StratumRequest,
-    session: &SessionState,
+    session: &mut SessionState,
     job_cache: &crate::node_integration::JobCache,
     share_repo: Option<&ShareRepository>,
     worker_repo: Option<&WorkerRepository>,
-) -> StratumResponse {
+) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
     if !session.is_subscribed {
-        return StratumResponse::err(req.id.clone(), 25, "not-subscribed");
+        return (StratumResponse::err(req.id.clone(), 25, "not-subscribed"), None);
     }
 
     // Extract submit parameters
@@ -435,8 +476,18 @@ async fn handle_submit(
         }
     }
 
+    // Record accepted share in VarDiff and check for retarget.
+    // Only record timestamps for valid shares that reached validation.
+    let new_diff = if validation.accepted {
+        let now = Instant::now();
+        session.vardiff.record_share(now);
+        session.vardiff.maybe_retarget(now)
+    } else {
+        None
+    };
+
     // Return protocol response based on validation result
-    if validation.accepted {
+    let response = if validation.accepted {
         StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
     } else {
         let (code, reason) = match validation.reject_reason.as_deref() {
@@ -447,7 +498,9 @@ async fn handle_submit(
             _ => (20, "invalid-submit-shape"),
         };
         StratumResponse::rejected(req.id.clone(), code, reason)
-    }
+    };
+
+    (response, new_diff)
 }
 
 #[cfg(test)]
@@ -492,7 +545,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None);
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
         
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
@@ -503,7 +556,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None);
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -537,7 +590,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -595,7 +648,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -627,7 +680,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None);
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -674,6 +727,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
         
         let server_handle = tokio::spawn(async move {
@@ -746,6 +800,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
         
         let server_handle = tokio::spawn(async move {
@@ -814,6 +869,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
 
         let server_handle = tokio::spawn(async move {
@@ -878,6 +934,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
 
         let server_handle = tokio::spawn(async move {
@@ -952,6 +1009,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1026,6 +1084,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            VarDiffConfig::default(),
         );
 
         let server_handle = tokio::spawn(async move {

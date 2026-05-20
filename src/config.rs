@@ -16,7 +16,55 @@ pub struct Config {
     /// API bearer token for authentication
     #[serde(default = "default_api_token")]
     pub api_token: String,
+    /// Variable difficulty settings (maps to VarDiff runtime config)
+    #[serde(default)]
+    pub vardiff: VarDiffSettings,
 }
+
+/// Variable difficulty settings loaded from config.toml.
+/// Converted to `VarDiffConfig` at runtime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VarDiffSettings {
+    /// Absolute minimum P_diff floor
+    #[serde(default = "default_vardiff_min_floor")]
+    pub min_floor: f64,
+    /// Initial P_diff as fraction of N_diff
+    #[serde(default = "default_vardiff_initial_pct")]
+    pub initial_pct: f64,
+    /// Target seconds between shares
+    #[serde(default = "default_vardiff_target_secs")]
+    pub target_secs: f64,
+    /// Retarget interval in seconds
+    #[serde(default = "default_vardiff_retarget_secs")]
+    pub retarget_secs: f64,
+}
+
+impl Default for VarDiffSettings {
+    fn default() -> Self {
+        Self {
+            min_floor: default_vardiff_min_floor(),
+            initial_pct: default_vardiff_initial_pct(),
+            target_secs: default_vardiff_target_secs(),
+            retarget_secs: default_vardiff_retarget_secs(),
+        }
+    }
+}
+
+impl From<VarDiffSettings> for crate::share_processing::VarDiffConfig {
+    fn from(s: VarDiffSettings) -> Self {
+        Self {
+            min_floor: s.min_floor,
+            initial_pct: s.initial_pct,
+            target_secs: s.target_secs,
+            retarget_secs: s.retarget_secs,
+        }
+    }
+}
+
+fn default_vardiff_min_floor() -> f64 { 0.001 }
+fn default_vardiff_initial_pct() -> f64 { 0.01 }
+fn default_vardiff_target_secs() -> f64 { 20.0 }
+fn default_vardiff_retarget_secs() -> f64 { 60.0 }
 
 fn default_api_token() -> String {
     "devtoken".to_string()
@@ -104,5 +152,61 @@ mod tests {
     fn test_parse_invalid_toml() {
         let result: Result<Config, _> = toml::from_str("not valid toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vardiff_config_defaults() {
+        // Without [vardiff] section, should use defaults
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!((cfg.vardiff.min_floor - 0.001).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.initial_pct - 0.01).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.target_secs - 20.0).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.retarget_secs - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_vardiff_config_custom() {
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+
+            [vardiff]
+            min_floor = 0.01
+            initial_pct = 0.05
+            target_secs = 15.0
+            retarget_secs = 30.0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!((cfg.vardiff.min_floor - 0.01).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.initial_pct - 0.05).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.target_secs - 15.0).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.retarget_secs - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_vardiff_config_partial() {
+        // Only set some fields, rest should use defaults
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+
+            [vardiff]
+            min_floor = 0.5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!((cfg.vardiff.min_floor - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.vardiff.initial_pct - 0.01).abs() < f64::EPSILON); // default
+        assert!((cfg.vardiff.target_secs - 20.0).abs() < f64::EPSILON); // default
+        assert!((cfg.vardiff.retarget_secs - 60.0).abs() < f64::EPSILON); // default
     }
 }
