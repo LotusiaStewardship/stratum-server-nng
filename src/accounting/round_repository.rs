@@ -24,8 +24,9 @@ impl RoundRepository {
     }
 
     /// Ensure one open round exists. If no open round is found, creates one with the
-    /// given `start_template_id`. Returns the open round.
-    pub fn get_or_create_current_round(&self, start_template_id: i64) -> Result<Round> {
+    /// given `start_template_id`. Returns the open round and a bool indicating
+    /// whether a new round was created (true) or an existing one was returned (false).
+    pub fn get_or_create_current_round(&self, start_template_id: i64) -> Result<(Round, bool)> {
         let conn = self.conn.lock();
 
         // Try to find an existing open round
@@ -45,7 +46,7 @@ impl RoundRepository {
         );
 
         match existing {
-            Ok(round) => Ok(round),
+            Ok(round) => Ok((round, false)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // No open round exists — create one
                 let mut stmt = conn.prepare(
@@ -53,13 +54,13 @@ impl RoundRepository {
                 )?;
                 stmt.execute([start_template_id])?;
                 let id = conn.last_insert_rowid();
-                Ok(Round {
+                Ok((Round {
                     id,
                     start_template_id,
                     end_template_id: None,
                     status: "open".to_string(),
                     found_block_hash: None,
-                })
+                }, true))
             }
             Err(e) => Err(e.into()),
         }
@@ -81,7 +82,7 @@ impl RoundRepository {
     /// If the template's ID falls within an existing round's range (between start_template_id
     /// and end_template_id, inclusive), returns that round. If no round covers this template,
     /// creates a new open round with this template_id as the start.
-    pub fn resolve_round_for_template(&self, template_id: i64) -> Result<Round> {
+    pub fn resolve_round_for_template(&self, template_id: i64) -> Result<(Round, bool)> {
         let conn = self.conn.lock();
 
         // First try: template matches an open round's range (start <= template_id <= end or open)
@@ -105,7 +106,7 @@ impl RoundRepository {
         );
 
         match matching {
-            Ok(round) => Ok(round),
+            Ok(round) => Ok((round, false)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // No round covers this template — create a new open round
                 // Release lock before recursive-like call
@@ -189,8 +190,9 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        let round = repo.get_or_create_current_round(42).unwrap();
+        let (round, is_new) = repo.get_or_create_current_round(42).unwrap();
 
+        assert!(is_new, "a new round should be created");
         assert_eq!(round.status, "open");
         assert_eq!(round.start_template_id, 42);
         assert_eq!(round.id, 1);
@@ -205,9 +207,10 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        let round1 = repo.get_or_create_current_round(42).unwrap();
-        let round2 = repo.get_or_create_current_round(99).unwrap();
+        let (round1, _) = repo.get_or_create_current_round(42).unwrap();
+        let (round2, is_new) = repo.get_or_create_current_round(99).unwrap();
 
+        assert!(!is_new, "second call should return existing round");
         // Same round returned, start_template_id from the first call
         assert_eq!(round1.id, round2.id);
         assert_eq!(round2.start_template_id, 42);
@@ -221,7 +224,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        let round = repo.get_or_create_current_round(42).unwrap();
+        let (round, _) = repo.get_or_create_current_round(42).unwrap();
         repo.close_round(round.id, 99, "found").unwrap();
 
         let fetched = repo.get_by_id(round.id).unwrap().unwrap();
@@ -229,7 +232,8 @@ mod tests {
         assert_eq!(fetched.end_template_id, Some(99));
 
         // A new open round is created when none exists
-        let new_round = repo.get_or_create_current_round(100).unwrap();
+        let (new_round, is_new) = repo.get_or_create_current_round(100).unwrap();
+        assert!(is_new, "a new round should be created when none exists");
         assert_eq!(new_round.start_template_id, 100);
         assert_ne!(new_round.id, round.id);
     }
@@ -242,10 +246,10 @@ mod tests {
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
         // Create an open round for template 42
-        let _round = repo.get_or_create_current_round(42).unwrap();
+        let _ = repo.get_or_create_current_round(42).unwrap();
 
         // Resolving for any template >= 42 should return the open round
-        let resolved = repo.resolve_round_for_template(55).unwrap();
+        let (resolved, _is_new) = repo.resolve_round_for_template(55).unwrap();
         assert_eq!(resolved.status, "open");
     }
 
@@ -257,7 +261,8 @@ mod tests {
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
         // No rounds exist — resolving should create one
-        let resolved = repo.resolve_round_for_template(42).unwrap();
+        let (resolved, is_new) = repo.resolve_round_for_template(42).unwrap();
+        assert!(is_new, "a new round should be created");
         assert_eq!(resolved.start_template_id, 42);
         assert_eq!(resolved.status, "open");
     }
@@ -284,13 +289,13 @@ mod tests {
         assert!(repo.list(None).unwrap().is_empty());
 
         // Create one round
-        repo.get_or_create_current_round(1).unwrap();
+        let _ = repo.get_or_create_current_round(1).unwrap();
         assert_eq!(repo.list(None).unwrap().len(), 1);
 
         // Create another after closing the first
-        let first = repo.get_or_create_current_round(1).unwrap();
+        let (first, _) = repo.get_or_create_current_round(1).unwrap();
         repo.close_round(first.id, 10, "found").unwrap();
-        repo.get_or_create_current_round(11).unwrap();
+        let _ = repo.get_or_create_current_round(11).unwrap();
         assert_eq!(repo.list(None).unwrap().len(), 2);
     }
 
@@ -301,10 +306,10 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        let r1 = repo.get_or_create_current_round(1).unwrap();
+        let (r1, _) = repo.get_or_create_current_round(1).unwrap();
         repo.close_round(r1.id, 10, "found").unwrap();
 
-        let r2 = repo.get_or_create_current_round(11).unwrap();
+        let (r2, _) = repo.get_or_create_current_round(11).unwrap();
 
         let open = repo.list(Some("open")).unwrap();
         assert_eq!(open.len(), 1);

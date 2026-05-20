@@ -7,14 +7,12 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
-use parking_lot::Mutex;
-use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
 use crate::stratum_protocol::session::SessionState;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
-use crate::accounting::{ShareRepository, WorkerRepository, Share, ShareOutcome, AuthorizationEvent, AccountingService};
+use crate::accounting::{ShareRepository, AuthorizationEvent, AccountingService};
 use crate::share_processing::validator;
 
 /// TCP Stratum V1 server that accepts miner connections.
@@ -24,8 +22,9 @@ pub struct StratumServer {
     connected_miners: Arc<RwLock<u64>>,
     job_cache: Arc<crate::node_integration::JobCache>,
     shutdown_tx: broadcast::Sender<()>,
-    share_repo: Option<ShareRepository>,
-    worker_repo: Option<WorkerRepository>,
+    /// Broadcast channel for N_diff (network difficulty) changes.
+    /// Each session listens on this to update its VarDiff ceiling.
+    n_diff_tx: broadcast::Sender<f64>,
     accounting_service: Option<AccountingService>,
     vardiff_config: VarDiffConfig,
 }
@@ -36,26 +35,28 @@ impl StratumServer {
         bind_address: SocketAddr,
         job_cache: Arc<crate::node_integration::JobCache>,
         shutdown_tx: broadcast::Sender<()>,
-        db_conn: Option<Arc<Mutex<Connection>>>,
         accounting_service: Option<AccountingService>,
         vardiff_config: VarDiffConfig,
     ) -> Self {
-        let (share_repo, worker_repo) = if let Some(conn) = db_conn {
-            (Some(ShareRepository::new(conn.clone())), Some(WorkerRepository::new(conn)))
-        } else {
-            (None, None)
-        };
+        let (n_diff_tx, _) = broadcast::channel::<f64>(128);
         Self {
             bind_address,
             session_counter: Arc::new(RwLock::new(0)),
             connected_miners: Arc::new(RwLock::new(0)),
             job_cache,
             shutdown_tx,
-            share_repo,
-            worker_repo,
+            n_diff_tx,
             accounting_service,
             vardiff_config,
         }
+    }
+
+    /// Notify all active sessions of a change in network difficulty (N_diff).
+    /// Each session updates its VarDiff ceiling via `update_max()`, ensuring
+    /// the per-session P_diff never exceeds the new N_diff.
+    pub async fn notify_new_template(&self, new_n_diff: f64) {
+        debug!(new_n_diff, "broadcasting N_diff change to all sessions");
+        let _ = self.n_diff_tx.send(new_n_diff);
     }
 
     /// Get the number of connected miners.
@@ -98,8 +99,7 @@ impl StratumServer {
                             let connected_miners = self.connected_miners.clone();
                             let job_cache = self.job_cache.clone();
                             let shutdown_rx = shutdown_rx.resubscribe();
-                            let share_repo = self.share_repo.clone();
-                            let worker_repo = self.worker_repo.clone();
+                            let n_diff_rx = self.n_diff_tx.subscribe();
                             let accounting_service = self.accounting_service.clone();
                             
                             tokio::spawn(async move {
@@ -112,8 +112,7 @@ impl StratumServer {
                                     session,
                                     job_cache,
                                     shutdown_rx,
-                                    share_repo,
-                                    worker_repo,
+                                    n_diff_rx,
                                     accounting_service,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
@@ -152,8 +151,7 @@ async fn handle_connection(
     mut session: SessionState,
     job_cache: Arc<crate::node_integration::JobCache>,
     mut shutdown_signal: broadcast::Receiver<()>,
-    share_repo: Option<ShareRepository>,
-    worker_repo: Option<WorkerRepository>,
+    mut n_diff_rx: broadcast::Receiver<f64>,
     accounting_service: Option<AccountingService>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -208,7 +206,7 @@ async fn handle_connection(
                                     &req,
                                     &session,
                                     &auth_resp,
-                                    share_repo.as_ref(),
+                                    accounting_service.as_ref().map(|svc| &svc.share_repo),
                                 ).await;
                                 auth_resp
                             }
@@ -217,8 +215,6 @@ async fn handle_connection(
                                     &req,
                                     &mut session,
                                     &job_cache,
-                                    share_repo.as_ref(),
-                                    worker_repo.as_ref(),
                                     accounting_service.as_ref(),
                                 ).await;
                                 // If VarDiff retargeted, send mining.set_difficulty to miner
@@ -298,6 +294,16 @@ async fn handle_connection(
                 info!(session = %session.session_id, "shutting down connection");
                 break;
             }
+            n_diff = n_diff_rx.recv() => {
+                if let Ok(new_n_diff) = n_diff {
+                    debug!(
+                        session = %session.session_id,
+                        new_n_diff = new_n_diff,
+                        "updating VarDiff ceiling due to N_diff change",
+                    );
+                    session.vardiff.update_max(new_n_diff);
+                }
+            }
         }
     }
 
@@ -363,8 +369,6 @@ async fn handle_submit(
     req: &crate::stratum_protocol::protocol::StratumRequest,
     session: &mut SessionState,
     job_cache: &crate::node_integration::JobCache,
-    share_repo: Option<&ShareRepository>,
-    worker_repo: Option<&WorkerRepository>,
     accounting_service: Option<&AccountingService>,
 ) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
@@ -415,77 +419,32 @@ async fn handle_submit(
             )
         };
 
-    // Persist share + outcome atomically if repositories are available.
+    // Persist share + outcome via AccountingService (records accounting events too).
     // This runs for ALL submissions (accepted or rejected) per UBQ.
-    if let (Some(share_repo), Some(worker_repo)) = (share_repo, worker_repo) {
-        // Parse worker name to get payout address and suffix.
-        // If unparseable, we cannot persist (need a worker_id for FK).
+    // AccountingService handles worker upsert, round resolution, dedupe key, and
+    // atomic share+outcome insert with accounting event recording.
+    if let Some(acct) = accounting_service {
         if let Ok(worker_parsed) =
             crate::stratum_protocol::session::parse_worker_name(worker_name)
         {
-            if let Ok(worker) = worker_repo.upsert(
+            if let Err(e) = acct.record_share(
                 &worker_parsed.payout_address,
                 worker_parsed.worker_suffix.as_deref(),
+                &session.session_id,
+                job_id,
+                template_id,
+                template_epoch,
+                extranonce2,
+                ntime_hex,
+                nonce_hex,
+                share_diff,
+                if validation.accepted { "accepted" } else { "rejected" },
+                validation.reject_reason.as_deref(),
+                validation.low_diff_ok,
+                validation.network_target_ok,
+                validation.block_hash.as_deref(),
             ) {
-                // Resolve round_id via AccountingService (if available)
-                // Per UBQ: round_id is resolved at insert time, not backfilled.
-                let round_id = accounting_service
-                    .and_then(|svc| svc.resolve_round_for_template(template_id).ok())
-                    .map(|round| round.id);
-
-                // Build dedupe key per UBQ format
-                let dedupe_key = ShareRepository::build_dedupe_key(
-                    worker.id,
-                    template_id,
-                    template_epoch,
-                    extranonce2,
-                    ntime_hex,
-                    nonce_hex,
-                );
-
-                // Create raw share record
-                let share = Share {
-                    id: 0,
-                    worker_id: worker.id,
-                    session_id: session.session_id.clone(),
-                    job_id: job_id.to_string(),
-                    template_id,
-                    template_epoch,
-                    extranonce2: extranonce2.to_string(),
-                    ntime_hex_6b: ntime_hex.to_string(),
-                    nonce_hex_8b: nonce_hex.to_string(),
-                    difficulty: share_diff,
-                    dedupe_key: dedupe_key.clone(),
-                };
-
-                // Create share outcome based on validation result
-                let outcome = ShareOutcome {
-                    id: 0,
-                    share_id: 0,
-                    session_id: session.session_id.clone(),
-                    worker_id: worker.id,
-                    job_id: job_id.to_string(),
-                    round_id,
-                    dedupe_key: dedupe_key.clone(),
-                    status: if validation.accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    }
-                    .to_string(),
-                    reject_reason: validation.reject_reason.clone(),
-                    node_result: None,
-                    low_diff_ok: Some(validation.low_diff_ok),
-                    network_target_ok: Some(validation.network_target_ok),
-                    block_hash: validation.block_hash.clone(),
-                };
-
-                // Insert atomically
-                if let Err(e) =
-                    share_repo.insert_share_and_outcome_atomic(&share, &outcome)
-                {
-                    warn!(error = %e, "failed to atomically persist share and outcome");
-                }
+                warn!(error = %e, "failed to persist share via AccountingService");
             }
         }
     }
@@ -559,7 +518,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
         
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
@@ -570,7 +529,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -604,7 +563,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -662,7 +621,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -694,7 +653,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -722,14 +681,16 @@ mod tests {
     #[tokio::test]
     async fn test_graceful_shutdown_persists_in_flight_shares() {
         use tempfile::NamedTempFile;
-        use crate::accounting::{init_schema, ShareRepository};
+        use crate::accounting::{init_schema, AccountingService, ShareRepository};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
         let db_conn = Connection::open(&db_path).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -740,8 +701,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
         
@@ -797,13 +757,15 @@ mod tests {
     #[tokio::test]
     async fn test_authorization_event_recorded() {
         use tempfile::NamedTempFile;
-        use crate::accounting::init_schema;
+        use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -814,8 +776,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
         
@@ -867,13 +828,15 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_share_unauthorized_persists_outcome() {
         use tempfile::NamedTempFile;
-        use crate::accounting::init_schema;
+        use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -884,8 +847,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
 
@@ -933,13 +895,15 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_share_stale_job_persists_outcome() {
         use tempfile::NamedTempFile;
-        use crate::accounting::init_schema;
+        use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -950,8 +914,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
 
@@ -1009,13 +972,15 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_share_ntime_mismatch_persists_outcome() {
         use tempfile::NamedTempFile;
-        use crate::accounting::init_schema;
+        use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -1026,8 +991,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
 
@@ -1085,13 +1049,15 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_share_invalid_shape_persists_outcome() {
         use tempfile::NamedTempFile;
-        use crate::accounting::init_schema;
+        use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
+        use rusqlite::Connection;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
         let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -1102,8 +1068,7 @@ mod tests {
             addr,
             job_cache.clone(),
             shutdown_tx.clone(),
-            Some(db_conn_arc.clone()),
-            None,
+            Some(accounting_svc),
             VarDiffConfig::default(),
         );
 
@@ -1155,5 +1120,86 @@ mod tests {
         assert!(total >= 1, "share outcome should be persisted for invalid shape");
         let reasons = share_repo.count_rejected_by_reason().unwrap();
         assert_eq!(reasons.get("invalid-submit-shape"), Some(&1));
+    }
+
+    /// Integration test: verify accounting events are recorded in the full TCP submission path.
+    /// Per UBQ §Accounting Event: the hot path must produce share_outcome events.
+    #[tokio::test]
+    async fn test_accounting_event_recorded_in_submission_path() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::{init_schema, AccountingService};
+        use parking_lot::Mutex;
+        use rusqlite::Connection;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let accounting_svc = AccountingService::new(db_conn_arc.clone());
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13344".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(accounting_svc.clone()),
+            VarDiffConfig::default(),
+        );
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13344").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Authorize
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Submit a share
+        write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify accounting events were recorded (regardless of accept/reject status)
+        let events = accounting_svc.event_repo.list_by_type("share_outcome", 10, 0).unwrap();
+        assert!(
+            !events.is_empty(),
+            "share_outcome accounting event should be recorded in TCP submission path"
+        );
+        // Verify the event has the correct shape: event_type, status, session_id, worker_id
+        assert!(
+            events[0].status == "accepted" || events[0].status == "rejected",
+            "share outcome status must be 'accepted' or 'rejected', got '{}'",
+            events[0].status,
+        );
+        assert_eq!(events[0].event_type, "share_outcome");
+        assert!(events[0].session_id.is_some(), "session_id should be recorded");
+        assert!(events[0].worker_id.is_some(), "worker_id should be recorded");
     }
 }

@@ -112,7 +112,6 @@ async fn main() -> Result<()> {
         config.stratum_bind,
         job_cache.clone(),
         shutdown_tx.clone(),
-        Some(db_conn_arc.clone()),
         Some(accounting_service),
         config.vardiff.into(),
     ));

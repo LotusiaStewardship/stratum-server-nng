@@ -35,11 +35,14 @@ impl AccountingService {
     /// Record a share submission with full accounting: worker upsert, round resolution,
     /// atomic share+outcome insert, and accounting event recording.
     ///
+    /// Takes the already-parsed payout_address and optional worker_suffix
+    /// (from `parse_worker_name`). Records accounting events automatically.
+    ///
     /// Returns (share_id, outcome_id, round_id) or (None, None, None) if the share
     /// was a duplicate (dedupe key collision).
     pub fn record_share(
         &self,
-        worker_name: &str,
+        payout_address: &str,
         worker_suffix: Option<&str>,
         session_id: &str,
         job_id: &str,
@@ -56,10 +59,10 @@ impl AccountingService {
         block_hash: Option<&str>,
     ) -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
         // 1. Upsert worker
-        let worker = self.worker_repo.upsert(worker_name, worker_suffix)?;
+        let worker = self.worker_repo.upsert(payout_address, worker_suffix)?;
 
-        // 2. Resolve round for this template
-        let round = self.round_repo.resolve_round_for_template(template_id)?;
+        // 2. Resolve round for this template (records round_opened event if new round created)
+        let round = self.resolve_round_for_template(template_id)?;
         let round_id = Some(round.id);
 
         // 3. Build dedupe key
@@ -110,13 +113,18 @@ impl AccountingService {
         // 7. Record accounting event (only for fresh inserts, not duplicates)
         if is_new {
             if let (Some(_sid), Some(_oid)) = (share_id, outcome_id) {
+                // Reconstruct full worker name from payout_address and suffix
+                let full_worker_name = match &worker.worker_suffix {
+                    Some(suffix) => format!("{}.{}", worker.payout_address, suffix),
+                    None => worker.payout_address.clone(),
+                };
                 let event = AccountingEvent {
                     id: 0,
                     event_type: "share_outcome".to_string(),
                     status: status.to_string(),
                     session_id: Some(session_id.to_string()),
                     worker_id: Some(worker.id),
-                    worker_name: Some(worker_name.to_string()),
+                    worker_name: Some(full_worker_name),
                     payout_address: Some(worker.payout_address.clone()),
                     round_id,
                     template_id: Some(template_id),
@@ -134,18 +142,78 @@ impl AccountingService {
     }
 
     /// Get the current open round, creating one if needed.
+    /// Records a `round_opened` accounting event when a new round is created.
     pub fn get_or_create_current_round(&self, start_template_id: i64) -> Result<Round> {
-        self.round_repo.get_or_create_current_round(start_template_id)
+        let (round, is_new) = self.round_repo.get_or_create_current_round(start_template_id)?;
+        if is_new {
+            let event = AccountingEvent {
+                id: 0,
+                event_type: "round_opened".to_string(),
+                status: "open".to_string(),
+                session_id: None,
+                worker_id: None,
+                worker_name: None,
+                payout_address: None,
+                round_id: Some(round.id),
+                template_id: Some(start_template_id),
+                template_epoch: None,
+                job_id: None,
+                block_hash: None,
+                height: None,
+                payload_json: None,
+            };
+            let _ = self.event_repo.record_event(&event);
+        }
+        Ok(round)
     }
 
     /// Resolve which round a template belongs to.
+    /// Records a `round_opened` accounting event when a new round is created.
     pub fn resolve_round_for_template(&self, template_id: i64) -> Result<Round> {
-        self.round_repo.resolve_round_for_template(template_id)
+        let (round, is_new) = self.round_repo.resolve_round_for_template(template_id)?;
+        if is_new {
+            let event = AccountingEvent {
+                id: 0,
+                event_type: "round_opened".to_string(),
+                status: "open".to_string(),
+                session_id: None,
+                worker_id: None,
+                worker_name: None,
+                payout_address: None,
+                round_id: Some(round.id),
+                template_id: Some(template_id),
+                template_epoch: None,
+                job_id: None,
+                block_hash: None,
+                height: None,
+                payload_json: None,
+            };
+            let _ = self.event_repo.record_event(&event);
+        }
+        Ok(round)
     }
 
-    /// Close a round.
+    /// Close a round. Records a `round_closed` accounting event.
     pub fn close_round(&self, id: i64, end_template_id: i64, status: &str) -> Result<()> {
-        self.round_repo.close_round(id, end_template_id, status)
+        self.round_repo.close_round(id, end_template_id, status)?;
+        let event = AccountingEvent {
+            id: 0,
+            event_type: "round_closed".to_string(),
+            status: status.to_string(),
+            session_id: None,
+            worker_id: None,
+            worker_name: None,
+            payout_address: None,
+            round_id: Some(id),
+            template_id: Some(end_template_id),
+            template_epoch: None,
+            job_id: None,
+            block_hash: None,
+            height: None,
+            payload_json: None,
+        };
+        let _ = self.event_repo.record_event(&event);
+        Ok(())
     }
 
     /// Record an accounting event.

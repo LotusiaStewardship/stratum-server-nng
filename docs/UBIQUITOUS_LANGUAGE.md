@@ -331,7 +331,7 @@ A record of every `mining.authorize` attempt, stored in the `authorization_event
 
 ### Accounting Event
 A general-purpose audit log recording significant pool operations, stored in the `accounting_events` table. Each event captures:
-- event_type (e.g., `submit_result`, `found_block_observed`, `found_block_orphaned`)
+- event_type (e.g., `share_outcome`, `round_opened`, `round_closed`, `found_block_observed`, `found_block_orphaned`)
 - status (e.g., `accepted`, `orphaned`)
 - Optional context fields: session_id, worker_id, worker_name, payout_address, round_id, template_id, template_epoch, job_id, block_hash, height
 - payload_json: Arbitrary JSON payload for extensibility (e.g., `{"reject_reason":"high-hash"}`)

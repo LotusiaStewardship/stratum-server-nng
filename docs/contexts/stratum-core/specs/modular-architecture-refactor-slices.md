@@ -576,8 +576,8 @@ CREATE TABLE rounds (
 -- accounting_events table (append-only audit log per UBQ)
 CREATE TABLE accounting_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type TEXT NOT NULL,    -- 'submit_result', 'found_block_observed', 'found_block_orphaned',
-                                 -- 'round_opened', 'round_closed', 'share_outcome'
+    event_type TEXT NOT NULL,    -- 'share_outcome', 'round_opened', 'round_closed',
+                                 -- 'found_block_observed', 'found_block_orphaned'
     status TEXT NOT NULL,        -- 'accepted', 'rejected', 'stale', 'orphaned'
     session_id TEXT,
     worker_id INTEGER,

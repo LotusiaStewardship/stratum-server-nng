@@ -76,8 +76,8 @@ mod tests {
         init_schema(&conn).unwrap();
         let round_repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        round_repo.get_or_create_current_round(1).unwrap();
-        round_repo.get_or_create_current_round(10).unwrap(); // no-op, same round
+        let _ = round_repo.get_or_create_current_round(1).unwrap();
+        let _ = round_repo.get_or_create_current_round(10).unwrap(); // no-op, same round
 
         let stats = ServerStats::default();
         let params = ListRoundsParams { status: None };
@@ -100,9 +100,9 @@ mod tests {
         init_schema(&conn).unwrap();
         let round_repo = RoundRepository::new(Arc::new(Mutex::new(conn)));
 
-        let r1 = round_repo.get_or_create_current_round(1).unwrap();
+        let (r1, _) = round_repo.get_or_create_current_round(1).unwrap();
         round_repo.close_round(r1.id, 5, "found").unwrap();
-        round_repo.get_or_create_current_round(6).unwrap(); // new open round
+        let _ = round_repo.get_or_create_current_round(6).unwrap(); // new open round
 
         let stats = ServerStats::default();
 
