@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bitcoinsuite_bitcoind_stratum::target_to_difficulty;
+use crate::share_processing::network_target_hex_to_difficulty;
 use crate::share_processing::VarDiffConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -54,6 +54,26 @@ impl StratumServer {
     /// Notify all active sessions of a change in network difficulty (N_diff).
     /// Each session updates its VarDiff ceiling via `update_max()`, ensuring
     /// the per-session P_diff never exceeds the new N_diff.
+    /// Notify all active sessions of a new mining job, broadcasting the N_diff
+    /// derived from the job's network target. Each session updates its VarDiff
+    /// ceiling to ensure P_diff never exceeds the new N_diff.
+    ///
+    /// This is the single integration point for any template change (startup,
+    /// pub/sub events in Slice 6, etc.).
+    pub async fn notify_new_job(&self, job: &MiningJob) {
+        let n_diff = network_target_hex_to_difficulty(&job.network_target_hex)
+            .unwrap_or(1.0);
+        debug!(
+            job_id = %job.job_id,
+            n_diff = n_diff,
+            "broadcasting new job N_diff to all sessions",
+        );
+        self.notify_new_template(n_diff).await;
+    }
+
+    /// Notify all active sessions of a change in network difficulty (N_diff).
+    /// Each session updates its VarDiff ceiling via `update_max()`, ensuring
+    /// the per-session P_diff never exceeds the new N_diff.
     pub async fn notify_new_template(&self, new_n_diff: f64) {
         debug!(new_n_diff, "broadcasting N_diff change to all sessions");
         let _ = self.n_diff_tx.send(new_n_diff);
@@ -83,11 +103,7 @@ impl StratumServer {
                                 .job_cache
                                 .get_latest()
                                 .await
-                                .and_then(|job| {
-                                    let target_bytes = hex::decode(&job.network_target_hex).ok()?;
-                                    let target_arr: [u8; 32] = target_bytes.as_slice().try_into().ok()?;
-                                    target_to_difficulty(&target_arr).ok()
-                                })
+                                .and_then(|job| network_target_hex_to_difficulty(&job.network_target_hex))
                                 .unwrap_or(1.0);
                             let session = SessionState::new(
                                 session_id.clone(),
@@ -257,9 +273,25 @@ async fn handle_connection(
                         writer.write_all(resp_line.as_bytes()).await?;
                         writer.write_all(b"\n").await?;
                         
-                        // If authorized, send mining.notify with current job
-                        // and record the assigned job in session (per UBQ §Assigned Job)
+                        // If authorized, send mining.set_difficulty with current P_diff
+                        // then mining.notify with current job, and record assigned job
                         if session.is_authorized && req.method == Method::Authorize {
+                            // Send initial mining.set_difficulty so the miner knows its difficulty
+                            let initial_diff = session.current_difficulty();
+                            let set_diff_cmd = serde_json::json!({
+                                "id": null,
+                                "method": "mining.set_difficulty",
+                                "params": [initial_diff]
+                            });
+                            let set_diff_line = serde_json::to_string(&set_diff_cmd)?;
+                            writer.write_all(set_diff_line.as_bytes()).await?;
+                            writer.write_all(b"\n").await?;
+                            debug!(
+                                session = %session.session_id,
+                                initial_diff = initial_diff,
+                                "sent mining.set_difficulty on session start",
+                            );
+                            
                             if let Some(job) = job_cache.get_latest().await {
                                 let notify = create_notify(&job, &session.session_id);
                                 let notify_line = serde_json::to_string(&notify)?;
@@ -512,6 +544,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_notify_new_job_broadcasts() {
+        let job_cache = Arc::new(JobCache::new(10));
+        let job = create_test_job();
+        job_cache.insert(job.clone()).await;
+        
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        
+        // Should not panic or error
+        server.notify_new_job(&job).await;
+    }
+
+    #[tokio::test]
     async fn test_server_starts_and_accepts_connections() {
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
@@ -591,7 +637,18 @@ mod tests {
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"], serde_json::Value::Bool(true));
         
-        // Receive mining.notify after authorize
+        // Receive mining.set_difficulty after authorize
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.set_difficulty")
+            .unwrap();
+        let set_diff: serde_json::Value = serde_json::from_str(&response.trim()).unwrap();
+        assert_eq!(set_diff["method"], "mining.set_difficulty");
+        let diff_val = set_diff["params"][0].as_f64().unwrap();
+        assert!(diff_val > 0.0, "initial P_diff should be positive, got {}", diff_val);
+        
+        // Receive mining.notify after set_difficulty
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
             .await
@@ -613,6 +670,13 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
+
+    // Note: A TCP-level VarDiff retarget test (verifying mining.set_difficulty
+    // is sent after fast shares) is impractical because random share submissions
+    // have ~10^-9 probability of passing P_diff=0.26 validation. The VarDiff
+    // algorithm is thoroughly covered by 10+ unit tests in difficulty.rs.
+    // The initial mining.set_difficulty on authorize is verified in
+    // test_integration_subscribe_authorize_submit above.
 
     #[tokio::test]
     async fn test_authorize_requires_subscribe() {
@@ -725,6 +789,10 @@ mod tests {
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         
+        // Read mining.set_difficulty (sent after authorize)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        
         // Wait for mining.notify
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
@@ -797,6 +865,10 @@ mod tests {
         
         // Authorize with valid worker
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Read mining.set_difficulty (sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         
@@ -937,6 +1009,10 @@ mod tests {
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 
+        // Read mining.set_difficulty (sent after authorize)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
         // Wait for mining.notify
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
@@ -1011,6 +1087,10 @@ mod tests {
         reader.read_line(&mut response).await.unwrap();
 
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Read mining.set_difficulty (sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1091,6 +1171,10 @@ mod tests {
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 
+        // Read mining.set_difficulty (sent after authorize)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
         // Wait for mining.notify
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
@@ -1167,6 +1251,10 @@ mod tests {
 
         // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Read mining.set_difficulty (sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 

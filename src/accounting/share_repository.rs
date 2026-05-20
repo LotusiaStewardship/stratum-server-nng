@@ -322,6 +322,44 @@ impl ShareRepository {
         Ok(map)
     }
 
+    /// Count share outcomes by round, grouped by worker, with worker details.
+    /// Returns tuples of (worker_id, payout_address, worker_suffix,
+    /// total_shares, accepted_shares, rejected_shares).
+    pub fn count_outcomes_by_round_with_workers(
+        &self,
+        round_id: i64,
+    ) -> Result<Vec<(i64, String, Option<String>, i64, i64, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT so.worker_id, w.payout_address, w.worker_suffix,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN so.status = 'accepted' THEN 1 ELSE 0 END) as accepted,
+                    SUM(CASE WHEN so.status = 'rejected' THEN 1 ELSE 0 END) as rejected
+             FROM share_outcomes so
+             JOIN workers w ON w.id = so.worker_id
+             WHERE so.round_id = ?1
+             GROUP BY so.worker_id
+             ORDER BY so.worker_id"
+        )?;
+
+        let rows = stmt.query_map([round_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut breakdown = Vec::new();
+        for row in rows {
+            breakdown.push(row?);
+        }
+        Ok(breakdown)
+    }
+
     /// Total number of raw share records.
     pub fn total_count(&self) -> Result<i64> {
         let conn = self.conn.lock();

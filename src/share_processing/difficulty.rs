@@ -1,5 +1,18 @@
+use bitcoinsuite_bitcoind_stratum::target_to_difficulty;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+/// Convert a hex-encoded network target (32 bytes) to a floating-point difficulty value.
+///
+/// This is used to convert a job's `network_target_hex` into N_diff for VarDiff ceiling
+/// calculation and for initial difficulty computation at session creation.
+///
+/// Returns `None` if the hex string is invalid or not exactly 32 bytes.
+pub fn network_target_hex_to_difficulty(hex: &str) -> Option<f64> {
+    let bytes = hex::decode(hex).ok()?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+    target_to_difficulty(&arr).ok()
+}
 
 /// Configuration for per-session variable difficulty (VarDiff).
 #[derive(Debug, Clone)]
@@ -373,5 +386,26 @@ mod tests {
             (vardiff.max - 200.0).abs() < f64::EPSILON,
             "max should be updated to 200.0"
         );
+    }
+
+    #[test]
+    fn test_network_target_hex_to_difficulty_valid() {
+        // Real network target from test job
+        let hex = "0000000009d01000000000000000000000000000000000000000000000000000";
+        let diff = network_target_hex_to_difficulty(hex);
+        assert!(diff.is_some(), "should parse valid hex target");
+        let d = diff.unwrap();
+        assert!(d > 0.0, "difficulty should be positive, got {}", d);
+    }
+
+    #[test]
+    fn test_network_target_hex_to_difficulty_invalid_hex() {
+        assert!(network_target_hex_to_difficulty("zzzz").is_none());
+    }
+
+    #[test]
+    fn test_network_target_hex_to_difficulty_wrong_length() {
+        // Too short (not 32 bytes)
+        assert!(network_target_hex_to_difficulty("00ff").is_none());
     }
 }

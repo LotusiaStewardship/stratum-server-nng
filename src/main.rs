@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         s.network_difficulty = Some(job.network_target_hex.clone());
     }
 
+    // Notify the Stratum server about the new job, broadcasting N_diff to all
     // Create AccountingService (wraps all accounting repositories)
     let accounting_service = AccountingService::new(db_conn_arc.clone());
     let app_state = AppState {
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
         share_repo: Some(accounting_service.share_repo.clone()),
         worker_repo: Some(accounting_service.worker_repo.clone()),
         round_repo: Some(accounting_service.round_repo.clone()),
+        api_token: config.api_token.clone(),
     };
 
     // Start HTTP API server
@@ -115,6 +117,10 @@ async fn main() -> Result<()> {
         Some(accounting_service),
         config.vardiff.into(),
     ));
+    // Notify server of the new job, broadcasting N_diff to all sessions.
+    // Validates the integration path for future template refreshes (Slice 6).
+    stratum_server.notify_new_job(&job).await;
+
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {
         let mut shutdown_signal = stratum_shutdown_signal;

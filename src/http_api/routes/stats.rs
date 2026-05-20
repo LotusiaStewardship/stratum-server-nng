@@ -19,7 +19,7 @@ pub struct StatsResponse {
 pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
     let stats = state.stats.read().await;
     
-    // Query actual share outcome counts from repository if available
+    // Query share outcome counts from repository
     let (total_shares, accepted_shares, rejected_shares, rejection_breakdown) =
         if let Some(ref share_repo) = state.share_repo {
             let total = share_repo.total_outcome_count().unwrap_or(0);
@@ -28,7 +28,7 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
             let reasons = share_repo.count_rejected_by_reason().unwrap_or_default();
             (total, accepted, rejected, reasons)
         } else {
-            (stats.total_shares, stats.accepted_shares, stats.rejected_shares, HashMap::new())
+            (0, 0, 0, HashMap::new())
         };
     
     let accepted_pct = if total_shares > 0 {
@@ -59,30 +59,8 @@ mod tests {
     use tokio::sync::RwLock;
 
     #[tokio::test]
-    async fn test_stats_response() {
-        let stats = ServerStats {
-            total_shares: 100,
-            accepted_shares: 95,
-            rejected_shares: 5,
-            ..Default::default()
-        };
-
-        let response = stats_handler(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: None,
-        }))
-        .await;
-
-        assert_eq!(response.total_shares, 100);
-        assert_eq!(response.accepted_shares, 95);
-        assert_eq!(response.rejected_shares, 5);
-        assert!((response.accepted_pct - 95.0).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_stats_response_zero_shares() {
+    async fn test_stats_response_correct_without_db() {
+        // Without a share_repo, all counts return 0
         let stats = ServerStats::default();
 
         let response = stats_handler(State(AppState {
@@ -90,19 +68,20 @@ mod tests {
             share_repo: None,
             worker_repo: None,
             round_repo: None,
+            api_token: "test".to_string(),
         }))
         .await;
 
         assert_eq!(response.total_shares, 0);
+        assert_eq!(response.accepted_shares, 0);
+        assert_eq!(response.rejected_shares, 0);
         assert_eq!(response.accepted_pct, 0.0);
+        assert!(response.rejection_breakdown.is_empty());
     }
 
     #[tokio::test]
     async fn test_stats_response_with_network_difficulty() {
         let stats = ServerStats {
-            total_shares: 100,
-            accepted_shares: 95,
-            rejected_shares: 5,
             network_difficulty: Some("ffffffff".to_string()),
             ..Default::default()
         };
@@ -112,6 +91,7 @@ mod tests {
             share_repo: None,
             worker_repo: None,
             round_repo: None,
+            api_token: "test".to_string(),
         }))
         .await;
 
@@ -173,6 +153,7 @@ mod tests {
             share_repo: Some(share_repo),
             worker_repo: None,
             round_repo: None,
+            api_token: "test".to_string(),
         }))
         .await;
 
