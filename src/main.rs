@@ -11,9 +11,8 @@ use stratum_server_nng::config::Config;
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
-use stratum_server_nng::share_processing::VarDiffConfig;
 use stratum_server_nng::stratum_protocol::server::StratumServer;
-use stratum_server_nng::accounting::{init_schema, ShareRepository};
+use stratum_server_nng::accounting::{init_schema, AccountingService};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,12 +47,6 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let stats = Arc::new(RwLock::new(ServerStats::default()));
-    let share_repo = ShareRepository::new(db_conn_arc.clone());
-    let app_state = AppState {
-        stats: stats.clone(),
-        share_repo: Some(share_repo),
-    };
-
     // Create NNG RPC client and job cache
     let nng_client = Arc::new(NngRpcClient::new(config.nng_rpc_url.clone()));
     let job_cache = Arc::new(JobCache::new(512));
@@ -81,7 +74,14 @@ async fn main() -> Result<()> {
         s.network_difficulty = Some(job.network_target_hex.clone());
     }
 
-    // Database connection already wrapped above for shutdown coordinator
+    // Create AccountingService (wraps all accounting repositories)
+    let accounting_service = AccountingService::new(db_conn_arc.clone());
+    let app_state = AppState {
+        stats: stats.clone(),
+        share_repo: Some(accounting_service.share_repo.clone()),
+        worker_repo: Some(accounting_service.worker_repo.clone()),
+        round_repo: Some(accounting_service.round_repo.clone()),
+    };
 
     // Start HTTP API server
     let http_state = app_state.clone();
@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         job_cache.clone(),
         shutdown_tx.clone(),
         Some(db_conn_arc.clone()),
+        Some(accounting_service),
         config.vardiff.into(),
     ));
     let stratum_for_stats = stratum_server.clone();

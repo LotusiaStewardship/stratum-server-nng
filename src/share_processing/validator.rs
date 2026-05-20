@@ -1,4 +1,3 @@
-use crate::share_processing::VarDiffConfig;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::session::SessionState;
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, header_meets_difficulty};
@@ -205,6 +204,7 @@ pub fn validate_share(
 mod tests {
     use super::*;
     use crate::stratum_protocol::session::SessionState;
+    use crate::share_processing::VarDiffConfig;
 
     // Real-world MiningJob reconstructed from lotusd template at height 1292529
     // Source: template_id=890, epoch=100, prevhash in stratum format

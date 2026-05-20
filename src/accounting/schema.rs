@@ -82,6 +82,38 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_worker_id ON share_outcomes(worker_id);
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_dedupe_key ON share_outcomes(dedupe_key);
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_status ON share_outcomes(status);
+
+        -- rounds table (payout round tracking)
+        CREATE TABLE IF NOT EXISTS rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_template_id INTEGER NOT NULL,
+            end_template_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'open',  -- 'open', 'found', 'closed', 'paid', 'orphaned'
+            found_block_hash TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- accounting_events table (append-only audit log per UBQ)
+        CREATE TABLE IF NOT EXISTS accounting_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            session_id TEXT,
+            worker_id INTEGER,
+            worker_name TEXT,
+            payout_address TEXT,
+            round_id INTEGER,
+            template_id INTEGER,
+            template_epoch INTEGER,
+            job_id TEXT,
+            block_hash TEXT,
+            height INTEGER,
+            payload_json TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_accounting_events_type ON accounting_events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_accounting_events_created ON accounting_events(created_at);
         ",
     )?;
     Ok(())

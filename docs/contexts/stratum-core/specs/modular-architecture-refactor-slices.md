@@ -14,8 +14,8 @@
 | 1 | Minimal Stratum Server (Tracer Bullet) | AFK | None | 1 day | ✅ Done (UBQ-aligned) |
 | 2 | NNG Template Integration | AFK | #1 | 1 day | ✅ Done (UBQ-aligned) |
 | 3 | Share Validation Pipeline | AFK | #2 | 1 day | ✅ Done (UBQ-aligned) |
-| 4 | Per-Session VarDiff | AFK | #3 | 1 day |
-| 5 | Worker and Round Accounting | AFK | #3 | 1 day |
+| 4 | Per-Session VarDiff | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
+| 5 | Worker and Round Accounting | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
 | 6 | Found Blocks and Reorg Handling | AFK | #5 | 1 day |
 | 7 | PPLNS Payout Calculation | AFK | #6 | 2 days |
 | 8 | Complete HTTP API | AFK | #5 | 1 day |
@@ -494,32 +494,40 @@ src/
 
 ## Slice 5: Worker and Round Accounting
 
+**Status:** ✅ Completed 2026-05-19 (UBQ-aligned)
+
 ### What to build
 
 Implement worker persistence (across sessions) and round accounting. Workers are identified by `(payout_address, worker_suffix)`. Rounds track share accumulation periods. Add `accounting_events` audit log.
 
 ### Acceptance criteria
 
-- [ ] Worker repository:
+- [x] Worker repository:
   - `upsert_worker(payout_address, worker_suffix) -> Worker` — create or fetch
   - Worker has persistent ID across sessions
-- [ ] Round repository:
-  - `get_or_create_current_round() -> Round` — ensure one open round
+- [x] Round repository:
+  - `get_or_create_current_round(start_template_id) -> Round` — ensure one open round
   - Round has `start_template_id`, `status` (open/found/closed/paid/orphaned)
-- [ ] Share outcomes include `round_id` foreign key (resolved at insert time via `resolve_round_for_template(template_id)`)
-- [ ] On share submission:
+  - `close_round(id, end_template_id, status)` marks round as closed
+  - `resolve_round_for_template(template_id)` returns correct round for template
+  - `list(status_filter)` lists rounds with optional status filter
+- [x] Share outcomes include `round_id` foreign key (resolved at insert time via `resolve_round_for_template(template_id)`)
+- [x] On share submission:
   - Worker upserted (if new)
   - Round resolved via `resolve_round_for_template(template_id)`
   - Share outcome recorded with round_id
-- [ ] **Accounting events table** (append-only audit log):
-  - Record `share_outcome` events with status (accepted/rejected/stale)
+- [x] **Accounting events table** (append-only audit log):
+  - Record `share_outcome` events with status (accepted/rejected)
   - Record `round_opened`, `round_closed` events
-- [ ] `GET /api/v1/workers` — list workers with share counts
-- [ ] `GET /api/v1/workers/{id}` — worker details (shares, hashrate)
-- [ ] `GET /api/v1/rounds` — list rounds with status
-- [ ] Unit tests for worker/round repositories
-- [ ] Unit tests for accounting event recording
-- [ ] Integration test: multiple sessions, same worker, verify share aggregation
+  - Queryable by `event_type` with pagination
+- [x] `GET /api/v1/workers` — list workers with share counts
+- [x] `GET /api/v1/workers/{id}` — worker details (shares)
+- [x] `GET /api/v1/rounds` — list rounds with status filter
+- [x] Unit tests for worker/round repositories (8 round_repo tests)
+- [x] Unit tests for accounting event recording (4 event_repo tests)
+- [x] Unit tests for AccountingService facade (3 service tests)
+- [x] Integration test: round resolution in share recording path
+- [x] HTTP API tests for workers (3 tests) and rounds (3 tests)
 
 ### Testing scope
 

@@ -70,6 +70,8 @@ mod tests {
         let response = stats_handler(State(AppState {
             stats: Arc::new(RwLock::new(stats)),
             share_repo: None,
+            worker_repo: None,
+            round_repo: None,
         }))
         .await;
 
@@ -86,6 +88,8 @@ mod tests {
         let response = stats_handler(State(AppState {
             stats: Arc::new(RwLock::new(stats)),
             share_repo: None,
+            worker_repo: None,
+            round_repo: None,
         }))
         .await;
 
@@ -106,6 +110,8 @@ mod tests {
         let response = stats_handler(State(AppState {
             stats: Arc::new(RwLock::new(stats)),
             share_repo: None,
+            worker_repo: None,
+            round_repo: None,
         }))
         .await;
 
@@ -165,6 +171,8 @@ mod tests {
         let response = stats_handler(State(AppState {
             stats: Arc::new(RwLock::new(stats)),
             share_repo: Some(share_repo),
+            worker_repo: None,
+            round_repo: None,
         }))
         .await;
 

@@ -207,20 +207,20 @@ impl ShareRepository {
     ///
     /// This ensures that a share and its outcome are always persisted together.
     /// If either insert fails (e.g., constraint violation), both are rolled back.
-    /// Returns (share_id, outcome_id) or (None, None) if duplicate.
+    /// Returns (share_id, outcome_id, is_new) where is_new=false means duplicate.
     pub fn insert_share_and_outcome_atomic(
         &self,
         share: &Share,
         outcome: &ShareOutcome,
-    ) -> Result<(Option<i64>, Option<i64>)> {
+    ) -> Result<(Option<i64>, Option<i64>, bool)> {
         let conn = self.conn.lock();
 
         // Use SQLite transaction for atomicity
         conn.execute_batch("BEGIN TRANSACTION")?;
 
-        let result = (|| -> Result<(Option<i64>, Option<i64>)> {
+        let result = (|| -> Result<(Option<i64>, Option<i64>, bool)> {
             // Insert share
-            let share_id = {
+            let (share_id, share_is_new) = {
                 let mut stmt = conn.prepare(
                     "INSERT OR IGNORE INTO shares
                      (worker_id, session_id, job_id, template_id, template_epoch,
@@ -241,18 +241,19 @@ impl ShareRepository {
                     share.dedupe_key.to_sql()?,
                 ])?;
 
-                if rows == 0 {
+                let is_new = rows > 0;
+                let id = if is_new {
+                    conn.last_insert_rowid()
+                } else {
                     // Duplicate — get the existing ID
                     let mut query = conn.prepare("SELECT id FROM shares WHERE dedupe_key = ?1")?;
-                    let id: i64 = query.query_row([&share.dedupe_key], |row| row.get(0))?;
-                    id
-                } else {
-                    conn.last_insert_rowid()
-                }
+                    query.query_row([&share.dedupe_key], |row| row.get(0))?
+                };
+                (id, is_new)
             };
 
             // Insert share outcome
-            let outcome_id = {
+            let (outcome_id, outcome_is_new) = {
                 let mut stmt = conn.prepare(
                     "INSERT OR IGNORE INTO share_outcomes
                      (share_id, session_id, worker_id, job_id, round_id, dedupe_key,
@@ -275,18 +276,19 @@ impl ShareRepository {
                     outcome.block_hash.to_sql()?,
                 ])?;
 
-                if rows == 0 {
+                let is_new = rows > 0;
+                let id = if is_new {
+                    conn.last_insert_rowid()
+                } else {
                     // Duplicate — get the existing ID
                     let mut query =
                         conn.prepare("SELECT id FROM share_outcomes WHERE dedupe_key = ?1")?;
-                    let id: i64 = query.query_row([&outcome.dedupe_key], |row| row.get(0))?;
-                    id
-                } else {
-                    conn.last_insert_rowid()
-                }
+                    query.query_row([&outcome.dedupe_key], |row| row.get(0))?
+                };
+                (id, is_new)
             };
 
-            Ok((Some(share_id), Some(outcome_id)))
+            Ok((Some(share_id), Some(outcome_id), share_is_new || outcome_is_new))
         })();
 
         match result {

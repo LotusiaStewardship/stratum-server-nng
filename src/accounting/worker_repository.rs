@@ -69,6 +69,25 @@ impl WorkerRepository {
             Err(e) => Err(e.into()),
         }
     }
+    /// List all workers ordered by ID ascending.
+    pub fn list_all(&self) -> Result<Vec<Worker>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, payout_address, worker_suffix FROM workers ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Worker {
+                id: row.get(0)?,
+                payout_address: row.get(1)?,
+                worker_suffix: row.get(2)?,
+            })
+        })?;
+        let mut workers = Vec::new();
+        for row in rows {
+            workers.push(row?);
+        }
+        Ok(workers)
+    }
 }
 
 #[cfg(test)]

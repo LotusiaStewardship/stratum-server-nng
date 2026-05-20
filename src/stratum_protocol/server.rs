@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::stratum_protocol::session::SessionState;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
-use crate::accounting::{ShareRepository, WorkerRepository, Share, ShareOutcome, AuthorizationEvent};
+use crate::accounting::{ShareRepository, WorkerRepository, Share, ShareOutcome, AuthorizationEvent, AccountingService};
 use crate::share_processing::validator;
 
 /// TCP Stratum V1 server that accepts miner connections.
@@ -26,6 +26,7 @@ pub struct StratumServer {
     shutdown_tx: broadcast::Sender<()>,
     share_repo: Option<ShareRepository>,
     worker_repo: Option<WorkerRepository>,
+    accounting_service: Option<AccountingService>,
     vardiff_config: VarDiffConfig,
 }
 
@@ -36,6 +37,7 @@ impl StratumServer {
         job_cache: Arc<crate::node_integration::JobCache>,
         shutdown_tx: broadcast::Sender<()>,
         db_conn: Option<Arc<Mutex<Connection>>>,
+        accounting_service: Option<AccountingService>,
         vardiff_config: VarDiffConfig,
     ) -> Self {
         let (share_repo, worker_repo) = if let Some(conn) = db_conn {
@@ -51,6 +53,7 @@ impl StratumServer {
             shutdown_tx,
             share_repo,
             worker_repo,
+            accounting_service,
             vardiff_config,
         }
     }
@@ -97,6 +100,7 @@ impl StratumServer {
                             let shutdown_rx = shutdown_rx.resubscribe();
                             let share_repo = self.share_repo.clone();
                             let worker_repo = self.worker_repo.clone();
+                            let accounting_service = self.accounting_service.clone();
                             
                             tokio::spawn(async move {
                                 // Increment connected miners
@@ -110,6 +114,7 @@ impl StratumServer {
                                     shutdown_rx,
                                     share_repo,
                                     worker_repo,
+                                    accounting_service,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
                                 }
@@ -149,6 +154,7 @@ async fn handle_connection(
     mut shutdown_signal: broadcast::Receiver<()>,
     share_repo: Option<ShareRepository>,
     worker_repo: Option<WorkerRepository>,
+    accounting_service: Option<AccountingService>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -213,6 +219,7 @@ async fn handle_connection(
                                     &job_cache,
                                     share_repo.as_ref(),
                                     worker_repo.as_ref(),
+                                    accounting_service.as_ref(),
                                 ).await;
                                 // If VarDiff retargeted, send mining.set_difficulty to miner
                                 if let Some(diff) = new_diff {
@@ -358,6 +365,7 @@ async fn handle_submit(
     job_cache: &crate::node_integration::JobCache,
     share_repo: Option<&ShareRepository>,
     worker_repo: Option<&WorkerRepository>,
+    accounting_service: Option<&AccountingService>,
 ) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
     if !session.is_subscribed {
@@ -419,6 +427,12 @@ async fn handle_submit(
                 &worker_parsed.payout_address,
                 worker_parsed.worker_suffix.as_deref(),
             ) {
+                // Resolve round_id via AccountingService (if available)
+                // Per UBQ: round_id is resolved at insert time, not backfilled.
+                let round_id = accounting_service
+                    .and_then(|svc| svc.resolve_round_for_template(template_id).ok())
+                    .map(|round| round.id);
+
                 // Build dedupe key per UBQ format
                 let dedupe_key = ShareRepository::build_dedupe_key(
                     worker.id,
@@ -451,7 +465,7 @@ async fn handle_submit(
                     session_id: session.session_id.clone(),
                     worker_id: worker.id,
                     job_id: job_id.to_string(),
-                    round_id: None,
+                    round_id,
                     dedupe_key: dedupe_key.clone(),
                     status: if validation.accepted {
                         "accepted"
@@ -545,7 +559,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
@@ -556,7 +570,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -590,7 +604,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -648,7 +662,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -680,7 +694,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -727,6 +741,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
         
@@ -800,6 +815,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
         
@@ -869,6 +885,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -934,6 +951,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1009,6 +1027,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1084,6 +1103,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(db_conn_arc.clone()),
+            None,
             VarDiffConfig::default(),
         );
 
