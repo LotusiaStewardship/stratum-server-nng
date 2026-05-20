@@ -64,12 +64,21 @@ impl StratumServer {
     /// Notify all active sessions of a change in network difficulty (N_diff).
     /// Each session updates its VarDiff ceiling via `update_max()`, ensuring
     /// the per-session P_diff never exceeds the new N_diff.
-    /// Notify all active sessions of a new mining job, broadcasting the N_diff
-    /// derived from the job's network target. Each session updates its VarDiff
-    /// ceiling to ensure P_diff never exceeds the new N_diff.
+    /// Broadcast N_diff to all active sessions, updating each session's VarDiff
+    /// ceiling from the job's `network_target_hex`. Each session clamps its P_diff
+    /// to ensure P_diff ∈ [vardiff_min_floor, N_diff] at all times.
     ///
-    /// This is the single integration point for any template change (startup,
-    /// pub/sub events in Slice 6, etc.).
+    /// **This only broadcasts N_diff** — it does NOT send the job through `job_tx`.
+    /// Sessions receive new mining jobs via either:
+    ///   - `job_cache.get_latest()` on authorize (startup path)
+    ///   - The `job_tx` broadcast channel (NNG event consumer / dynamic path)
+    ///
+    /// The dynamic path (`job_tx`) independently extracts N_diff from the job's
+    /// `network_target_hex` in the `job_rx` handler and calls `vardiff.update_max()`,
+    /// so N_diff propagation is guaranteed regardless of the broadcast path.
+    ///
+    /// Called from main.rs on startup. Not used for dynamic template changes
+    /// (those flow through the NNG event consumer → `job_tx`).
     pub async fn notify_new_job(&self, job: &MiningJob) {
         let n_diff = network_target_hex_to_difficulty(&job.network_target_hex)
             .unwrap_or(1.0);
@@ -84,6 +93,10 @@ impl StratumServer {
     /// Notify all active sessions of a change in network difficulty (N_diff).
     /// Each session updates its VarDiff ceiling via `update_max()`, ensuring
     /// the per-session P_diff never exceeds the new N_diff.
+    ///
+    /// This is a lower-level function used internally by `notify_new_job()`.
+    /// External callers should prefer `notify_new_job()` or ensure the `job_tx`
+    /// handler updates VarDiff from the incoming job's `network_target_hex`.
     pub async fn notify_new_template(&self, new_n_diff: f64) {
         debug!(new_n_diff, "broadcasting N_diff change to all sessions");
         let _ = self.n_diff_tx.send(new_n_diff);
@@ -387,6 +400,27 @@ async fn handle_connection(
             }
             new_job = job_rx.recv() => {
                 if let Ok(job) = new_job {
+                    // Per UBQ §Pool Difficulty: P_diff ∈ [vardiff_min_floor, N_diff] at all times.
+                    // When a new template arrives (via NNG event consumer -> job_tx), the N_diff
+                    // ceiling must be updated before recording any new assigned jobs.
+                    if let Some(n_diff) = network_target_hex_to_difficulty(&job.network_target_hex) {
+                        if let Some(clamped_diff) = session.vardiff.update_max(n_diff) {
+                            let set_diff = serde_json::json!({
+                                "id": null,
+                                "method": "mining.set_difficulty",
+                                "params": [clamped_diff]
+                            });
+                            let set_diff_line = serde_json::to_string(&set_diff)?;
+                            writer.write_all(set_diff_line.as_bytes()).await?;
+                            writer.write_all(b"\n").await?;
+                            debug!(
+                                session = %session.session_id,
+                                clamped_diff = clamped_diff,
+                                "sent mining.set_difficulty after N_diff ceiling update",
+                            );
+                        }
+                    }
+
                     // Per UBQ: clean_jobs=true — ALL previous jobs become stale immediately
                     debug!(
                         session = %session.session_id,
@@ -1559,5 +1593,130 @@ mod tests {
             "only one share outcome should exist, got {}",
             total_outcomes
         );
+    }
+
+    /// Integration test: when a new job with lower N_diff arrives through `job_tx`,
+    /// the session's VarDiff ceiling is updated, P_diff is clamped, and
+    /// `mining.set_difficulty` is sent to the miner with the clamped value.
+    ///
+    /// Verifies GAP 1 fix: the NNG event consumer path (via `job_tx`) must update
+    /// VarDiff ceilings, not just the startup path (via `notify_new_template` / `n_diff_tx`).
+    ///
+    /// On the unfixed code, this test would fail: the `job_rx` handler sends
+    /// `mining.notify` (no `mining.set_difficulty`), so the test reads `mining.notify`
+    /// and fails the `set_difficulty` assertion.
+    #[tokio::test]
+    async fn test_vardiff_ceiling_clamped_on_new_job_broadcast() {
+        let job_cache = Arc::new(JobCache::new(10));
+        let initial_job = create_test_job();
+        job_cache.insert(initial_job.clone()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13350".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
+        // Capture job_tx before spawning the server task
+        let job_tx = server.job_tx();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13350").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe
+        write_half
+            .write_all(
+                b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Authorize
+        write_half
+            .write_all(
+                b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n",
+            )
+            .await
+            .unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Read mining.set_difficulty (initial P_diff, sent after authorize)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+        let set_diff: serde_json::Value =
+            serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(set_diff["method"], "mining.set_difficulty");
+        let initial_p_diff = set_diff["params"][0].as_f64().unwrap();
+        assert!(initial_p_diff > 0.0, "initial P_diff must be positive");
+
+        // Read mining.notify (initial job)
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Compute the initial N_diff for context
+        let _initial_n_diff =
+            network_target_hex_to_difficulty(&initial_job.network_target_hex)
+                .unwrap_or(f64::INFINITY);
+
+        // Create a new job with a vastly lower N_diff (all-0xFF target ≈ 0 difficulty)
+        // This forces P_diff to clamp because P_diff > N_diff after the update.
+        let mut new_job = create_test_job();
+        new_job.job_id = "job-891-101".to_string();
+        new_job.template_id = 891;
+        new_job.template_epoch = 101;
+        new_job.network_target_hex =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_string();
+
+        // Broadcast the new job through job_tx (the NNG event consumer path)
+        job_tx.send(Arc::new(new_job)).unwrap();
+
+        // After the fix, the job_rx handler should send mining.set_difficulty
+        // BEFORE mining.notify. On the unfixed code, only mining.notify is sent
+        // and this assertion will fail.
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut response))
+            .await
+            .expect(
+                "should receive mining.set_difficulty after VarDiff ceiling update",
+            )
+            .unwrap();
+
+        let clamped: serde_json::Value =
+            serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(
+            clamped["method"],
+            "mining.set_difficulty",
+            "expected mining.set_difficulty before mining.notify after N_diff clamp"
+        );
+        let clamped_p_diff = clamped["params"][0].as_f64().unwrap();
+        assert!(
+            clamped_p_diff < initial_p_diff,
+            "P_diff should be clamped from {initial} down to {clamped} when N_diff drops below P_diff",
+            initial = initial_p_diff,
+            clamped = clamped_p_diff,
+        );
+
+        // Cleanup
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
     }
 }
