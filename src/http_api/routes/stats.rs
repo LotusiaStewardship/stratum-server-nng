@@ -115,18 +115,18 @@ mod tests {
         
         // Insert raw shares (one per outcome)
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
-             VALUES (1, 'sess-1', 'job-1', 1, 100, '00112233', '001122334455', '0011223344556677', 1.0, 'dk1')",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 100, '00000001', '00112233', '001122334455', '0011223344556677', 1.0, 'dk1')",
             [],
         ).unwrap();
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
-             VALUES (1, 'sess-1', 'job-1', 1, 101, '00112234', '001122334456', '0011223344556678', 1.0, 'dk2')",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 101, '00000001', '00112234', '001122334456', '0011223344556678', 1.0, 'dk2')",
             [],
         ).unwrap();
         db_conn.execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
-             VALUES (1, 'sess-1', 'job-1', 1, 102, '00112235', '001122334457', '0011223344556679', 1.0, 'dk3')",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
+             VALUES (1, 'sess-1', 'job-1', 1, 102, '00000001', '00112235', '001122334457', '0011223344556679', 1.0, 'dk3')",
             [],
         ).unwrap();
         

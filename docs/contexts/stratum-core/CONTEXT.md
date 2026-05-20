@@ -131,6 +131,28 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 | 8 | ⬜ Pending — Complete HTTP API (shares, blocks, payouts, pagination) |
 | 9 | ⬜ Pending — Payout signer abstraction |
 
+## Cross-Cutting Concerns (Extranonce)
+
+### mining.set_extranonce
+- Sent immediately after `mining.subscribe` response per Stratum V1 standard
+- Contains `[extranonce1, extranonce2_size]`
+- Implemented in `server.rs` subscribe handler
+
+### mining.extranonce.subscribe
+- Accepted with success response (no-op — extranonce1 never changes per session)
+- Method defined in `protocol.rs`, handled in `server.rs`
+
+### Extranonce1 Uniqueness
+- Derived from session counter (monotonically increasing u64)
+- Lower 32 bits formatted as 8-hex-char string
+- Guarantees uniqueness without collision-checking overhead
+- Implemented in `server.rs` accept loop
+
+### Extranonce1 Persistence
+- Stored in `shares.extranonce1` (TEXT NOT NULL) for every share
+- Stored in `found_blocks.extranonce1` (TEXT, nullable) for found blocks
+- Enables coinbase reconstruction for any historical share from DB alone
+
 ## Future Considerations
 
 - Slice 7: PPLNS payout calculation

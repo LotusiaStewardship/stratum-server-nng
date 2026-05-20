@@ -14,6 +14,7 @@ pub struct Share {
     pub job_id: String,
     pub template_id: i64,
     pub template_epoch: i64,
+    pub extranonce1: String,
     pub extranonce2: String,
     pub ntime_hex_6b: String,
     pub nonce_hex_8b: String,
@@ -86,21 +87,22 @@ impl ShareRepository {
         let mut stmt = conn.prepare(
             "INSERT OR IGNORE INTO shares
              (worker_id, session_id, job_id, template_id, template_epoch,
-              extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
 
-        let rows_affected = stmt.execute([
-            share.worker_id.to_sql()?,
-            share.session_id.to_sql()?,
-            share.job_id.to_sql()?,
-            share.template_id.to_sql()?,
-            share.template_epoch.to_sql()?,
-            share.extranonce2.to_sql()?,
-            share.ntime_hex_6b.to_sql()?,
-            share.nonce_hex_8b.to_sql()?,
-            share.difficulty.to_sql()?,
-            share.dedupe_key.to_sql()?,
+        let rows_affected = stmt.execute(rusqlite::params![
+            share.worker_id,
+            share.session_id,
+            share.job_id,
+            share.template_id,
+            share.template_epoch,
+            share.extranonce1,
+            share.extranonce2,
+            share.ntime_hex_6b,
+            share.nonce_hex_8b,
+            share.difficulty,
+            share.dedupe_key,
         ])?;
 
         if rows_affected == 0 {
@@ -235,21 +237,22 @@ impl ShareRepository {
                 let mut stmt = conn.prepare(
                     "INSERT OR IGNORE INTO shares
                      (worker_id, session_id, job_id, template_id, template_epoch,
-                      extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )?;
 
-                let rows = stmt.execute([
-                    share.worker_id.to_sql()?,
-                    share.session_id.to_sql()?,
-                    share.job_id.to_sql()?,
-                    share.template_id.to_sql()?,
-                    share.template_epoch.to_sql()?,
-                    share.extranonce2.to_sql()?,
-                    share.ntime_hex_6b.to_sql()?,
-                    share.nonce_hex_8b.to_sql()?,
-                    share.difficulty.to_sql()?,
-                    share.dedupe_key.to_sql()?,
+                let rows = stmt.execute(rusqlite::params![
+                    share.worker_id,
+                    share.session_id,
+                    share.job_id,
+                    share.template_id,
+                    share.template_epoch,
+                    share.extranonce1,
+                    share.extranonce2,
+                    share.ntime_hex_6b,
+                    share.nonce_hex_8b,
+                    share.difficulty,
+                    share.dedupe_key,
                 ])?;
 
                 let is_new = rows > 0;
@@ -394,6 +397,7 @@ mod tests {
             job_id: format!("job-{}-{}", template_id, template_epoch),
             template_id,
             template_epoch,
+            extranonce1: "00000001".to_string(),
             extranonce2: "00112233".to_string(),
             ntime_hex_6b: "001122334455".to_string(),
             nonce_hex_8b: "0011223344556677".to_string(),

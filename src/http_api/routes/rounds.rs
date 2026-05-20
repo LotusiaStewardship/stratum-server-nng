@@ -161,8 +161,8 @@ mod tests {
         for i in 1..=3 {
             let dedupe = dedupe_base(i);
             conn.lock().execute(
-                "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
-                 VALUES (?1, 'sess-1', 'job-1', 1, 100, '00112233', '001122334455', '0011223344556677', 1.0, ?2)",
+                "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (?1, 'sess-1', 'job-1', 1, 100, '00000001', '00112233', '001122334455', '0011223344556677', 1.0, ?2)",
                 rusqlite::params![w1.id, dedupe],
             ).unwrap();
             conn.lock().execute(
@@ -174,8 +174,8 @@ mod tests {
         // One rejected for w2 (share_id = 4, the next sequential ID)
         let dedupe_r = dedupe_base(10);
         conn.lock().execute(
-            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
-             VALUES (?1, 'sess-1', 'job-1', 1, 100, '00112233', '001122334455', '0011223344556677', 1.0, ?2)",
+            "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+             VALUES (?1, 'sess-1', 'job-1', 1, 100, '00000001', '00112233', '001122334455', '0011223344556677', 1.0, ?2)",
             rusqlite::params![w2.id, dedupe_r],
         ).unwrap();
         let share_id_4: i64 = 4;

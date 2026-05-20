@@ -109,7 +109,17 @@ impl StratumServer {
                     match result {
                         Ok((stream, addr)) => {
                             debug!(addr = %addr, "new miner connection");
-                            let session_id = self.generate_session_id().await;
+                            // Per UBQ: extranonce1 must be globally unique across active sessions.
+                            // Derive from the session counter to guarantee uniqueness without
+                            // collision-checking. The counter wraps at u32::MAX (~4B connections),
+                            // which is not practically reachable.
+                            let mut counter = self.session_counter.write().await;
+                            *counter += 1;
+                            let count = *counter;
+                            drop(counter);
+                            let session_id = format!("sess-{}", count);
+                            let extranonce1 = format!("{:08x}", count as u32);
+
                             // Compute N_diff from the latest job's network target
                             let n_diff = self
                                 .job_cache
@@ -117,11 +127,12 @@ impl StratumServer {
                                 .await
                                 .and_then(|job| network_target_hex_to_difficulty(&job.network_target_hex))
                                 .unwrap_or(1.0);
-                            let session = SessionState::new(
+                            let mut session = SessionState::new(
                                 session_id.clone(),
                                 self.vardiff_config.clone(),
                                 n_diff,
                             );
+                            session.extranonce1 = extranonce1;
                             
                             // Clone Arcs for the connection handler
                             let connected_miners = self.connected_miners.clone();
@@ -312,7 +323,19 @@ async fn handle_connection(
                             Method::Ping => {
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
                             }
-                            Method::SetDifficulty | Method::ExtranonceSubscribe | Method::SetExtranonce | Method::SuggestDifficulty => {
+                            Method::ExtranonceSubscribe => {
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        "verbose: mining.extranonce.subscribe acknowledged",
+                                    );
+                                }
+                                // Acknowledge subscription per Stratum V1 standard.
+                                // Since extranonce1 is per-session and never changes at runtime,
+                                // we accept the subscription but never send follow-up updates.
+                                StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
+                            }
+                            Method::SetDifficulty | Method::SetExtranonce | Method::SuggestDifficulty => {
                                 if debug {
                                     info!(
                                         session = %session.session_id,
@@ -360,6 +383,36 @@ async fn handle_connection(
                         let mut buf = resp_line.as_bytes().to_vec();
                         buf.push(b'\n');
                         writer.write_all(&buf).await?;
+                        
+                        // After subscribe, send mining.set_extranonce per Stratum V1 standard.
+                        // The miner needs extranonce1 + extranonce2_size to construct the coinbase.
+                        // This notification is sent in addition to the subscribe response which
+                        // also includes these values (result[1], result[2]).
+                        if req.method == Method::Subscribe && session.is_subscribed {
+                            let extranonce_cmd = serde_json::json!({
+                                "id": null,
+                                "method": "mining.set_extranonce",
+                                "params": [session.extranonce1, session.extranonce2_size]
+                            });
+                            let extranonce_line = serde_json::to_string(&extranonce_cmd)?;
+                            if debug {
+                                info!(
+                                    session = %session.session_id,
+                                    extranonce1 = %session.extranonce1,
+                                    message = %extranonce_line,
+                                    "verbose: mining.set_extranonce sent after subscribe",
+                                );
+                            }
+                            debug_assert!(!extranonce_line.is_empty(), "write empty set_extranonce");
+                            let mut buf = extranonce_line.as_bytes().to_vec();
+                            buf.push(b'\n');
+                            writer.write_all(&buf).await?;
+                            debug!(
+                                session = %session.session_id,
+                                extranonce1 = %session.extranonce1,
+                                "sent mining.set_extranonce",
+                            );
+                        }
                         
                         // If authorized, send mining.set_difficulty with current P_diff
                         // then mining.notify with current job, and record assigned job
@@ -709,6 +762,7 @@ async fn handle_submit(
                 job_id,
                 template_id,
                 template_epoch,
+                &session.extranonce1,
                 extranonce2,
                 ntime_hex,
                 nonce_hex,
@@ -974,6 +1028,104 @@ mod tests {
         assert_eq!(params.len(), 13); // 9 standard + 4 Lotus extension params
     }
 
+    /// Integration test: subscribe response includes extranonce1,
+    /// then server sends mining.set_extranonce per Stratum V1 standard.
+    #[tokio::test]
+    async fn test_subscribe_sends_set_extranonce() {
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13339".parse().unwrap();
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13339").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(resp["error"].is_null());
+        let result = resp["result"].as_array().unwrap();
+        assert_eq!(result.len(), 3);
+        let extranonce1 = result[1].as_str().unwrap();
+        assert_eq!(extranonce1.len(), 8, "extranonce1 must be 8 hex chars");
+        assert!(extranonce1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(result[2].as_u64().unwrap(), 4, "extranonce2_size must be 4");
+
+        // Read mining.set_extranonce notification
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.set_extranonce after subscribe")
+            .unwrap();
+        let set_en: serde_json::Value = serde_json::from_str(&response.trim()).unwrap();
+        assert_eq!(set_en["method"], "mining.set_extranonce");
+        assert_eq!(set_en["id"], serde_json::Value::Null);
+        let params = set_en["params"].as_array().unwrap();
+        assert_eq!(params.len(), 2);
+        let notif_extranonce1 = params[0].as_str().unwrap();
+        assert_eq!(notif_extranonce1, extranonce1, "set_extranonce extranonce1 must match subscribe response");
+        assert_eq!(params[1].as_u64().unwrap(), 4, "set_extranonce extranonce2_size must be 4");
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
+    }
+
+    /// Integration test: mining.extranonce.subscribe returns success.
+    #[tokio::test]
+    async fn test_extranonce_subscribe_returns_success() {
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13346".parse().unwrap();
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
+
+        let server_handle = tokio::spawn(async move {
+            server.run().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13346").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe first (required before extranonce.subscribe in some clients)
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        // Drain mining.set_extranonce
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Send mining.extranonce.subscribe
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "mining.extranonce.subscribe should not return error, got {:?}",
+            resp["error"],
+        );
+        assert_eq!(resp["result"], serde_json::Value::Bool(true));
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
+    }
+
     /// Integration test: full subscribe → authorize → submit flow
     #[tokio::test]
     async fn test_integration_subscribe_authorize_submit() {
@@ -1002,6 +1154,10 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"].as_array().unwrap().len(), 3);
+        
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
         
         // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
@@ -1158,6 +1314,10 @@ mod tests {
         // Subscribe
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
         let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
         reader.read_line(&mut response).await.unwrap();
         
         // Authorize
@@ -1318,6 +1478,10 @@ mod tests {
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
         // Do NOT authorize. Submit with a valid Lotus address that was never authorized.
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJHGmfZkU8zFrzU8Gw198o4j2XUryNnrMccuvZ.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
 
@@ -1385,6 +1549,10 @@ mod tests {
         // Subscribe and authorize
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
         let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
         reader.read_line(&mut response).await.unwrap();
 
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
@@ -1470,6 +1638,10 @@ mod tests {
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
         response.clear();
         reader.read_line(&mut response).await.unwrap();
@@ -1551,6 +1723,10 @@ mod tests {
         // Subscribe and authorize
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
         let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
         reader.read_line(&mut response).await.unwrap();
 
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
@@ -1637,6 +1813,10 @@ mod tests {
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
         // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
         response.clear();
@@ -1720,6 +1900,10 @@ mod tests {
         // Subscribe
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
         let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
         reader.read_line(&mut response).await.unwrap();
 
         // Authorize
@@ -1820,6 +2004,10 @@ mod tests {
             .await
             .unwrap();
         let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
+        response.clear();
         reader.read_line(&mut response).await.unwrap();
 
         // Authorize

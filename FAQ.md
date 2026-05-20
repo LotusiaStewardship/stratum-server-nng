@@ -91,7 +91,7 @@ Key characteristics:
 
 The connection follows a standard Stratum V1 handshake:
 
-1. **Subscribe** — The miner sends `mining.subscribe` to register with the pool. The pool responds with a unique `extranonce1`, subscription IDs, and the expected `extranonce2` size.
+1. **Subscribe** — The miner sends `mining.subscribe` to register with the pool. The pool responds with a unique `extranonce1`, subscription IDs, and the expected `extranonce2` size. The pool then sends `mining.set_extranonce` with `[extranonce1, extranonce2_size]` as a notification per Stratum V1 standard.
 2. **Authorize** — The miner sends `mining.authorize` with its worker name (e.g., `lotus_YourAddress.rig0`). The pool validates the worker name and begins tracking shares for that worker.
 3. **Receive work** — The pool sends `mining.notify` with a new mining job (block header template, merkle branches, etc.).
 4. **Submit shares** — The miner sends `mining.submit` with a candidate share (nonce, timestamp, etc.). The pool validates it and responds with accepted/rejected.
