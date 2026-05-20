@@ -1057,3 +1057,55 @@ Key UBQ invariants that span multiple slices:
 | Payout share snapshot for audit | UBQ §Payout Share Snapshot | Slice 7 |
 | Template epoch: monotonically increasing counter | UBQ §Template Epoch | Slice 2, Slice 6 |
 | Job ID format: `job-{template_id}-{epoch}` | UBQ §Job | Slice 2 |
+
+---
+
+## Stratum V1 Protocol Compatibility
+
+Notes on Stratum V1 extension methods and their current status between this server and the canonical GPU miner (`lotus-gpu-miner`).
+
+### Verified Compatibility (canonical GPU miner)
+
+The miner at [`lotus-gpu-miner`](../../../../lotus-gpu-miner/) sends only these client-to-server methods:
+- `mining.subscribe` — supported ✅
+- `mining.authorize` — supported ✅
+- `mining.submit` — supported ✅
+- `mining.ping` — supported ✅ (returns `true` with no error)
+
+The miner handles these server-to-client notifications:
+- `mining.set_difficulty` — supported ✅
+- `mining.set_extranonce` — supported ✅ (but server does not yet send this; see below)
+- `mining.notify` — supported ✅
+
+All core Stratum V1 flows work. The miner connects, subscribes, authorizes, receives jobs and difficulty updates, and submits shares without issues.
+
+### Discrepancies
+
+#### `mining.extranonce.subscribe` (client-to-server)
+**Status:** 🟡 Ignored (returns "unknown method" error)
+**GPU miner:** Does NOT send this method. No compatibility impact for canonical miner.
+**Third-party impact:** Some Stratum V1 proxy software (e.g., btcproxy, cgminer forks) send this during initialization. An error response may cause warnings or disconnection.
+**Fix priority:** Low — implement as no-op success response for third-party compatibility.
+
+#### `mining.suggest_difficulty` (client-to-server)
+**Status:** 🟡 Ignored (returns "unknown method" error)
+**GPU miner:** Does NOT send this method. No compatibility impact for canonical miner.
+**Third-party impact:** Some Stratum miners send this as a courtesy to suggest a preferred difficulty. Returning an error is spec-compliant.
+**Fix priority:** Low — return `true` as a no-op for third-party compatibility.
+
+#### `mining.set_extranonce` (server-to-client)
+**Status:** 🔴 Server does not send this notification
+**GPU miner:** Handles this correctly (updates extranonce1 and extranonce2_size).
+**Current behavior:** The server assigns a unique extranonce1 at session creation and never changes it. This method is not needed for the current design, but may be required if extranonce rotation is ever implemented (e.g., for privacy or session merging).
+**Fix priority:** None — not needed unless extranonce rotation is added.
+
+#### `mining.set_difficulty` (server-to-client — P_diff clamp on N_diff drop)
+**Status:** 🔴 Gap — See Gap 4 in architecture review
+**Details:** When N_diff drops and a session's VarDiff ceiling contracts, P_diff is silently clamped down. The miner is NOT notified via `mining.set_difficulty`. See the architecture review for the fix.
+
+### Future Work
+
+When implementing support for third-party miners or proxies:
+1. Return `true` for `mining.extranonce.subscribe` (no-op, no actual extranonce subscription)
+2. Return `true` for `mining.suggest_difficulty` (no-op, ignore suggested difficulty)
+3. These changes are trivial and can be done as part of any maintenance cycle.

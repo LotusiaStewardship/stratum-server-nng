@@ -85,10 +85,19 @@ impl VarDiff {
 
     /// Update the N_diff ceiling. When N_diff decreases, P_diff is clamped down.
     /// Called when a new template arrives with a lower network difficulty.
-    pub fn update_max(&mut self, new_n_diff: f64) {
+    ///
+    /// Returns `Some(new_p_diff)` if P_diff was clamped down, `None` otherwise.
+    /// The caller should send `mining.set_difficulty` to the miner when P_diff changes.
+    pub fn update_max(&mut self, new_n_diff: f64) -> Option<f64> {
+        let old_current = self.current;
         self.max = new_n_diff;
         if self.current > self.max {
             self.current = self.max;
+        }
+        if (self.current - old_current).abs() > f64::EPSILON {
+            Some(self.current)
+        } else {
+            None
         }
     }
 
@@ -356,7 +365,15 @@ mod tests {
         vardiff.max = 100.0;
 
         // update_max with a lower N_diff should clamp current down
-        vardiff.update_max(50.0);
+        let result = vardiff.update_max(50.0);
+
+        // Should signal that P_diff changed
+        assert!(result.is_some(), "update_max should signal clamp");
+        assert!(
+            (result.unwrap() - 50.0).abs() < f64::EPSILON,
+            "returned P_diff should be 50.0, got {}",
+            result.unwrap()
+        );
 
         // Current should be clamped to new max = 50.0
         assert!(
@@ -376,8 +393,9 @@ mod tests {
         let mut vardiff = VarDiff::new(default_config(), 100.0, now);
         // Current = 1.0, max = 100.0
         // Update max to 200.0 (higher) — should not affect current
-        vardiff.update_max(200.0);
+        let result = vardiff.update_max(200.0);
 
+        assert!(result.is_none(), "update_max should not signal when P_diff unchanged");
         assert!(
             (vardiff.current() - 1.0).abs() < f64::EPSILON,
             "current should stay at 1.0 when max increases"
@@ -386,6 +404,23 @@ mod tests {
             (vardiff.max - 200.0).abs() < f64::EPSILON,
             "max should be updated to 200.0"
         );
+    }
+
+    #[test]
+    fn test_update_max_no_clamp_when_at_or_below_max() {
+        let now = Instant::now();
+        let mut vardiff = VarDiff::new(default_config(), 100.0, now);
+        // Current = 1.0, max = 100.0
+
+        // New max = 50.0 — current (1.0) is below max, no clamp needed
+        let result = vardiff.update_max(50.0);
+
+        assert!(result.is_none(), "update_max should not signal when current is already below new max");
+        assert!(
+            (vardiff.current() - 1.0).abs() < f64::EPSILON,
+            "current should stay at 1.0 when below new max"
+        );
+        assert_eq!(vardiff.max, 50.0, "max should be updated regardless");
     }
 
     #[test]

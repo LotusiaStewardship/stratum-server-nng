@@ -333,7 +333,23 @@ async fn handle_connection(
                         new_n_diff = new_n_diff,
                         "updating VarDiff ceiling due to N_diff change",
                     );
-                    session.vardiff.update_max(new_n_diff);
+                    // If clamp lowered P_diff, notify the miner immediately
+                    // so it doesn't submit with an outdated difficulty.
+                    if let Some(clamped_diff) = session.vardiff.update_max(new_n_diff) {
+                        let set_diff = serde_json::json!({
+                            "id": null,
+                            "method": "mining.set_difficulty",
+                            "params": [clamped_diff]
+                        });
+                        let set_diff_line = serde_json::to_string(&set_diff)?;
+                        writer.write_all(set_diff_line.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        debug!(
+                            session = %session.session_id,
+                            clamped_diff = clamped_diff,
+                            "sent mining.set_difficulty after N_diff clamp",
+                        );
+                    }
                 }
             }
         }

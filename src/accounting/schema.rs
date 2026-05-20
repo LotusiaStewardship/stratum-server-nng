@@ -2,8 +2,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
-    // Enable foreign keys
+    // Enable foreign keys and WAL journal mode
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
     conn.execute_batch(
         "
@@ -82,6 +83,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_worker_id ON share_outcomes(worker_id);
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_dedupe_key ON share_outcomes(dedupe_key);
         CREATE INDEX IF NOT EXISTS idx_share_outcomes_status ON share_outcomes(status);
+        CREATE INDEX IF NOT EXISTS idx_share_outcomes_round_id ON share_outcomes(round_id);
 
         -- rounds table (payout round tracking)
         CREATE TABLE IF NOT EXISTS rounds (
