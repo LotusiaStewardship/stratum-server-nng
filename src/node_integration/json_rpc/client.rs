@@ -65,13 +65,38 @@ impl JsonRpcClient {
     }
 
     /// Get the current chain tip block count.
-    /// Placeholder for future use.
     pub async fn getblockcount(&self) -> Result<i32> {
         let response = self.call("getblockcount", vec![]).await?;
         let count = response.as_i64().ok_or_else(|| {
             anyhow::anyhow!("getblockcount: unexpected response type: {}", response)
         })?;
         Ok(count as i32)
+    }
+
+    /// Get the block hash at a given height via `getblockhash`.
+    /// Returns `Ok(None)` if the height is above the chain tip (error code -8).
+    pub async fn getblockhash(&self, height: i64) -> Result<Option<String>> {
+        let response = self.call("getblockhash", vec![serde_json::json!(height)]).await;
+
+        match response {
+            Ok(val) => {
+                // On success, getblockhash returns a hex string
+                match val.as_str() {
+                    Some(hash) => Ok(Some(hash.to_string())),
+                    None => {
+                        anyhow::bail!("getblockhash: unexpected response type: {}", val);
+                    }
+                }
+            }
+            Err(e) => {
+                // Check if error is "Block not found" (height above tip, error code -8)
+                let err_str = e.to_string();
+                if err_str.contains("-8") || err_str.contains("Block not found") {
+                    return Ok(None);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Make a generic JSON-RPC 2.0 call.

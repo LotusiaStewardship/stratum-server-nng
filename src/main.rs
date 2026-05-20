@@ -118,6 +118,32 @@ async fn main() -> Result<()> {
         &config.bitcoind_rpc.rpc_pass,
     ));
 
+    // Block reconciliation: validate found_blocks against current chain state
+    info!("reconciling found_blocks against chain state");
+    {
+        let rpc = json_rpc_client.clone();
+        match rpc.getblockcount().await {
+            Ok(tip_height) => {
+                let tip = tip_height as i64;
+                if let Err(e) = accounting_service.reconcile_found_blocks(tip, |height| {
+                    let rpc = rpc.clone();
+                    async move { rpc.getblockhash(height).await }
+                }).await {
+                    tracing::warn!(error = %e, "found_block reconciliation encountered errors");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "block reconciliation skipped: could not get chain tip"
+                );
+            }
+        }
+    }
+
+    // Clone accounting service for the NNG event consumer (stratum server also needs it)
+    let nng_accounting = accounting_service.clone();
+
     let stratum_server = Arc::new(StratumServer::new(
         config.stratum_bind,
         job_cache.clone(),
@@ -129,6 +155,32 @@ async fn main() -> Result<()> {
     // Notify server of the new job, broadcasting N_diff to all sessions.
     // Validates the integration path for future template refreshes (Slice 6).
     stratum_server.notify_new_job(&job).await;
+
+    // Start NNG pub/sub event consumer (template refresh, reorg detection)
+    let consumer_shutdown_rx = shutdown_tx.subscribe();
+    match stratum_server_nng::node_integration::NngEventConsumer::new(
+        &config.nng_pub_url,
+        nng_client.clone(),
+        job_cache.clone(),
+        Some(nng_accounting),
+        stratum_server.job_tx(),
+    ) {
+        Ok(consumer) => {
+            let consumer_handle = tokio::spawn(async move {
+                if let Err(e) = consumer.run(consumer_shutdown_rx).await {
+                    tracing::warn!(error = %e, "NNG event consumer exited with error");
+                }
+            });
+            shutdown.register_task(consumer_handle);
+            tracing::info!("NNG pub/sub event consumer started");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to start NNG event consumer (pub/sub may be unavailable)",
+            );
+        }
+    }
 
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {
@@ -225,3 +277,5 @@ async fn wait_for_shutdown_signal() -> Result<ShutdownType> {
         }
     }
 }
+
+

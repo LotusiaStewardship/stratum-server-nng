@@ -27,6 +27,9 @@ pub struct StratumServer {
     /// Broadcast channel for N_diff (network difficulty) changes.
     /// Each session listens on this to update its VarDiff ceiling.
     n_diff_tx: broadcast::Sender<f64>,
+    /// Broadcast channel for new mining jobs (Arc-wrapped to share across sessions).
+    /// Connection handlers listen on this and send `mining.notify` to miners.
+    job_tx: broadcast::Sender<Arc<MiningJob>>,
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
     vardiff_config: VarDiffConfig,
@@ -43,6 +46,7 @@ impl StratumServer {
         vardiff_config: VarDiffConfig,
     ) -> Self {
         let (n_diff_tx, _) = broadcast::channel::<f64>(128);
+        let (job_tx, _) = broadcast::channel::<Arc<MiningJob>>(128);
         Self {
             bind_address,
             session_counter: Arc::new(RwLock::new(0)),
@@ -50,6 +54,7 @@ impl StratumServer {
             job_cache,
             shutdown_tx,
             n_diff_tx,
+            job_tx,
             accounting_service,
             json_rpc_client,
             vardiff_config,
@@ -82,6 +87,11 @@ impl StratumServer {
     pub async fn notify_new_template(&self, new_n_diff: f64) {
         debug!(new_n_diff, "broadcasting N_diff change to all sessions");
         let _ = self.n_diff_tx.send(new_n_diff);
+    }
+
+    /// Get a clone of the job broadcast sender (used by NNG event consumer).
+    pub fn job_tx(&self) -> broadcast::Sender<Arc<MiningJob>> {
+        self.job_tx.clone()
     }
 
     /// Get the number of connected miners.
@@ -121,6 +131,7 @@ impl StratumServer {
                             let job_cache = self.job_cache.clone();
                             let shutdown_rx = shutdown_rx.resubscribe();
                             let n_diff_rx = self.n_diff_tx.subscribe();
+                            let job_rx = self.job_tx.subscribe();
                             let accounting_service = self.accounting_service.clone();
                             let json_rpc_client = self.json_rpc_client.clone();
                             
@@ -135,6 +146,7 @@ impl StratumServer {
                                     job_cache,
                                     shutdown_rx,
                                     n_diff_rx,
+                                    job_rx,
                                     accounting_service,
                                     json_rpc_client,
                                 ).await {
@@ -175,6 +187,7 @@ async fn handle_connection(
     job_cache: Arc<crate::node_integration::JobCache>,
     mut shutdown_signal: broadcast::Receiver<()>,
     mut n_diff_rx: broadcast::Receiver<f64>,
+    mut job_rx: broadcast::Receiver<Arc<MiningJob>>,
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
 ) -> Result<()> {
@@ -372,6 +385,37 @@ async fn handle_connection(
                     }
                 }
             }
+            new_job = job_rx.recv() => {
+                if let Ok(job) = new_job {
+                    // Per UBQ: clean_jobs=true — ALL previous jobs become stale immediately
+                    debug!(
+                        session = %session.session_id,
+                        job_id = %job.job_id,
+                        "received new job broadcast, clearing assigned jobs",
+                    );
+                    session.clear_assigned_jobs();
+
+                    // Send mining.notify to the miner
+                    let notify = create_notify(&job, &session.session_id);
+                    let notify_line = serde_json::to_string(&notify)?;
+                    writer.write_all(notify_line.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+
+                    // Record the new assigned job with current P_diff and frozen ntime
+                    let p_diff = session.current_difficulty();
+                    session.record_assigned_job(
+                        job.job_id.clone(),
+                        p_diff,
+                        job.ntime.clone(),
+                    );
+                    debug!(
+                        session = %session.session_id,
+                        job = %job.job_id,
+                        p_diff = p_diff,
+                        "sent mining.notify and recorded assigned job",
+                    );
+                }
+            }
         }
     }
 
@@ -506,28 +550,14 @@ async fn handle_submit(
     // This runs for ALL submissions (accepted or rejected) per UBQ.
     // AccountingService handles worker upsert, round resolution, dedupe key, and
     // atomic share+outcome insert with accounting event recording.
-    // We capture the dedupe_key from the share parameters for later node_result update.
-    let dedupe_key = if let Ok(_parsed) =
-        crate::stratum_protocol::session::parse_worker_name(worker_name)
-    {
-        // Compute the dedupe key to update node_result after block submission
-        crate::accounting::ShareRepository::build_dedupe_key(
-            0, // worker_id unknown at this point; will be resolved by AccountingService
-            template_id,
-            template_epoch,
-            extranonce2,
-            ntime_hex,
-            nonce_hex,
-        )
-    } else {
-        String::new()
-    };
+    // The returned dedupe_key has the real worker_id (not a placeholder).
+    let mut actual_dedupe_key = String::new();
 
     if let Some(acct) = accounting_service {
         if let Ok(worker_parsed) =
             crate::stratum_protocol::session::parse_worker_name(worker_name)
         {
-            if let Err(e) = acct.record_share(
+            match acct.record_share(
                 &worker_parsed.payout_address,
                 worker_parsed.worker_suffix.as_deref(),
                 &session.session_id,
@@ -544,7 +574,12 @@ async fn handle_submit(
                 validation.network_target_ok,
                 validation.block_hash.as_deref(),
             ) {
-                warn!(error = %e, "failed to persist share via AccountingService");
+                Ok((_, _, _, dedupe_key)) => {
+                    actual_dedupe_key = dedupe_key;
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to persist share via AccountingService");
+                }
             }
         }
     }
@@ -573,17 +608,24 @@ async fn handle_submit(
                                 );
                                 if let Some(acct) = accounting_service {
                                     if let Some(block_hash) = &validation.block_hash {
-                                        let _ = acct.record_found_block(
-                                            template_id, // round_id proxy
-                                            block_hash,
-                                            job.height as i64,
-                                            None,
-                                            Some(job.template_id as i64),
-                                            Some("json-rpc"),
-                                        );
+                                        // Resolve the actual round for this template (not template_id as round_id)
+                                        if let Ok(round) = acct.resolve_round_for_template(template_id) {
+                                            let _ = acct.record_found_block(
+                                                round.id,
+                                                block_hash,
+                                                job.height as i64,
+                                                None,
+                                                Some(job.template_id as i64),
+                                                Some("json-rpc"),
+                                            );
+                                            // Close the round: transition from 'open' to 'found'
+                                            let _ = acct.close_round(round.id, template_id, "found");
+                                        } else {
+                                            warn!(template_id, "failed to resolve round for found block");
+                                        }
                                     }
                                     let _ = acct.update_share_outcome_node_result(
-                                        &dedupe_key, "accepted"
+                                        &actual_dedupe_key, "accepted"
                                     );
                                 }
                             }
@@ -595,7 +637,7 @@ async fn handle_submit(
                                 if let Some(acct) = accounting_service {
                                     let reason = result.error.unwrap_or_else(|| "unknown".to_string());
                                     let _ = acct.update_share_outcome_node_result(
-                                        &dedupe_key, &format!("rejected: {}", reason)
+                                        &actual_dedupe_key, &format!("rejected: {}", reason)
                                     );
                                 }
                             }

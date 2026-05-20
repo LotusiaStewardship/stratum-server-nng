@@ -114,13 +114,25 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 - Template fetched once on startup via NNG RPC
 - Converted to MiningJob and cached in JobCache (LRU, max 512)
 - N_diff broadcast to all sessions via `StratumServer::notify_new_job()`
-- Slice 6 will add event-driven refresh via NNG pub/sub
+- Event-driven refresh via NNG pub/sub `NngEventConsumer`:
+  - Subscribes to `miningwrkchg` with 100ms coalescing
+  - Fetches new template, inserts in cache, broadcasts to all sessions
+  - `clean_jobs=true` clears all session assigned_jobs immediately
 
 ---
 
-## Future Considerations (Post-Slice 5)
+## Implementation Status
 
-- Slice 6: NNG pub/sub (miningwrchg, blkconnected, blkdisconctd), found blocks, reorg handling
+| Slice | Status |
+|-------|--------|
+| 1–5 | ✅ Complete |
+| 6 | ✅ Complete — JSON-RPC client, block builder, found block repo, NNG pub/sub event consumer, block reconciliation |
+| 7 | ⬜ Pending — PPLNS payout calculation |
+| 8 | ⬜ Pending — Complete HTTP API (shares, blocks, payouts, pagination) |
+| 9 | ⬜ Pending — Payout signer abstraction |
+
+## Future Considerations
+
 - Slice 7: PPLNS payout calculation
 - Slice 8: Complete HTTP API (shares, blocks, payouts, pagination)
 - Slice 9: Payout signer abstraction
