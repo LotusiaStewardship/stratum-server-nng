@@ -771,7 +771,7 @@ mod tests {
         let params = notify["params"].as_array().unwrap();
         assert_eq!(params[0], "job-890-100"); // job_id with epoch
         assert_eq!(params[1], job.prevhash); // prevhash
-        assert_eq!(params.len(), 9); // 9 params total
+        assert_eq!(params.len(), 13); // 9 standard + 4 Lotus extension params
     }
 
     /// Integration test: full subscribe → authorize → submit flow

@@ -38,7 +38,7 @@ pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
         version: format!("{:08x}", template.version),
         nbits: template.nbits_stratum.clone(),
         ntime: template.ntime_stratum.clone(),
-        network_target_hex: hex::encode(template.target.as_slice()),
+        network_target_hex: template.target.to_hex_be(),
         clean_jobs: false,
         template_epoch: template.curtime,
         height: template.height,
@@ -106,7 +106,13 @@ mod tests {
     #[test]
     fn test_template_to_job_network_target() {
         let mut template = create_test_template();
-        // Set a specific target: 0x00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        // Set raw Sha256d bytes (LE internal storage).
+        // Sha256d stores bytes LSB-first. These 32 bytes are:
+        //   [0x00,0x00,0x00,0x00, 0xFF,...,0xFF]
+        // The U256 value represented is 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000
+        // (28 most-significant bytes = 0xFF, 4 least-significant bytes = 0x00).
+        // In big-endian hex (to_hex_be) this is:
+        //   ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000
         template.target = Sha256d::new([
             0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -117,7 +123,7 @@ mod tests {
 
         assert_eq!(
             job.network_target_hex,
-            "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000"
         );
     }
 

@@ -49,7 +49,7 @@ impl NngEventConsumer {
 
     /// Run the event loop until shutdown signal is received.
     pub async fn run(
-        mut self,
+        self,
         mut shutdown_signal: broadcast::Receiver<()>,
     ) -> Result<()> {
         info!("NNG pub/sub consumer starting event loop");

@@ -45,6 +45,11 @@ impl MiningJob {
             self.nbits,
             self.ntime,
             self.clean_jobs,
+            // Lotus extension fields (params 9-12)
+            self.height,
+            self.epoch_hash,
+            self.extended_metadata_hash,
+            self.block_size,
         ])
     }
 }
