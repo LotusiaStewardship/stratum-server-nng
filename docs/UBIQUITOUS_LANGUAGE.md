@@ -86,7 +86,7 @@ A persistent mining identity that spans sessions. A worker has:
 ### Session
 A TCP connection from a miner to the pool server. A session has:
 - Unique session identifier
-- Assigned extranonce1 (4 bytes, unique per session)
+- Assigned extranonce1 (4 bytes, globally unique across all active sessions)
 - Extranonce2 size (fixed at 4 bytes per Stratum V1 standard)
 - Variable difficulty (per-session VarDiff controller — P_diff)
 - Subscription and authorization state
@@ -97,6 +97,12 @@ A TCP connection from a miner to the pool server. A session has:
 - Idle timeout (`conn_idle_timeout_secs`)
 
 **Key invariant:** Each session has exactly one extranonce1 value for its lifetime. Extranonce1 is never reused across sessions.
+
+**Key invariant:** Extranonce1 is derived from the session counter (monotonically increasing u64), guaranteeing global uniqueness across all active sessions without collision-checking overhead. The counter wraps at u32::MAX (~4B connections).
+
+**Key invariant:** The server sends `mining.set_extranonce` immediately after the `mining.subscribe` response, communicating the session's `[extranonce1, extranonce2_size]` as a notification. This is the standard Stratum V1 mechanism for delivering extranonce parameters.
+
+**Key invariant:** `mining.extranonce.subscribe` is accepted (returns success) but does not trigger any follow-up updates because extranonce1 is fixed per session.
 
 **Key invariant:** Session is transient (TCP connection lifetime). Worker is persistent (exists across sessions).
 

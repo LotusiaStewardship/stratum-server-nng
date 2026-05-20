@@ -181,6 +181,7 @@ impl StratumServer {
     }
 
     /// Generate a unique session ID.
+    #[cfg(test)]
     async fn generate_session_id(&self) -> String {
         let mut counter = self.session_counter.write().await;
         *counter += 1;
