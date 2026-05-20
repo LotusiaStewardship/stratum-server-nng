@@ -116,6 +116,26 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_accounting_events_type ON accounting_events(event_type);
         CREATE INDEX IF NOT EXISTS idx_accounting_events_created ON accounting_events(created_at);
+
+        -- found_blocks table
+        CREATE TABLE IF NOT EXISTS found_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            block_hash TEXT NOT NULL UNIQUE,
+            height INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            worker_id INTEGER,
+            template_id INTEGER,
+            persist_source TEXT,
+            orphan_reason TEXT,
+            matured_at DATETIME,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (round_id) REFERENCES rounds(id),
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_found_blocks_status ON found_blocks(status);
+        CREATE INDEX IF NOT EXISTS idx_found_blocks_hash ON found_blocks(block_hash);
         ",
     )?;
     Ok(())

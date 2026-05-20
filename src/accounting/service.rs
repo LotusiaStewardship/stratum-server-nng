@@ -5,8 +5,8 @@ use rusqlite::Connection;
 
 use super::{
     ShareRepository, WorkerRepository, RoundRepository,
-    AccountingEventRepository,
-    Share, ShareOutcome, Round, AccountingEvent,
+    FoundBlockRepository, AccountingEventRepository,
+    Share, ShareOutcome, Round, AccountingEvent, FoundBlock,
 };
 
 /// Facade that orchestrates accounting operations across multiple repositories.
@@ -20,6 +20,7 @@ pub struct AccountingService {
     pub worker_repo: WorkerRepository,
     pub round_repo: RoundRepository,
     pub event_repo: AccountingEventRepository,
+    pub found_block_repo: FoundBlockRepository,
 }
 
 impl AccountingService {
@@ -29,6 +30,7 @@ impl AccountingService {
             worker_repo: WorkerRepository::new(conn.clone()),
             round_repo: RoundRepository::new(conn.clone()),
             event_repo: AccountingEventRepository::new(conn.clone()),
+            found_block_repo: FoundBlockRepository::new(conn.clone()),
         }
     }
 
@@ -214,6 +216,45 @@ impl AccountingService {
         };
         let _ = self.event_repo.record_event(&event);
         Ok(())
+    }
+
+    /// Update the node_result field on a share_outcome after block submission.
+    pub fn update_share_outcome_node_result(&self, dedupe_key: &str, node_result: &str) -> Result<usize> {
+        self.share_repo.update_outcome_node_result(dedupe_key, node_result)
+    }
+
+    /// Record a found block after successful lotusd submission.
+    pub fn record_found_block(
+        &self,
+        round_id: i64,
+        block_hash: &str,
+        height: i64,
+        worker_id: Option<i64>,
+        template_id: Option<i64>,
+        persist_source: Option<&str>,
+    ) -> Result<FoundBlock> {
+        let block = self.found_block_repo.record_found_block(
+            round_id, block_hash, height, worker_id, template_id, persist_source,
+        )?;
+        // Record accounting event
+        let event = AccountingEvent {
+            id: 0,
+            event_type: "found_block_observed".to_string(),
+            status: "confirmed".to_string(),
+            session_id: None,
+            worker_id,
+            worker_name: None,
+            payout_address: None,
+            round_id: Some(round_id),
+            template_id,
+            template_epoch: None,
+            job_id: None,
+            block_hash: Some(block_hash.to_string()),
+            height: Some(height),
+            payload_json: None,
+        };
+        let _ = self.event_repo.record_event(&event);
+        Ok(block)
     }
 
     /// Record an accounting event.

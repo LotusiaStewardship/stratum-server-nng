@@ -11,6 +11,9 @@ pub struct Config {
     pub api_bind: SocketAddr,
     /// lotusd NNG RPC URL (e.g., "ipc:///tmp/lotusd.rpc")
     pub nng_rpc_url: String,
+    /// lotusd NNG Pub/Sub URL (e.g., "ipc:///tmp/lotusd.pub")
+    #[serde(default = "default_nng_pub_url")]
+    pub nng_pub_url: String,
     /// SQLite database path
     pub sqlite_path: String,
     /// API bearer token for authentication
@@ -19,6 +22,9 @@ pub struct Config {
     /// Variable difficulty settings (maps to VarDiff runtime config)
     #[serde(default)]
     pub vardiff: VarDiffSettings,
+    /// lotusd JSON-RPC HTTP settings for block submission
+    #[serde(default)]
+    pub bitcoind_rpc: BitcoindRpcSettings,
 }
 
 /// Variable difficulty settings loaded from config.toml.
@@ -61,10 +67,42 @@ impl From<VarDiffSettings> for crate::share_processing::VarDiffConfig {
     }
 }
 
+/// Lotusd JSON-RPC HTTP settings for block submission and chain queries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BitcoindRpcSettings {
+    /// JSON-RPC URL (e.g., "http://127.0.0.1:10604")
+    #[serde(default = "default_bitcoind_rpc_url")]
+    pub url: String,
+    /// RPC username for Basic Auth
+    #[serde(default)]
+    pub rpc_user: String,
+    /// RPC password for Basic Auth
+    #[serde(default)]
+    pub rpc_pass: String,
+}
+
+impl Default for BitcoindRpcSettings {
+    fn default() -> Self {
+        Self {
+            url: default_bitcoind_rpc_url(),
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+        }
+    }
+}
+
+fn default_bitcoind_rpc_url() -> String {
+    "http://127.0.0.1:10604".to_string()
+}
+
 fn default_vardiff_min_floor() -> f64 { 0.001 }
 fn default_vardiff_initial_pct() -> f64 { 0.01 }
 fn default_vardiff_target_secs() -> f64 { 20.0 }
 fn default_vardiff_retarget_secs() -> f64 { 60.0 }
+
+fn default_nng_pub_url() -> String {
+    "ipc:///tmp/lotusd.pub".to_string()
+}
 
 fn default_api_token() -> String {
     "devtoken".to_string()
@@ -87,12 +125,28 @@ impl Config {
             cfg.nng_rpc_url = url;
         }
         
+        if let Ok(url) = std::env::var("NNG_PUB_URL") {
+            cfg.nng_pub_url = url;
+        }
+        
         if let Ok(token) = std::env::var("STRATUM_API_TOKEN") {
             cfg.api_token = token;
         }
         
         if let Ok(path) = std::env::var("DATABASE_PATH") {
             cfg.sqlite_path = path;
+        }
+        
+        if let Ok(url) = std::env::var("BITCOIND_RPC_URL") {
+            cfg.bitcoind_rpc.url = url;
+        }
+        
+        if let Ok(user) = std::env::var("BITCOIND_RPC_USER") {
+            cfg.bitcoind_rpc.rpc_user = user;
+        }
+        
+        if let Ok(pass) = std::env::var("BITCOIND_RPC_PASS") {
+            cfg.bitcoind_rpc.rpc_pass = pass;
         }
         
         Ok(cfg)

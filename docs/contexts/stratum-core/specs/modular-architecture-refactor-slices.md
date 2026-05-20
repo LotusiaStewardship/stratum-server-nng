@@ -16,7 +16,7 @@
 | 3 | Share Validation Pipeline | AFK | #2 | 1 day | ✅ Done (UBQ-aligned) |
 | 4 | Per-Session VarDiff | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
 | 5 | Worker and Round Accounting | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
-| 6 | Found Blocks and Reorg Handling | AFK | #5 | 1 day |
+| 6 | Found Blocks and Reorg Handling (includes JSON-RPC submitblock) | AFK | #5 | 2 days |
 | 7 | PPLNS Payout Calculation | AFK | #6 | 2 days |
 | 8 | Complete HTTP API | AFK | #5 | 1 day |
 | 9 | Payout Signer Abstraction | HITL (needs key config) | #7 | 0.5 days |
@@ -619,14 +619,56 @@ CREATE INDEX idx_share_outcomes_round_id ON share_outcomes(round_id);
 
 ### What to build
 
-Track found blocks submitted to lotusd. Handle blockchain reorgs via NNG pub/sub events (`blkconnected`, `blkdisconctd`, `miningwrkchg`). Mark orphaned blocks and adjust accounting.
+Track found blocks submitted to lotusd. Handle blockchain reorgs via NNG pub/sub events (`blkconnected`, `blkdisconctd`, `miningwrkchg`). Mark orphaned blocks and adjust accounting. Build a JSON-RPC HTTP client for block submission and chain queries.
 
 ### Acceptance criteria
+
+#### JSON-RPC Client
+
+- [ ] JSON-RPC client connects to configured `bitcoind_rpc.url` with authentication
+  - [ ] Uses `rpc_user` / `rpc_pass` from config for HTTP Basic Auth
+  - [ ] Configurable via `[bitcoind_rpc]` section in config.toml or env var overrides
+- [ ] JSON-RPC request formatting:
+  - [ ] Builds valid JSON-RPC 2.0 request objects: `{"jsonrpc":"2.0","id":<n>,"method":"<method>","params":<params>}`
+  - [ ] Auto-incrementing request IDs for correlation
+- [ ] JSON-RPC response parsing:
+  - [ ] Parses successful responses: `{"result":<value>,"error":null,"id":<n>}`
+  - [ ] Parses error responses: `{"result":null,"error":{"code":<n>,"message":<s>},"id":<n>}` and returns structured error
+  - [ ] Handles HTTP transport errors (connection refused, timeout, DNS failure)
+  - [ ] Handles malformed JSON responses
+- [ ] `submitblock(mined_block_hex: &str) -> Result<SubmitBlockResult>`:
+  - [ ] Calls `submitblock` JSON-RPC method with raw hex-encoded block
+  - [ ] Returns structured result: `SubmitBlockResult { accepted: bool, block_hash: String, error: Option<String> }`
+  - [ ] Gracefully handles rejection (duplicate, invalid, orphaned)
+- [ ] Placeholder `getblockcount()` for future use (scaffold, returns `Result<i32>`)
+- [ ] JSON-RPC client is `Send + Sync`, shares one `reqwest::Client` across requests
+- [ ] Unit tests for:
+  - [ ] Request formatting (correct JSON-RPC 2.0 structure, auth header)
+  - [ ] Response parsing (success, error, malformed)
+  - [ ] `submitblock` result parsing (accepted vs rejected)
+  - [ ] HTTP error propagation (timeout, connection refused)
+
+#### Block Submission Pipeline
+
+- [ ] After share validation produces `network_target_ok=true`:
+  - [ ] Build the full block from template + miner submission (coinbase + extranonce1 + extranonce2 + header fields)
+  - [ ] Serialize to raw hex bytes
+  - [ ] Submit to lotusd via `submitblock` JSON-RPC call
+  - [ ] If accepted: record share_outcome with `node_result="accepted"`, create `FoundBlock` record with `persist_source="json-rpc"`
+  - [ ] If rejected: record share_outcome with `node_result="rejected: <reason>"`, skip found_block creation
+  - [ ] If lotusd unavailable (connection error): share is still accepted as high-hash share, block submission retried on best-effort basis
+- [ ] Duplicate detection: if the same block is submitted twice (second miner sends same block), second submission returns `"duplicate"` — handle gracefully (don't create duplicate found_block)
+
+#### Found Block Repository
 
 - [ ] Found block repository:
   - `record_found_block(round_id, block_hash, height, worker_id) -> FoundBlock`
   - `mark_orphaned(block_hash, reason) -> ()`
-  - `get_by_hash(block_hash) -> FoundBlock`
+  - `get_by_hash(block_hash) -> Option<FoundBlock>`
+  - `list(status_filter: Option<&str>) -> Vec<FoundBlock>`
+
+#### NNG Pub/Sub Event Handling
+
 - [ ] NNG pub/sub client subscribes to:
   - `miningwrkchg` — template refresh (with 100ms coalescing)
   - `blkconnected` — block connected (for tip tracking)
@@ -644,37 +686,57 @@ Track found blocks submitted to lotusd. Handle blockchain reorgs via NNG pub/sub
   - Clear session's `assigned_jobs` map
   - Create new job in cache
 - [ ] Event coalescing: 100ms debounce for `miningwrkchg` events
-- [ ] `GET /api/v1/blocks` — list found blocks with status (confirmed/orphaned)
-- [ ] Unit tests for orphan detection logic
-- [ ] Integration test: simulate reorg, verify orphan handling
+
+#### HTTP API
+
+- [ ] `GET /api/v1/blocks` — list found blocks with status (confirmed/orphaned), optional `?status=` filter
+- [ ] `GET /api/v1/blocks/{hash}` — block detail with miner attribution and round info
+
+#### Configuration
+
+- [ ] Wire `nng_pub_url` from config.toml into `Config` struct
+- [ ] Wire `[bitcoind_rpc]` section into `Config` struct (`url`, `rpc_user`, `rpc_pass`)
+- [ ] Environment variable overrides: `NNG_PUB_URL`, `BITCOIND_RPC_URL`, `BITCOIND_RPC_USER`, `BITCOIND_RPC_PASS`
 
 ### Testing scope
 
 **Test:**
-- Found block persistence (insert, query, orphan)
+- JSON-RPC client request formatting and response parsing
+- `submitblock` result parsing (accepted, duplicate, rejected, error)
+- HTTP error handling (connection refused, timeout, malformed response)
+- Found block persistence (insert, query, orphan, list with filter)
+- Block submission pipeline (full block build → submit → record/reject)
+- Duplicate block detection (second submission doesn't create duplicate found_block)
 - NNG pub/sub event parsing
 - Event coalescing (debounce logic)
 - Orphan cascade (block → round, but NOT shares)
 - `clean_jobs=true` → assigned_jobs cleared
-- Accounting event recording (found_block_orphaned)
+- Accounting event recording (found_block_orphaned, found_block_observed)
 
 **Don't test:**
 - Template refresh logic (already tested in Slice 2)
 - Payout reversal (Slice 7 handles payouts)
+- Actual lotusd network calls (mock JSON-RPC responses)
 
 ### Module structure
 
 ```
 src/
 ├── node_integration/
-│   └── nng/
-│       ├── pub_sub.rs      # NNG pub/sub subscription, event parsing
-│       └── events.rs       # NodeEvent enum (MiningWorkChanged, BlockConnected, BlockDisconnected)
+│   ├── nng/
+│   │   ├── pub_sub.rs      # NNG pub/sub subscription, event parsing
+│   │   └── events.rs       # NodeEvent enum (MiningWorkChanged, BlockConnected, BlockDisconnected)
+│   └── json_rpc/
+│       ├── mod.rs          # Re-exports
+│       ├── client.rs       # JSON-RPC HTTP client with auth, request/response handling
+│       └── methods.rs      # RPC method implementations (submitblock, getblockcount)
 ├── accounting/
 │   ├── found_block_repository.rs # Found block CRUD
 │   └── schema.rs           # CREATE TABLE found_blocks
 └── stratum_protocol/
-    └── server.rs           # Broadcast mining.notify on template refresh, clear assigned_jobs
+    ├── block_builder.rs    # Build full block from template + miner submission
+    └── server.rs           # Wire block submission in share validation hot path,
+                            # broadcast mining.notify on template refresh
 ```
 
 ### Database schema additions
@@ -689,26 +751,25 @@ CREATE TABLE found_blocks (
     status TEXT NOT NULL DEFAULT 'confirmed',  -- 'confirmed', 'matured', 'paid', 'orphaned'
     worker_id INTEGER,
     template_id INTEGER,
-    persist_source TEXT,  -- 'submitblock' or other
+    persist_source TEXT,  -- 'json-rpc' or other
     orphan_reason TEXT,
     matured_at DATETIME,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (round_id) REFERENCES rounds(id),
     FOREIGN KEY (worker_id) REFERENCES workers(id)
 );
-
--- Add orphaned status to rounds
-ALTER TABLE rounds ADD COLUMN status TEXT NOT NULL DEFAULT 'open';
 ```
 
 ### Notes
 
+- **JSON-RPC client shares `reqwest::Client`** with a single connection pool, not per-call connections.
+- **Block building:** The stratum server has all the pieces to reconstruct the full block: template header + coinbase1 + extranonce1 + extranonce2 + coinbase2 + merkle branches. `block_builder.rs` assembles these into raw block bytes for `submitblock`.
 - **Event coalescing:** 100ms debounce for `miningwrkchg` to reduce template refresh frequency during high mempool variance.
 - **Orphan cascade per UBQ:** Block orphaned → round orphaned → shares remain valid in PPLNS window. The `round_id` is historical accounting only — PPLNS window calculation is share-ID-based, not round-based. Orphan cost is absorbed by pool fees over time.
 - **UBQ invariant:** When a round is orphaned, its shares remain valid and stay in the PPLNS window.
 - **UBQ invariant:** When `clean_jobs=true`, ALL previous jobs become stale immediately. This differs from Bitcoin where only merkle_root changes and miners could theoretically continue working.
 - **UBQ invariant:** The reason code for `miningwrkchg` (NewTip/Reorg/MempoolRefresh/ManualInvalidation) is for logging and observability only — all events trigger `clean_jobs=true`.
-- **Shutdown handling:** NNG pub/sub loop must unsubscribe and close on shutdown signal (use `tokio::select!` with shutdown receiver).
+- **Shutdown handling:** NNG pub/sub loop and JSON-RPC client must respect shutdown signal (use `tokio::select!` with shutdown receiver).
 
 ---
 

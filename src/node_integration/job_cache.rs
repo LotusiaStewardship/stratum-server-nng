@@ -110,6 +110,7 @@ mod tests {
             epoch_hash: String::new(),
             extended_metadata_hash: String::new(),
             block_size: 0,
+            block_bytes: vec![],
         }
     }
 

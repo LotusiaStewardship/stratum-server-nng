@@ -9,7 +9,7 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::accounting::{ShareRepository, WorkerRepository, RoundRepository};
+use crate::accounting::{ShareRepository, WorkerRepository, RoundRepository, FoundBlockRepository};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +17,7 @@ pub struct AppState {
     pub share_repo: Option<ShareRepository>,
     pub worker_repo: Option<WorkerRepository>,
     pub round_repo: Option<RoundRepository>,
+    pub found_block_repo: Option<FoundBlockRepository>,
     pub api_token: String,
 }
 
@@ -60,6 +61,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}", get(crate::http_api::routes::get_worker))
         .route("/api/v1/rounds", get(crate::http_api::routes::list_rounds))
         .route("/api/v1/rounds/{id}", get(crate::http_api::routes::get_round))
+        .route("/api/v1/blocks", get(crate::http_api::routes::list_blocks))
+        .route("/api/v1/blocks/{hash}", get(crate::http_api::routes::get_block))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -84,6 +87,7 @@ mod tests {
             share_repo: None,
             worker_repo: None,
             round_repo: None,
+            found_block_repo: None,
             api_token: token.to_string(),
         }
     }

@@ -41,6 +41,7 @@ mod tests {
             share_repo: None,
             worker_repo: None,
             round_repo: None,
+            found_block_repo: None,
             api_token: "test".to_string(),
         }))
         .await;

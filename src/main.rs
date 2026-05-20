@@ -10,7 +10,7 @@ use tracing_subscriber::FmtSubscriber;
 use stratum_server_nng::config::Config;
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
-use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job};
+use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job, JsonRpcClient};
 use stratum_server_nng::stratum_protocol::server::StratumServer;
 use stratum_server_nng::accounting::{init_schema, AccountingService};
 
@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         share_repo: Some(accounting_service.share_repo.clone()),
         worker_repo: Some(accounting_service.worker_repo.clone()),
         round_repo: Some(accounting_service.round_repo.clone()),
+        found_block_repo: Some(accounting_service.found_block_repo.clone()),
         api_token: config.api_token.clone(),
     };
 
@@ -110,11 +111,19 @@ async fn main() -> Result<()> {
 
     // Start Stratum TCP server
     let stratum_shutdown_signal = shutdown.signal();
+    // Create JSON-RPC client for lotusd (block submission, chain queries)
+    let json_rpc_client = Arc::new(JsonRpcClient::new(
+        &config.bitcoind_rpc.url,
+        &config.bitcoind_rpc.rpc_user,
+        &config.bitcoind_rpc.rpc_pass,
+    ));
+
     let stratum_server = Arc::new(StratumServer::new(
         config.stratum_bind,
         job_cache.clone(),
         shutdown_tx.clone(),
         Some(accounting_service),
+        Some(json_rpc_client.clone()),
         config.vardiff.into(),
     ));
     // Notify server of the new job, broadcasting N_diff to all sessions.

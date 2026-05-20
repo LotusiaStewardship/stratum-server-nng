@@ -230,6 +230,7 @@ mod tests {
             epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
             extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
+            block_bytes: vec![],
         }
     }
 

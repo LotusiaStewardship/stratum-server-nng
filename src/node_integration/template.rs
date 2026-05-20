@@ -45,6 +45,7 @@ pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
         epoch_hash,
         extended_metadata_hash,
         block_size,
+        block_bytes: template.block.clone(),
     }
 }
 

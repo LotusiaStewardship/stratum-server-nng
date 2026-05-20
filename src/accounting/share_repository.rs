@@ -186,6 +186,17 @@ impl ShareRepository {
         Ok(count)
     }
 
+    /// Update the node_result field on a share_outcome after block submission to lotusd.
+    /// Returns the number of rows updated (should be 0 or 1).
+    pub fn update_outcome_node_result(&self, dedupe_key: &str, node_result: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "UPDATE share_outcomes SET node_result = ?1 WHERE dedupe_key = ?2"
+        )?;
+        let rows = stmt.execute(rusqlite::params![node_result, dedupe_key])?;
+        Ok(rows)
+    }
+
     /// Total share_outcomes count.
     pub fn total_outcome_count(&self) -> Result<i64> {
         let conn = self.conn.lock();

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crate::share_processing::network_target_hex_to_difficulty;
 use crate::share_processing::VarDiffConfig;
+use crate::node_integration::JsonRpcClient;
+use crate::node_integration::block_builder::build_submit_block;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +28,7 @@ pub struct StratumServer {
     /// Each session listens on this to update its VarDiff ceiling.
     n_diff_tx: broadcast::Sender<f64>,
     accounting_service: Option<AccountingService>,
+    json_rpc_client: Option<Arc<JsonRpcClient>>,
     vardiff_config: VarDiffConfig,
 }
 
@@ -36,6 +39,7 @@ impl StratumServer {
         job_cache: Arc<crate::node_integration::JobCache>,
         shutdown_tx: broadcast::Sender<()>,
         accounting_service: Option<AccountingService>,
+        json_rpc_client: Option<Arc<JsonRpcClient>>,
         vardiff_config: VarDiffConfig,
     ) -> Self {
         let (n_diff_tx, _) = broadcast::channel::<f64>(128);
@@ -47,6 +51,7 @@ impl StratumServer {
             shutdown_tx,
             n_diff_tx,
             accounting_service,
+            json_rpc_client,
             vardiff_config,
         }
     }
@@ -117,6 +122,7 @@ impl StratumServer {
                             let shutdown_rx = shutdown_rx.resubscribe();
                             let n_diff_rx = self.n_diff_tx.subscribe();
                             let accounting_service = self.accounting_service.clone();
+                            let json_rpc_client = self.json_rpc_client.clone();
                             
                             tokio::spawn(async move {
                                 // Increment connected miners
@@ -130,6 +136,7 @@ impl StratumServer {
                                     shutdown_rx,
                                     n_diff_rx,
                                     accounting_service,
+                                    json_rpc_client,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
                                 }
@@ -169,6 +176,7 @@ async fn handle_connection(
     mut shutdown_signal: broadcast::Receiver<()>,
     mut n_diff_rx: broadcast::Receiver<f64>,
     accounting_service: Option<AccountingService>,
+    json_rpc_client: Option<Arc<JsonRpcClient>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -243,6 +251,7 @@ async fn handle_connection(
                                     &mut session,
                                     &job_cache,
                                     accounting_service.as_ref(),
+                                    json_rpc_client.as_ref(),
                                 ).await;
                                 // If VarDiff retargeted, send mining.set_difficulty to miner
                                 if let Some(diff) = new_diff {
@@ -429,6 +438,7 @@ async fn handle_submit(
     session: &mut SessionState,
     job_cache: &crate::node_integration::JobCache,
     accounting_service: Option<&AccountingService>,
+    json_rpc_client: Option<&Arc<JsonRpcClient>>,
 ) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
     if !session.is_subscribed {
@@ -444,9 +454,10 @@ async fn handle_submit(
     let nonce_hex = arr.get(4).and_then(|v| v.as_str()).unwrap_or_default();
 
     // Get the job from the cache to get template data for header building.
-    // If not found, create a stale validation result directly.
+    // Keep the job for potential block submission if network_target_ok=true.
+    let cached_job = job_cache.get(job_id).await;
     let (validation, template_id, template_epoch, share_diff) =
-        if let Some(job) = job_cache.get(job_id).await {
+        if let Some(ref job) = cached_job {
             // Run the full validation pipeline
             let validation = validator::validate_share(
                 worker_name,
@@ -455,7 +466,7 @@ async fn handle_submit(
                 ntime_hex,
                 nonce_hex,
                 session,
-                &job,
+                job,
             );
             (
                 validation,
@@ -495,6 +506,23 @@ async fn handle_submit(
     // This runs for ALL submissions (accepted or rejected) per UBQ.
     // AccountingService handles worker upsert, round resolution, dedupe key, and
     // atomic share+outcome insert with accounting event recording.
+    // We capture the dedupe_key from the share parameters for later node_result update.
+    let dedupe_key = if let Ok(_parsed) =
+        crate::stratum_protocol::session::parse_worker_name(worker_name)
+    {
+        // Compute the dedupe key to update node_result after block submission
+        crate::accounting::ShareRepository::build_dedupe_key(
+            0, // worker_id unknown at this point; will be resolved by AccountingService
+            template_id,
+            template_epoch,
+            extranonce2,
+            ntime_hex,
+            nonce_hex,
+        )
+    } else {
+        String::new()
+    };
+
     if let Some(acct) = accounting_service {
         if let Ok(worker_parsed) =
             crate::stratum_protocol::session::parse_worker_name(worker_name)
@@ -517,6 +545,69 @@ async fn handle_submit(
                 validation.block_hash.as_deref(),
             ) {
                 warn!(error = %e, "failed to persist share via AccountingService");
+            }
+        }
+    }
+
+    // Block submission: if the share meets N_diff, submit to lotusd via JSON-RPC.
+    // This is best-effort: the share is already accepted; submission failure does
+    // not reject the share. The node_result field captures the submission outcome.
+    if validation.network_target_ok {
+        if let (Some(job), Some(json_rpc)) = (&cached_job, json_rpc_client) {
+            if !job.block_bytes.is_empty() {
+                match build_submit_block(
+                    job,
+                    &session.extranonce1,
+                    extranonce2,
+                    ntime_hex,
+                    nonce_hex,
+                    &job.block_bytes,
+                ) {
+                    Ok(block_hex) => {
+                        let submit_result = json_rpc.submitblock(&block_hex).await;
+                        match submit_result {
+                            Ok(result) if result.accepted => {
+                                debug!(
+                                    block_hash = ?validation.block_hash,
+                                    "block accepted by lotusd"
+                                );
+                                if let Some(acct) = accounting_service {
+                                    if let Some(block_hash) = &validation.block_hash {
+                                        let _ = acct.record_found_block(
+                                            template_id, // round_id proxy
+                                            block_hash,
+                                            job.height as i64,
+                                            None,
+                                            Some(job.template_id as i64),
+                                            Some("json-rpc"),
+                                        );
+                                    }
+                                    let _ = acct.update_share_outcome_node_result(
+                                        &dedupe_key, "accepted"
+                                    );
+                                }
+                            }
+                            Ok(result) => {
+                                debug!(
+                                    error = ?result.error,
+                                    "block rejected by lotusd"
+                                );
+                                if let Some(acct) = accounting_service {
+                                    let reason = result.error.unwrap_or_else(|| "unknown".to_string());
+                                    let _ = acct.update_share_outcome_node_result(
+                                        &dedupe_key, &format!("rejected: {}", reason)
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to submit block to lotusd (best-effort)");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to build submit block");
+                    }
+                }
             }
         }
     }
@@ -580,6 +671,7 @@ mod tests {
             epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
             extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
+            block_bytes: vec![],
         }
     }
 
@@ -591,7 +683,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         // Should not panic or error
         server.notify_new_job(&job).await;
@@ -604,7 +696,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
@@ -615,7 +707,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -649,7 +741,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -725,7 +817,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -757,7 +849,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -806,6 +898,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
         
@@ -885,6 +978,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
         
@@ -960,6 +1054,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1027,6 +1122,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1108,6 +1204,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1189,6 +1286,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1271,6 +1369,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc.clone()),
+            None,
             VarDiffConfig::default(),
         );
 
@@ -1357,6 +1456,7 @@ mod tests {
             job_cache.clone(),
             shutdown_tx.clone(),
             Some(accounting_svc),
+            None,
             VarDiffConfig::default(),
         );
 

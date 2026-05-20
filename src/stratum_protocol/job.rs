@@ -28,6 +28,9 @@ pub struct MiningJob {
     pub epoch_hash: String,
     pub extended_metadata_hash: String,
     pub block_size: u64,
+    /// Full serialized block bytes from the mining template.
+    /// Used by block_builder to reconstruct the block with miner's submission.
+    pub block_bytes: Vec<u8>,
 }
 
 impl MiningJob {
