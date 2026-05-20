@@ -3,6 +3,7 @@ use crate::share_processing::network_target_hex_to_difficulty;
 use crate::share_processing::VarDiffConfig;
 use crate::node_integration::JsonRpcClient;
 use crate::node_integration::block_builder::build_submit_block;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -806,10 +807,25 @@ async fn handle_submit(
                     nonce_hex,
                     &job.block_bytes,
                 ) {
-                    Ok(block_hex) => {
+                    Ok((block_hex, built_block_hash)) => {
+                        // DIAGNOSTIC: compare hashes — mismatch indicates the block was built
+                        // differently than the validator checked. With both fixes applied (header
+                        // construction via build_stratum_header + block_size from
+                        // compute_block_size_with_extranonce), this should not trigger.
+                        if let Some(ref val_hash) = validation.block_hash {
+                            if &built_block_hash != val_hash {
+                                warn!(
+                                    val_hash = %val_hash,
+                                    built_hash = %built_block_hash,
+                                    job_id = %job_id,
+                                    template_id = template_id,
+                                    "block hash mismatch: built block differs from validator",
+                                );
+                            }
+                        }
                         if debug {
                             info!(
-                                block_hash = ?validation.block_hash,
+                                block_hash = built_block_hash,
                                 block_hex_len = block_hex.len(),
                                 "verbose: block built, submitting to lotusd",
                             );
@@ -819,31 +835,29 @@ async fn handle_submit(
                             Ok(result) if result.accepted => {
                                 if debug {
                                     info!(
-                                        block_hash = ?validation.block_hash,
+                                        block_hash = built_block_hash,
                                         "verbose: block accepted by lotusd",
                                     );
                                 }
                                 debug!(
-                                    block_hash = ?validation.block_hash,
+                                    block_hash = built_block_hash,
                                     "block accepted by lotusd"
                                 );
                                 if let Some(acct) = accounting_service {
-                                    if let Some(block_hash) = &validation.block_hash {
-                                        // Resolve the actual round for this template (not template_id as round_id)
-                                        if let Ok(round) = acct.resolve_round_for_template(template_id) {
-                                            let _ = acct.record_found_block(
-                                                round.id,
-                                                block_hash,
-                                                job.height as i64,
-                                                None,
-                                                Some(job.template_id as i64),
-                                                Some("json-rpc"),
-                                            );
-                                            // Close the round: transition from 'open' to 'found'
-                                            let _ = acct.close_round(round.id, template_id, "found");
-                                        } else {
-                                            warn!(template_id, "failed to resolve round for found block");
-                                        }
+                                    // Resolve the actual round for this template (not template_id as round_id)
+                                    if let Ok(round) = acct.resolve_round_for_template(template_id) {
+                                        let _ = acct.record_found_block(
+                                            round.id,
+                                            &built_block_hash,
+                                            job.height as i64,
+                                            None,
+                                            Some(job.template_id as i64),
+                                            Some("json-rpc"),
+                                        );
+                                        // Close the round: transition from 'open' to 'found'
+                                        let _ = acct.close_round(round.id, template_id, "found");
+                                    } else {
+                                        warn!(template_id, "failed to resolve round for found block");
                                     }
                                     let _ = acct.update_share_outcome_node_result(
                                         &actual_dedupe_key, "accepted"
@@ -853,7 +867,7 @@ async fn handle_submit(
                             Ok(result) => {
                                 if debug {
                                     info!(
-                                        block_hash = ?validation.block_hash,
+                                        block_hash = built_block_hash,
                                         error = ?result.error,
                                         "verbose: block rejected by lotusd",
                                     );
@@ -872,7 +886,7 @@ async fn handle_submit(
                             Err(e) => {
                                 if debug {
                                     info!(
-                                        block_hash = ?validation.block_hash,
+                                        block_hash = built_block_hash,
                                         error = %e,
                                         "verbose: block submission to lotusd failed",
                                     );
