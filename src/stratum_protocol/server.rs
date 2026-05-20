@@ -421,13 +421,23 @@ async fn handle_connection(
                         }
                     }
 
-                    // Per UBQ: clean_jobs=true — ALL previous jobs become stale immediately
-                    debug!(
-                        session = %session.session_id,
-                        job_id = %job.job_id,
-                        "received new job broadcast, clearing assigned jobs",
-                    );
-                    session.clear_assigned_jobs();
+                    // Per UBQ: clean_jobs=true — ALL previous jobs become stale immediately.
+                    // Only clear when the job signals clean_jobs on the wire, so server
+                    // behavior stays aligned with the wire-level protocol signal.
+                    if job.clean_jobs {
+                        debug!(
+                            session = %session.session_id,
+                            job_id = %job.job_id,
+                            "clean_jobs=true — clearing assigned jobs",
+                        );
+                        session.clear_assigned_jobs();
+                    } else {
+                        debug!(
+                            session = %session.session_id,
+                            job_id = %job.job_id,
+                            "clean_jobs=false — preserving assigned jobs",
+                        );
+                    }
 
                     // Send mining.notify to the miner
                     let notify = create_notify(&job, &session.session_id);
@@ -1678,10 +1688,12 @@ mod tests {
 
         // Create a new job with a vastly lower N_diff (all-0xFF target ≈ 0 difficulty)
         // This forces P_diff to clamp because P_diff > N_diff after the update.
+        // Per UBQ: miningwrkchg-triggered jobs use clean_jobs=true.
         let mut new_job = create_test_job();
         new_job.job_id = "job-891-101".to_string();
         new_job.template_id = 891;
         new_job.template_epoch = 101;
+        new_job.clean_jobs = true;
         new_job.network_target_hex =
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                 .to_string();

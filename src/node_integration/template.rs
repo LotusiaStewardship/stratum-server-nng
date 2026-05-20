@@ -12,7 +12,12 @@ use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 /// The epoch comes from the template's `curtime` field, which is a monotonically
 /// increasing counter from lotusd (not a unix timestamp despite the name).
 /// On subsequent `miningwrkchg` events (Slice 6), the epoch is incremented.
-pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
+/// # Arguments
+///
+/// * `template` - The mining template from lotusd.
+/// * `clean_jobs` - Whether this job should invalidate all previous jobs.
+///   Pass `true` for miningwrkchg-triggered refreshes, `false` for initial startup.
+pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> MiningJob {
     // Extract header fields from serialized LotusHeader bytes
     let (epoch_hash, extended_metadata_hash, block_size) = if !template.header.is_empty() {
         let mut data = Bytes::from_slice(&template.header);
@@ -39,7 +44,7 @@ pub fn template_to_job(template: &MiningTemplate) -> MiningJob {
         nbits: template.nbits_stratum.clone(),
         ntime: template.ntime_stratum.clone(),
         network_target_hex: template.target.to_hex_be(),
-        clean_jobs: false,
+        clean_jobs,
         template_epoch: template.curtime,
         height: template.height,
         epoch_hash,
@@ -87,7 +92,7 @@ mod tests {
     #[test]
     fn test_template_to_job_basic_conversion() {
         let template = create_test_template();
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         // Job ID format per UBQ: job-{template_id}-{epoch}
         assert_eq!(job.job_id, "job-890-100");
@@ -101,6 +106,24 @@ mod tests {
         assert_eq!(job.ntime, template.ntime_stratum);
         assert_eq!(job.template_epoch, template.curtime);
         assert_eq!(job.clean_jobs, false);
+    }
+
+    #[test]
+    fn test_template_to_job_clean_jobs_false_explicit() {
+        let template = create_test_template();
+        let job = template_to_job(&template, false);
+        assert_eq!(job.clean_jobs, false,
+            "initial template should have clean_jobs=false"
+        );
+    }
+
+    #[test]
+    fn test_template_to_job_clean_jobs_true() {
+        let template = create_test_template();
+        let job = template_to_job(&template, true);
+        assert_eq!(job.clean_jobs, true,
+            "miningwrkchg-triggered job should have clean_jobs=true"
+        );
     }
 
     #[test]
@@ -119,7 +142,7 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF,
         ]);
 
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         assert_eq!(
             job.network_target_hex,
@@ -136,7 +159,7 @@ mod tests {
             "branch3".to_string(),
         ];
 
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         assert_eq!(job.merkle_branches.len(), 3);
         assert_eq!(job.merkle_branches[0], "branch1");
@@ -175,7 +198,7 @@ mod tests {
         header.ser_to(&mut buf);
         template.header = buf.as_slice().to_vec();
 
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         assert_eq!(job.height, 1292529);
         assert_eq!(

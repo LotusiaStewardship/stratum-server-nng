@@ -120,7 +120,11 @@ impl NngEventConsumer {
             }
         };
 
-        let job = Arc::new(template_to_job(&template));
+        // Per UBQ: ALL miningwrkchg events trigger clean_jobs=true because
+        // Lotus header includes block_size, which changes with every mempool update.
+        // The reason code (NewTip/Reorg/MempoolRefresh/ManualInvalidation) is for
+        // logging and observability only — not for behavioral branching.
+        let job = Arc::new(template_to_job(&template, true));
         self.job_cache.insert((*job).clone()).await;
 
         debug!(job_id = %job.job_id, "broadcasting new job to all sessions");

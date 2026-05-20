@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     );
 
     // Convert template to job and cache it
-    let job = template_to_job(&template);
+    let job = template_to_job(&template, false);
     job_cache.insert(job.clone()).await;
     info!(job_id = %job.job_id, "cached mining job");
 

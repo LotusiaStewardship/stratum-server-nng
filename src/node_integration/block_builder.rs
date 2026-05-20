@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_empty_template() {
         let template = test_template();
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         let result = build_submit_block(
             &job,
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_invalid_ntime() {
         let template = test_template();
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         let result = build_submit_block(
             &job,
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_invalid_nonce() {
         let template = test_template();
-        let job = template_to_job(&template);
+        let job = template_to_job(&template, false);
 
         let result = build_submit_block(
             &job,
