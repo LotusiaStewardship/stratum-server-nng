@@ -64,10 +64,12 @@ impl ShutdownCoordinator {
     }
 
     /// Initiate emergency shutdown - immediate exit without flush.
+    ///
+    /// Intentionally does NOT broadcast the shutdown signal — tasks receiving
+    /// it might start cleanup that will be interrupted by the immediate
+    /// `exit(1)` in main.rs, potentially leaving partial state.
     pub fn initiate_emergency_shutdown(&self) {
         info!("initiating emergency shutdown (no flush, no cleanup)");
-        let _ = self.shutdown_tx.send(());
-        // Don't wait for tasks - just exit
     }
 
     /// Register a task handle to be awaited during shutdown.

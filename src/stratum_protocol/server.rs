@@ -217,11 +217,22 @@ async fn handle_connection(
                             }
                             Method::Authorize => {
                                 let auth_resp = session.handle_authorize(&req);
+                                // Parse worker name once, use for both auth and event recording
+                                let worker_name_str = req.params.as_array()
+                                    .and_then(|a| a.first())
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let worker_parsed = crate::stratum_protocol::session::parse_worker_name(worker_name_str)
+                                    .unwrap_or_else(|_| crate::stratum_protocol::session::WorkerName {
+                                        payout_address: worker_name_str.to_string(),
+                                        worker_suffix: None,
+                                    });
                                 // Record authorization event per UBQ §Authorization Event
                                 record_authorization_event(
                                     &req,
                                     &session,
                                     &auth_resp,
+                                    &worker_parsed,
                                     accounting_service.as_ref().map(|svc| &svc.share_repo),
                                 ).await;
                                 auth_resp
@@ -369,19 +380,19 @@ fn create_notify(job: &MiningJob, _session_id: &str) -> serde_json::Value {
 
 /// Record an authorization event (immutable audit log per UBQ).
 /// Every mining.authorize attempt produces one record, regardless of success/failure.
+/// Takes a pre-parsed `WorkerName` to avoid redundant parsing with the caller.
 async fn record_authorization_event(
     req: &crate::stratum_protocol::protocol::StratumRequest,
     session: &SessionState,
     auth_resp: &StratumResponse,
+    worker_parsed: &crate::stratum_protocol::session::WorkerName,
     share_repo: Option<&ShareRepository>,
 ) {
-    let arr = req.params.as_array().cloned().unwrap_or_default();
-    let worker_name = arr.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
-
-    let (payout_address, worker_suffix) = match crate::stratum_protocol::session::parse_worker_name(&worker_name) {
-        Ok(w) => (w.payout_address, w.worker_suffix),
-        Err(_) => (worker_name.clone(), None),
-    };
+    let worker_name = req.params.as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     let authorized = auth_resp.error.is_null();
     let reason = if !authorized {
@@ -395,8 +406,8 @@ async fn record_authorization_event(
             id: 0,
             session_id: session.session_id.clone(),
             worker_name,
-            payout_address,
-            worker_suffix,
+            payout_address: worker_parsed.payout_address.clone(),
+            worker_suffix: worker_parsed.worker_suffix.clone(),
             authorized,
             reason,
         };
@@ -456,9 +467,22 @@ async fn handle_submit(
                     .map(|a| a.p_diff)
                     .unwrap_or_else(|| session.current_difficulty()),
             )
+        } else if let Some(assigned) = session.get_assigned_job(job_id) {
+            // Job evicted from JobCache but still in session's assigned_jobs.
+            // Can't run full validation without header data, so reject as
+            // stale-job. Recover template_id/epoch from job_id format for
+            // accurate dedupe-key construction in persistence.
+            let (recovered_tid, recovered_epoch) =
+                crate::stratum_protocol::job::parse_template_metadata_from_job_id(job_id)
+                    .unwrap_or((0i64, 0i64));
+            (
+                validator::ValidationResult::rejected("stale-job"),
+                recovered_tid,
+                recovered_epoch,
+                assigned.p_diff,
+            )
         } else {
-            // Job not in cache — treat as stale.
-            // Use defaults for template metadata since the job isn't available.
+            // Job not in cache and not in assigned_jobs — truly stale/unknown.
             (
                 validator::ValidationResult::rejected("stale-job"),
                 0i64,
@@ -1305,5 +1329,93 @@ mod tests {
         assert_eq!(events[0].event_type, "share_outcome");
         assert!(events[0].session_id.is_some(), "session_id should be recorded");
         assert!(events[0].worker_id.is_some(), "worker_id should be recorded");
+    }
+
+    /// Integration test: submitting the identical share twice via TCP results
+    /// in only one database record (dedupe_key enforcement through the full path).
+    #[tokio::test]
+    async fn test_deduplicate_identical_share_tcp() {
+        use tempfile::NamedTempFile;
+        use crate::accounting::{init_schema, AccountingService, ShareRepository};
+        use parking_lot::Mutex;
+        use rusqlite::Connection;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_conn = Connection::open(temp_file.path()).unwrap();
+        init_schema(&db_conn).unwrap();
+        let db_conn_arc = Arc::new(Mutex::new(db_conn));
+        let arc_for_assert = db_conn_arc.clone();
+        let accounting_svc = AccountingService::new(db_conn_arc);
+
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let addr: SocketAddr = "127.0.0.1:13345".parse().unwrap();
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            Some(accounting_svc),
+            VarDiffConfig::default(),
+        );
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream = TcpStream::connect("127.0.0.1:13345").await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Subscribe
+        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Authorize
+        write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Read mining.set_difficulty (sent after authorize)
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Wait for mining.notify
+        response.clear();
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
+            .await
+            .expect("should receive mining.notify")
+            .unwrap();
+
+        // Submit the same share twice
+        let share_data = b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n";
+
+        write_half.write_all(share_data).await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        write_half.write_all(share_data).await.unwrap();
+        response.clear();
+        reader.read_line(&mut response).await.unwrap();
+
+        // Shutdown
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        // Verify only ONE share was persisted (dedupe key prevented duplicate)
+        let share_repo = ShareRepository::new(arc_for_assert);
+        let total = share_repo.total_count().unwrap();
+        assert_eq!(
+            total, 1,
+            "dedupe key should have prevented duplicate share, got {} records",
+            total
+        );
+        let total_outcomes = share_repo.total_outcome_count().unwrap();
+        assert_eq!(
+            total_outcomes, 1,
+            "only one share outcome should exist, got {}",
+            total_outcomes
+        );
     }
 }

@@ -22,7 +22,7 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
     // Query share outcome counts from repository
     let (total_shares, accepted_shares, rejected_shares, rejection_breakdown) =
         if let Some(ref share_repo) = state.share_repo {
-            let total = share_repo.total_outcome_count().unwrap_or(0);
+            let total = share_repo.total_count().unwrap_or(0);
             let accepted = share_repo.count_outcomes_by_status("accepted").unwrap_or(0);
             let rejected = share_repo.count_outcomes_by_status("rejected").unwrap_or(0);
             let reasons = share_repo.count_rejected_by_reason().unwrap_or_default();
