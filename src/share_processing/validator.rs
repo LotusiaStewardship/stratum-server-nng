@@ -3,6 +3,7 @@ use crate::stratum_protocol::session::SessionState;
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, header_meets_difficulty};
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 use primitive_types::U256;
+use tracing::info;
 
 /// Result of validating a share submission.
 ///
@@ -95,26 +96,60 @@ pub fn validate_share(
     nonce: &str,
     session: &SessionState,
     job: &MiningJob,
+    debug: bool,
 ) -> ValidationResult {
     // 1. Check worker authorization
     if !session.authorized_workers.contains(worker_name) {
+        if debug {
+            info!(
+                session = %session.session_id,
+                worker = %worker_name,
+                "verbose: validation step 1 FAILED — unauthorized worker",
+            );
+        }
         return ValidationResult::rejected("unauthorized-worker");
     }
 
     // 2. Parse and validate submit params format
     if let Err(reason) = validate_share_format(extranonce2, ntime, nonce) {
+        if debug {
+            info!(
+                session = %session.session_id,
+                extranonce2 = %extranonce2,
+                ntime = %ntime,
+                nonce = %nonce,
+                "verbose: validation step 2 FAILED — invalid submit shape",
+            );
+        }
         return ValidationResult::rejected(&reason);
     }
 
     // 3. Look up assigned job in session
     let assigned = match session.get_assigned_job(job_id) {
         Some(a) => a,
-        None => return ValidationResult::rejected("stale-job"),
+        None => {
+            if debug {
+                info!(
+                    session = %session.session_id,
+                    job_id = %job_id,
+                    "verbose: validation step 3 FAILED — stale job (not in assigned_jobs)",
+                );
+            }
+            return ValidationResult::rejected("stale-job");
+        }
     };
 
     // 4. Check ntime matches frozen ntime from assignment
     // Per UBQ §Assigned Job: prevents miners from reusing valid nonces across different ntime values
     if ntime != assigned.ntime {
+        if debug {
+            info!(
+                session = %session.session_id,
+                submitted_ntime = %ntime,
+                assigned_ntime = %assigned.ntime,
+                "verbose: validation step 4 FAILED — ntime mismatch",
+            );
+        }
         return ValidationResult::rejected("ntime-mismatch");
     }
 
@@ -160,6 +195,14 @@ pub fn validate_share(
     };
 
     if !meets_pdiff {
+        if debug {
+            info!(
+                session = %session.session_id,
+                p_diff = assigned.p_diff,
+                hash_be = %hex::encode(hash_be),
+                "verbose: validation step 6 FAILED — low-difficulty share",
+            );
+        }
         return ValidationResult::rejected("low-difficulty-share");
     }
 
@@ -190,6 +233,17 @@ pub fn validate_share(
     } else {
         None
     };
+
+    if debug {
+        info!(
+            session = %session.session_id,
+            accepted = true,
+            low_diff_ok = true,
+            network_target_ok = meets_network,
+            block_hash = ?block_hash,
+            "verbose: validation PASSED — all checks ok",
+        );
+    }
 
     ValidationResult {
         accepted: true,
@@ -284,6 +338,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -303,6 +358,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -322,6 +378,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -341,6 +398,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -368,6 +426,7 @@ mod tests {
                 nonce,
                 &session,
                 &job,
+                false,
             );
             assert!(!result.accepted, "expected rejection for {:?}/{:?}/{:?}", extranonce2, ntime, nonce);
             assert_eq!(result.reject_reason.as_deref(), Some(expected_reason));
@@ -388,6 +447,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         if result.accepted {
@@ -417,6 +477,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -436,6 +497,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);
@@ -481,6 +543,7 @@ mod tests {
             &nonce,
             &session,
             &job,
+            false,
         );
 
         assert!(
@@ -569,6 +632,7 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
+            false,
         );
 
         assert!(!result.accepted);

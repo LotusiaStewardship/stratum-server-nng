@@ -24,6 +24,7 @@ pub struct NngEventConsumer {
     job_cache: Arc<JobCache>,
     accounting: Option<AccountingService>,
     job_tx: broadcast::Sender<Arc<MiningJob>>,
+    debug: bool,
 }
 
 impl NngEventConsumer {
@@ -34,6 +35,7 @@ impl NngEventConsumer {
         job_cache: Arc<JobCache>,
         accounting: Option<AccountingService>,
         job_tx: broadcast::Sender<Arc<MiningJob>>,
+        debug: bool,
     ) -> Result<Self> {
         let interface = PubInterface::open(pub_url)
             .map_err(|e| anyhow::anyhow!("failed to open NNG pub interface: {}", e))?;
@@ -44,7 +46,7 @@ impl NngEventConsumer {
         interface.subscribe("blkdisconctd")
             .map_err(|e| anyhow::anyhow!("failed to subscribe to blkdisconctd: {}", e))?;
         info!(pub_url, "NNG pub/sub consumer subscribed to events");
-        Ok(Self { interface, nng_rpc, job_cache, accounting, job_tx })
+        Ok(Self { interface, nng_rpc, job_cache, accounting, job_tx, debug })
     }
 
     /// Run the event loop until shutdown signal is received.
@@ -67,6 +69,15 @@ impl NngEventConsumer {
                 msg = self.interface.recv_async() => {
                     match msg {
                         Ok(Message::MiningWorkChanged(event)) => {
+                            if self.debug {
+                                info!(
+                                    reason = ?event.reason,
+                                    height = event.height,
+                                    epoch = event.template_epoch,
+                                    block_hash = %event.block_hash.to_hex_be(),
+                                    "verbose: miningwrkchg raw event payload",
+                                );
+                            }
                             debug!(
                                 reason = ?event.reason,
                                 height = event.height,
@@ -80,9 +91,30 @@ impl NngEventConsumer {
                         Ok(Message::BlockDisconnected(event)) => {
                             let block_hash = event.block.header.hash.to_hex_be();
                             debug!(block_hash, "received blkdisconctd event");
+                            if self.debug {
+                                info!(
+                                    block_hash = %block_hash,
+                                    prev_hash = %event.block.header.prev_hash.to_hex_be(),
+                                    n_bits = event.block.header.n_bits,
+                                    "verbose: block disconnected event payload",
+                                );
+                            }
                             if let Some(ref acct) = self.accounting {
                                 handle_block_disconnected(event, acct).await;
                             }
+                        }
+                        Ok(Message::BlockConnected(event)) => {
+                            let block_hash = event.block.header.hash.to_hex_be();
+                            if self.debug {
+                                info!(
+                                    block_hash = %block_hash,
+                                    prev_hash = %event.block.header.prev_hash.to_hex_be(),
+                                    n_bits = event.block.header.n_bits,
+                                    timestamp = event.block.header.timestamp,
+                                    "verbose: block connected event payload",
+                                );
+                            }
+                            debug!(block_hash, "received blkconnected event");
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -126,6 +158,29 @@ impl NngEventConsumer {
         // logging and observability only — not for behavioral branching.
         let job = Arc::new(template_to_job(&template, true));
         self.job_cache.insert((*job).clone()).await;
+
+        if self.debug {
+            info!(
+                job_id = %job.job_id,
+                template_id = job.template_id,
+                prevhash = %job.prevhash,
+                coinbase1 = %job.coinbase1,
+                coinbase2 = %job.coinbase2,
+                merkle_branches = %serde_json::to_string(&job.merkle_branches).unwrap_or_default(),
+                version = %job.version,
+                nbits = %job.nbits,
+                ntime = %job.ntime,
+                network_target_hex = %job.network_target_hex,
+                clean_jobs = job.clean_jobs,
+                template_epoch = job.template_epoch,
+                height = job.height,
+                epoch_hash = %job.epoch_hash,
+                extended_metadata_hash = %job.extended_metadata_hash,
+                block_size = job.block_size,
+                reason = ?event.reason,
+                "verbose: mining job from wrkchg event",
+            );
+        }
 
         debug!(job_id = %job.job_id, "broadcasting new job to all sessions");
         if self.job_tx.send(job).is_err() {

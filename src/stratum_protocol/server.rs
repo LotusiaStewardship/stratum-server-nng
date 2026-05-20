@@ -33,6 +33,7 @@ pub struct StratumServer {
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
     vardiff_config: VarDiffConfig,
+    debug: bool,
 }
 
 impl StratumServer {
@@ -44,6 +45,7 @@ impl StratumServer {
         accounting_service: Option<AccountingService>,
         json_rpc_client: Option<Arc<JsonRpcClient>>,
         vardiff_config: VarDiffConfig,
+        debug: bool,
     ) -> Self {
         let (n_diff_tx, _) = broadcast::channel::<f64>(128);
         let (job_tx, _) = broadcast::channel::<Arc<MiningJob>>(128);
@@ -58,6 +60,7 @@ impl StratumServer {
             accounting_service,
             json_rpc_client,
             vardiff_config,
+            debug,
         }
     }
 
@@ -147,6 +150,7 @@ impl StratumServer {
                             let job_rx = self.job_tx.subscribe();
                             let accounting_service = self.accounting_service.clone();
                             let json_rpc_client = self.json_rpc_client.clone();
+                            let debug = self.debug;
                             
                             tokio::spawn(async move {
                                 // Increment connected miners
@@ -162,6 +166,7 @@ impl StratumServer {
                                     job_rx,
                                     accounting_service,
                                     json_rpc_client,
+                                    debug,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
                                 }
@@ -203,6 +208,7 @@ async fn handle_connection(
     mut job_rx: broadcast::Receiver<Arc<MiningJob>>,
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
+    debug: bool,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -225,12 +231,27 @@ async fn handle_connection(
                             continue;
                         }
                         
+                        if debug {
+                            info!(
+                                session = %session.session_id,
+                                line = %trimmed,
+                                "verbose: stratum request received",
+                            );
+                        }
                         debug!(session = %session.session_id, line = %trimmed, "received request");
                         
                         // Parse the request
                         let req = match decode_request_line(trimmed, 4096) {
                             Ok(req) => req,
                             Err(e) => {
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        error = ?e,
+                                        raw = %trimmed,
+                                        "verbose: invalid request parse failure",
+                                    );
+                                }
                                 warn!(error = ?e, "invalid request");
                                 let resp = StratumResponse::err(
                                     serde_json::Value::Null,
@@ -278,6 +299,7 @@ async fn handle_connection(
                                     &job_cache,
                                     accounting_service.as_ref(),
                                     json_rpc_client.as_ref(),
+                                    debug,
                                 ).await;
                                 // If VarDiff retargeted, send mining.set_difficulty to miner
                                 if let Some(diff) = new_diff {
@@ -287,6 +309,14 @@ async fn handle_connection(
                                         "params": [diff]
                                     });
                                     let set_diff_line = serde_json::to_string(&set_diff)?;
+                                    if debug {
+                                        info!(
+                                            session = %session.session_id,
+                                            new_diff = diff,
+                                            message = %set_diff_line,
+                                            "verbose: mining.set_difficulty after VarDiff retarget",
+                                        );
+                                    }
                                     writer.write_all(set_diff_line.as_bytes()).await?;
                                     writer.write_all(b"\n").await?;
                                     debug!(
@@ -301,21 +331,49 @@ async fn handle_connection(
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
                             }
                             Method::SetDifficulty | Method::ExtranonceSubscribe | Method::SetExtranonce | Method::SuggestDifficulty => {
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        method = ?req.method,
+                                        "verbose: unsupported method received from miner",
+                                    );
+                                }
                                 debug!(method = ?req.method, "unsupported method");
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
                             Method::Notify => {
                                 // mining.notify is server-to-miner only
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        "verbose: mining.notify received from miner (should be server-to-miner)",
+                                    );
+                                }
                                 warn!("received mining.notify from miner (should be server-to-miner)");
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
-                            Method::Unknown(_) => {
+                            Method::Unknown(ref method_name) => {
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        method = %method_name,
+                                        "verbose: unknown method received from miner",
+                                    );
+                                }
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
                         };
                         
                         // Send response
                         let resp_line = serde_json::to_string(&resp)?;
+                        if debug {
+                            info!(
+                                session = %session.session_id,
+                                method = ?req.method,
+                                response = %resp_line,
+                                "verbose: stratum response sent",
+                            );
+                        }
                         writer.write_all(resp_line.as_bytes()).await?;
                         writer.write_all(b"\n").await?;
                         
@@ -330,6 +388,14 @@ async fn handle_connection(
                                 "params": [initial_diff]
                             });
                             let set_diff_line = serde_json::to_string(&set_diff_cmd)?;
+                            if debug {
+                                info!(
+                                    session = %session.session_id,
+                                    initial_diff = initial_diff,
+                                    message = %set_diff_line,
+                                    "verbose: mining.set_difficulty on session start",
+                                );
+                            }
                             writer.write_all(set_diff_line.as_bytes()).await?;
                             writer.write_all(b"\n").await?;
                             debug!(
@@ -341,6 +407,14 @@ async fn handle_connection(
                             if let Some(job) = job_cache.get_latest().await {
                                 let notify = create_notify(&job, &session.session_id);
                                 let notify_line = serde_json::to_string(&notify)?;
+                                if debug {
+                                    info!(
+                                        session = %session.session_id,
+                                        job_id = %job.job_id,
+                                        message = %notify_line,
+                                        "verbose: mining.notify on session start",
+                                    );
+                                }
                                 writer.write_all(notify_line.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
                                 
@@ -374,6 +448,13 @@ async fn handle_connection(
             }
             n_diff = n_diff_rx.recv() => {
                 if let Ok(new_n_diff) = n_diff {
+                    if debug {
+                        info!(
+                            session = %session.session_id,
+                            new_n_diff = new_n_diff,
+                            "verbose: N_diff change received",
+                        );
+                    }
                     debug!(
                         session = %session.session_id,
                         new_n_diff = new_n_diff,
@@ -388,6 +469,14 @@ async fn handle_connection(
                             "params": [clamped_diff]
                         });
                         let set_diff_line = serde_json::to_string(&set_diff)?;
+                        if debug {
+                            info!(
+                                session = %session.session_id,
+                                clamped_diff = clamped_diff,
+                                message = %set_diff_line,
+                                "verbose: mining.set_difficulty after N_diff clamp",
+                            );
+                        }
                         writer.write_all(set_diff_line.as_bytes()).await?;
                         writer.write_all(b"\n").await?;
                         debug!(
@@ -400,6 +489,17 @@ async fn handle_connection(
             }
             new_job = job_rx.recv() => {
                 if let Ok(job) = new_job {
+                    if debug {
+                        info!(
+                            session = %session.session_id,
+                            job_id = %job.job_id,
+                            clean_jobs = job.clean_jobs,
+                            template_epoch = job.template_epoch,
+                            height = job.height,
+                            "verbose: new job received via broadcast",
+                        );
+                    }
+
                     // Per UBQ §Pool Difficulty: P_diff ∈ [vardiff_min_floor, N_diff] at all times.
                     // When a new template arrives (via NNG event consumer -> job_tx), the N_diff
                     // ceiling must be updated before recording any new assigned jobs.
@@ -411,6 +511,14 @@ async fn handle_connection(
                                 "params": [clamped_diff]
                             });
                             let set_diff_line = serde_json::to_string(&set_diff)?;
+                            if debug {
+                                info!(
+                                    session = %session.session_id,
+                                    clamped_diff = clamped_diff,
+                                    message = %set_diff_line,
+                                    "verbose: mining.set_difficulty after N_diff ceiling update",
+                                );
+                            }
                             writer.write_all(set_diff_line.as_bytes()).await?;
                             writer.write_all(b"\n").await?;
                             debug!(
@@ -425,6 +533,13 @@ async fn handle_connection(
                     // Only clear when the job signals clean_jobs on the wire, so server
                     // behavior stays aligned with the wire-level protocol signal.
                     if job.clean_jobs {
+                        if debug {
+                            info!(
+                                session = %session.session_id,
+                                job_id = %job.job_id,
+                                "verbose: clean_jobs=true — clearing assigned jobs",
+                            );
+                        }
                         debug!(
                             session = %session.session_id,
                             job_id = %job.job_id,
@@ -442,6 +557,14 @@ async fn handle_connection(
                     // Send mining.notify to the miner
                     let notify = create_notify(&job, &session.session_id);
                     let notify_line = serde_json::to_string(&notify)?;
+                    if debug {
+                        info!(
+                            session = %session.session_id,
+                            job_id = %job.job_id,
+                            message = %notify_line,
+                            "verbose: mining.notify on new job",
+                        );
+                    }
                     writer.write_all(notify_line.as_bytes()).await?;
                     writer.write_all(b"\n").await?;
 
@@ -527,6 +650,7 @@ async fn handle_submit(
     job_cache: &crate::node_integration::JobCache,
     accounting_service: Option<&AccountingService>,
     json_rpc_client: Option<&Arc<JsonRpcClient>>,
+    debug: bool,
 ) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
     if !session.is_subscribed {
@@ -555,6 +679,7 @@ async fn handle_submit(
                 nonce_hex,
                 session,
                 job,
+                debug,
             );
             (
                 validation,
@@ -589,6 +714,27 @@ async fn handle_submit(
                 session.current_difficulty(),
             )
         };
+
+    // Verbose share submission details
+    if debug {
+        info!(
+            session = %session.session_id,
+            worker = %worker_name,
+            job_id = %job_id,
+            extranonce2 = %extranonce2,
+            ntime = %ntime_hex,
+            nonce = %nonce_hex,
+            accepted = validation.accepted,
+            reject_reason = ?validation.reject_reason,
+            low_diff_ok = validation.low_diff_ok,
+            network_target_ok = validation.network_target_ok,
+            block_hash = ?validation.block_hash,
+            p_diff = share_diff,
+            template_id = template_id,
+            template_epoch = template_epoch,
+            "verbose: share submission details",
+        );
+    }
 
     // Persist share + outcome via AccountingService (records accounting events too).
     // This runs for ALL submissions (accepted or rejected) per UBQ.
@@ -628,6 +774,14 @@ async fn handle_submit(
         }
     }
 
+    if debug && validation.network_target_ok {
+        info!(
+            block_hash = ?validation.block_hash,
+            block_bytes_len = cached_job.as_ref().map(|j| j.block_bytes.len()),
+            "verbose: block candidate detected, preparing submission",
+        );
+    }
+
     // Block submission: if the share meets N_diff, submit to lotusd via JSON-RPC.
     // This is best-effort: the share is already accepted; submission failure does
     // not reject the share. The node_result field captures the submission outcome.
@@ -643,9 +797,22 @@ async fn handle_submit(
                     &job.block_bytes,
                 ) {
                     Ok(block_hex) => {
+                        if debug {
+                            info!(
+                                block_hash = ?validation.block_hash,
+                                block_hex_len = block_hex.len(),
+                                "verbose: block built, submitting to lotusd",
+                            );
+                        }
                         let submit_result = json_rpc.submitblock(&block_hex).await;
                         match submit_result {
                             Ok(result) if result.accepted => {
+                                if debug {
+                                    info!(
+                                        block_hash = ?validation.block_hash,
+                                        "verbose: block accepted by lotusd",
+                                    );
+                                }
                                 debug!(
                                     block_hash = ?validation.block_hash,
                                     "block accepted by lotusd"
@@ -674,6 +841,13 @@ async fn handle_submit(
                                 }
                             }
                             Ok(result) => {
+                                if debug {
+                                    info!(
+                                        block_hash = ?validation.block_hash,
+                                        error = ?result.error,
+                                        "verbose: block rejected by lotusd",
+                                    );
+                                }
                                 debug!(
                                     error = ?result.error,
                                     "block rejected by lotusd"
@@ -686,11 +860,24 @@ async fn handle_submit(
                                 }
                             }
                             Err(e) => {
+                                if debug {
+                                    info!(
+                                        block_hash = ?validation.block_hash,
+                                        error = %e,
+                                        "verbose: block submission to lotusd failed",
+                                    );
+                                }
                                 warn!(error = %e, "failed to submit block to lotusd (best-effort)");
                             }
                         }
                     }
                     Err(e) => {
+                        if debug {
+                            info!(
+                                error = %e,
+                                "verbose: failed to build submit block",
+                            );
+                        }
                         warn!(error = %e, "failed to build submit block");
                     }
                 }
@@ -769,7 +956,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         // Should not panic or error
         server.notify_new_job(&job).await;
@@ -782,7 +969,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
@@ -793,7 +980,7 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         let id1 = server.generate_session_id().await;
         let id2 = server.generate_session_id().await;
@@ -827,7 +1014,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -903,7 +1090,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -935,7 +1122,7 @@ mod tests {
         
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default());
+        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
         let server_handle = tokio::spawn(async move {
             server.run().await
@@ -986,6 +1173,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
         
         let server_handle = tokio::spawn(async move {
@@ -1066,6 +1254,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
         
         let server_handle = tokio::spawn(async move {
@@ -1142,6 +1331,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1210,6 +1400,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1292,6 +1483,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1374,6 +1566,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1457,6 +1650,7 @@ mod tests {
             Some(accounting_svc.clone()),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move {
@@ -1544,6 +1738,7 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         let server_handle = tokio::spawn(async move { server.run().await });
@@ -1630,6 +1825,7 @@ mod tests {
             None,
             None,
             VarDiffConfig::default(),
+            false,
         );
 
         // Capture job_tx before spawning the server task

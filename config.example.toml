@@ -11,6 +11,13 @@
 # - Prefer keeping private keys out of the stratum process when you can.
 # -----------------------------------------------------------------------------
 
+# Enable verbose debug logging for troubleshooting pool issues.
+# When true (or DEBUG=true env var), logs detailed data for:
+#   - Full mining job / template fields on fetch and refresh
+#   - Share submission params and validation step outcomes
+#   - Block submission details (hex length, lotusd response)
+#   - NNG event payloads (miningwrkchg, blkconnected, blkdisconctd)
+# Default: false (production). Set to true when debugging pool issues.
 debug = false
 
 # -----------------------------------------------------------------------------

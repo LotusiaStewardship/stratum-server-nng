@@ -25,6 +25,11 @@ pub struct Config {
     /// lotusd JSON-RPC HTTP settings for block submission
     #[serde(default)]
     pub bitcoind_rpc: BitcoindRpcSettings,
+    /// Enable verbose debug logging for template data, share submissions,
+    /// validation decisions, block submissions, and NNG event payloads.
+    /// Default: false (production). Set to true for debugging pool issues.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 /// Variable difficulty settings loaded from config.toml.
@@ -149,6 +154,12 @@ impl Config {
             cfg.bitcoind_rpc.rpc_pass = pass;
         }
         
+        if let Ok(val) = std::env::var("DEBUG") {
+            if val == "true" || val == "1" || val == "yes" {
+                cfg.debug = true;
+            }
+        }
+        
         Ok(cfg)
     }
 }
@@ -262,5 +273,31 @@ mod tests {
         assert!((cfg.vardiff.initial_pct - 0.01).abs() < f64::EPSILON); // default
         assert!((cfg.vardiff.target_secs - 20.0).abs() < f64::EPSILON); // default
         assert!((cfg.vardiff.retarget_secs - 60.0).abs() < f64::EPSILON); // default
+    }
+
+    #[test]
+    fn test_debug_default_false() {
+        // Without debug field, should default to false
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.debug, "debug should default to false");
+    }
+
+    #[test]
+    fn test_debug_true_from_toml() {
+        let toml_str = r#"
+            debug = true
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.debug, "debug should be true when set in config");
     }
 }
