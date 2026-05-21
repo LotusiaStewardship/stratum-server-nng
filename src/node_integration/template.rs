@@ -145,6 +145,51 @@ pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> MiningJob
     }
 }
 
+/// Verify that a mining template's coinbase has at least one spendable (non-OP_RETURN)
+/// output with non-zero value. If all outputs are OP_RETURN or zero-valued, the block
+/// reward would be effectively burned.
+///
+/// Reconstructs the full coinbase via `coinbase1 + dummy_extranonce + coinbase2`
+/// and deserializes it through `bitcoinsuite_core::Tx::deser`. This mirrors the
+/// same reconstruction path used by `block_builder.rs` and the share validator,
+/// ensuring outputs are parsed identically to how lotusd will see them.
+pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> {
+    // Reconstruct the full coinbase with an 8-byte dummy extranonce (4B en1 + 4B en2).
+    // The extranonce bytes sit in the scriptSig (coinbase input) and do not affect
+    // the outputs, so any placeholder value works for output verification.
+    let coinbase_hex = format!(
+        "{}{:016x}{}",
+        template.coinbase1, 0u64, template.coinbase2
+    );
+    let coinbase_bytes = hex::decode(&coinbase_hex)
+        .map_err(|e| format!("failed to hex-decode reconstructed coinbase: {}", e))?;
+
+    let mut buf = Bytes::from_slice(&coinbase_bytes);
+    let coinbase_tx = Tx::deser(&mut buf)
+        .map_err(|e| format!("failed to deserialize coinbase tx: {}", e))?;
+
+    let outputs = coinbase_tx.outputs();
+    if outputs.is_empty() {
+        return Err("coinbase has zero outputs — entire block reward is lost".to_string());
+    }
+
+    let total_output_value: i64 = outputs.iter().map(|o| o.value).sum();
+    let spendable_count = outputs
+        .iter()
+        .filter(|o| o.value > 0 && !o.script.is_opreturn())
+        .count();
+
+    if spendable_count == 0 {
+        Err(format!(
+            "all {} output(s) ({:.8} total) are OP_RETURN or zero-valued — block reward will be BURNED",
+            outputs.len(),
+            total_output_value as f64 / 1e8,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +463,85 @@ mod tests {
              expected={}, got={}",
             expected_rust_size, job.block_size,
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // verify_coinbase_outputs tests
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a MiningTemplate with a specific coinbase2 for output testing.
+    fn template_with_coinbase2(coinbase2: &str) -> MiningTemplate {
+        let coinbase1 = "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f";
+        MiningTemplate {
+            template_id: 999,
+            block: vec![],
+            header: vec![],
+            previous_block_hash: Sha256d::new([0u8; 32]),
+            height: 1000,
+            version: 1,
+            bits: 486604799,
+            target: Sha256d::new([0u8; 32]),
+            curtime: 100,
+            mintime: 0,
+            maxtime: 0,
+            coinbase_value: 5000000000,
+            coinbase_tx: vec![],
+            transactions: vec![],
+            coinbase1: coinbase1.to_string(),
+            coinbase2: coinbase2.to_string(),
+            merkle_branches: vec![],
+            prev_hash_stratum: String::new(),
+            nbits_stratum: String::new(),
+            ntime_stratum: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_verify_coinbase_outputs_p2pkh_passes() {
+        // coinbase2 with: sequence(ffffffff), 3 outputs (P2PKH+P2PKH+OP_RETURN)
+        // Real-world values from lotusd template
+        let coinbase2 = "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000";
+        let template = template_with_coinbase2(coinbase2);
+        assert!(verify_coinbase_outputs(&template).is_ok(),
+            "template with P2PKH outputs should pass");
+    }
+
+    #[test]
+    fn test_verify_coinbase_outputs_op_return_only_fails() {
+        // coinbase2 with: sequence(ffffffff), 1 OP_RETURN output (value=0), locktime(0)
+        // Script: OP_RETURN(6a) push5(05) "logos"(6c6f676f73) = 7 bytes
+        // This simulates the burn scenario when coinbase_script=None
+        let coinbase2 = "ffffffff010000000000000000076a056c6f676f7300000000";
+        let template = template_with_coinbase2(coinbase2);
+        let err = verify_coinbase_outputs(&template).unwrap_err();
+        assert!(err.contains("BURNED"),
+            "OP_RETURN-only template should report BURNED, got: {}", err);
+    }
+
+    #[test]
+    fn test_verify_coinbase_outputs_zero_outputs_fails() {
+        // coinbase2 with: sequence(ffffffff), zero outputs, locktime(0)
+        let coinbase2 = "ffffffff0000000000";
+        let template = template_with_coinbase2(coinbase2);
+        let err = verify_coinbase_outputs(&template).unwrap_err();
+        assert!(err.contains("empty") || err.contains("zero"),
+            "zero-output template should report error, got: {}", err);
+    }
+
+    #[test]
+    fn test_verify_coinbase_outputs_empty_fails() {
+        let template = template_with_coinbase2("");
+        assert!(verify_coinbase_outputs(&template).is_err());
+    }
+
+    #[test]
+    fn test_verify_coinbase_outputs_mixed_passes() {
+        // coinbase2 with: sequence(ffffffff) + 2 outputs + locktime(0):
+        //   Output 1: OP_RETURN "logos" (value=0, script=6a056c6f676f73, 7 bytes)
+        //   Output 2: P2PKH (value=221695870, script=76a914...88ac, 25 bytes)
+        let coinbase2 = "ffffffff020000000000000000076a056c6f676f737ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac00000000";
+        let template = template_with_coinbase2(coinbase2);
+        assert!(verify_coinbase_outputs(&template).is_ok(),
+            "template with at least one P2PKH output should pass");
     }
 }

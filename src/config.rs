@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use bitcoinsuite_core::LotusAddress;
 use serde::Deserialize;
 use std::net::SocketAddr;
 
@@ -22,6 +23,9 @@ pub struct Config {
     /// Variable difficulty settings (maps to VarDiff runtime config)
     #[serde(default)]
     pub vardiff: VarDiffSettings,
+    /// Pool settings including mining identity and payout configuration
+    #[serde(default)]
+    pub pool: PoolSettings,
     /// lotusd JSON-RPC HTTP settings for block submission
     #[serde(default)]
     pub bitcoind_rpc: BitcoindRpcSettings,
@@ -58,6 +62,80 @@ impl Default for VarDiffSettings {
             target_secs: default_vardiff_target_secs(),
             retarget_secs: default_vardiff_retarget_secs(),
         }
+    }
+}
+
+/// Pool settings loaded from config.toml `[pool]` section.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PoolSettings {
+    /// Optional pool name for display/identification.
+    pub name: Option<String>,
+    /// Mining identity configuration (payout destination + optional scriptSig tag).
+    /// If None or missing, lotusd defaults to OP_RETURN — block rewards are burned.
+    pub mining_identity: Option<MiningIdentity>,
+}
+
+/// Mining identity configuration from `[pool.mining_identity]`.
+///
+/// Controls how the pool identifies itself in the coinbase and where the
+/// block reward goes. At least `payout_address` or `payout_script_hex` must
+/// be set to avoid burning block rewards via OP_RETURN fallback.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MiningIdentity {
+    /// Lotus address for the pool payout destination.
+    /// e.g. "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD"
+    pub payout_address: Option<String>,
+    /// Raw hex-encoded output script (alternative to payout_address).
+    /// e.g. "76a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac"
+    pub payout_script_hex: Option<String>,
+    /// Optional UTF-8 pool/operator identity tag embedded in coinbase scriptSig.
+    /// Visible in block explorers (coinbaseaux-style semantics).
+    pub coinbase_identity: Option<String>,
+}
+
+impl MiningIdentity {
+    /// Resolve the mining identity config into (coinbase_script_bytes, coinbase_identity_bytes).
+    ///
+    /// - **coinbase_script**: raw output script derived from `payout_address` or
+    ///   `payout_script_hex`. Passed as `coinbase_script` to lotusd's
+    ///   `GetMiningTemplateRequest`. If this is OP_RETURN, block rewards burn.
+    /// - **coinbase_identity**: optional pool tag bytes appended to the coinbase
+    ///   input scriptSig. Passed as `coinbase_identity` in the NNG flatbuffer.
+    pub fn resolve(&self) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let coinbase_script = match (&self.payout_address, &self.payout_script_hex) {
+            (Some(addr), None) => {
+                let addr: LotusAddress = addr.parse()
+                    .map_err(|e| anyhow!("invalid payout_address: {e}"))?;
+                let script = addr.script();
+                anyhow::ensure!(!script.is_opreturn(),
+                    "payout_address resolves to OP_RETURN — block rewards would be BURNED");
+                script.bytecode().to_vec()
+            }
+            (None, Some(hex)) => {
+                let bytes = hex::decode(hex)
+                    .map_err(|e| anyhow!("invalid payout_script_hex: {e}"))?;
+                anyhow::ensure!(bytes.first() != Some(&0x6a),
+                    "payout_script_hex starts with OP_RETURN — block rewards would be BURNED");
+                bytes
+            }
+            (Some(_), Some(_)) => {
+                bail!("set only one of payout_address or payout_script_hex, not both");
+            }
+            (None, None) => {
+                bail!(
+                    "pool.mining_identity.payout_address must be set (or payout_script_hex). \
+                     Without it lotusd creates OP_RETURN outputs and block rewards are BURNED. \
+                     See config.example.toml for configuration."
+                );
+            }
+        };
+
+        let coinbase_identity = self.coinbase_identity
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_bytes().to_vec());
+
+        Ok((coinbase_script, coinbase_identity))
     }
 }
 
@@ -152,6 +230,23 @@ impl Config {
         
         if let Ok(pass) = std::env::var("BITCOIND_RPC_PASS") {
             cfg.bitcoind_rpc.rpc_pass = pass;
+        }
+
+        // Pool settings environment variable overrides
+        if let Ok(addr) = std::env::var("POOL_PAYOUT_ADDRESS") {
+            cfg.pool.mining_identity.get_or_insert_with(|| MiningIdentity {
+                payout_address: None,
+                payout_script_hex: None,
+                coinbase_identity: None,
+            }).payout_address = Some(addr);
+        }
+
+        if let Ok(identity) = std::env::var("POOL_COINBASE_IDENTITY") {
+            cfg.pool.mining_identity.get_or_insert_with(|| MiningIdentity {
+                payout_address: None,
+                payout_script_hex: None,
+                coinbase_identity: None,
+            }).coinbase_identity = Some(identity);
         }
         
         if let Ok(val) = std::env::var("DEBUG") {
@@ -299,5 +394,174 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.debug, "debug should be true when set in config");
+    }
+
+    // -------------------------------------------------------------------------
+    // Pool / MiningIdentity tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_mining_identity_deserializes() {
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+
+            [pool]
+            name = "Lotusia Pool"
+
+            [pool.mining_identity]
+            payout_address = "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD"
+            coinbase_identity = "/Lotusia Pool/"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let id = cfg.pool.mining_identity.expect("mining_identity should be present");
+        assert_eq!(
+            id.payout_address.as_deref(),
+            Some("lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD")
+        );
+        assert_eq!(id.coinbase_identity.as_deref(), Some("/Lotusia Pool/"));
+        assert!(id.payout_script_hex.is_none());
+    }
+
+    #[test]
+    fn test_pool_mining_identity_defaults_to_none_when_absent() {
+        let toml_str = r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+            sqlite_path = "./test.db"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.pool.mining_identity.is_none(),
+            "mining_identity should be None when [pool.mining_identity] section is absent");
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_payout_address() {
+        let id = MiningIdentity {
+            payout_address: Some(
+                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
+            ),
+            payout_script_hex: None,
+            coinbase_identity: Some("/Lotusia Pool/".to_string()),
+        };
+        let (script_bytes, identity_bytes) = id.resolve().unwrap();
+
+        // Should be a valid P2PKH script (25 bytes):
+        //   OP_DUP (0x76) | OP_HASH160 (0xa9) | PUSH20 (0x14) | <20B hash> | OP_EQUALVERIFY (0x88) | OP_CHECKSIG (0xac)
+        assert_eq!(script_bytes.len(), 25, "P2PKH script should be 25 bytes");
+        assert_eq!(script_bytes[0], 0x76, "first byte should be OP_DUP");
+        assert_eq!(script_bytes[1], 0xa9, "second byte should be OP_HASH160");
+        assert_eq!(script_bytes[2], 0x14, "third byte should be PUSH20");
+        assert_eq!(script_bytes[23], 0x88, "24th byte should be OP_EQUALVERIFY");
+        assert_eq!(script_bytes[24], 0xac, "25th byte should be OP_CHECKSIG");
+
+        // Identity should be the ASCII bytes of "/Lotusia Pool/"
+        assert_eq!(
+            identity_bytes,
+            Some(b"/Lotusia Pool/".to_vec()),
+            "coinbase_identity should be UTF-8 bytes of the pool tag"
+        );
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_payout_script_hex() {
+        let id = MiningIdentity {
+            payout_address: None,
+            payout_script_hex: Some(
+                "76a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac".to_string(),
+            ),
+            coinbase_identity: None,
+        };
+        let (script_bytes, identity_bytes) = id.resolve().unwrap();
+
+        assert_eq!(script_bytes.len(), 25, "decoded hex P2PKH should be 25 bytes");
+        assert_eq!(script_bytes[0], 0x76);
+        assert_eq!(script_bytes[1], 0xa9);
+        assert_eq!(identity_bytes, None, "no identity set should return None");
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_op_return_hex_fails() {
+        let id = MiningIdentity {
+            payout_address: None,
+            payout_script_hex: Some("6a056c6f676f73".to_string()), // OP_RETURN "logos"
+            coinbase_identity: None,
+        };
+        let err = id.resolve().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BURNED"),
+            "error should mention BURNED, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_neither_fails() {
+        let id = MiningIdentity {
+            payout_address: None,
+            payout_script_hex: None,
+            coinbase_identity: None,
+        };
+        let err = id.resolve().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("payout_address"),
+            "error should mention payout_address, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_both_fails() {
+        let id = MiningIdentity {
+            payout_address: Some(
+                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
+            ),
+            payout_script_hex: Some(
+                "76a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac".to_string(),
+            ),
+            coinbase_identity: None,
+        };
+        let err = id.resolve().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only one"),
+            "error should mention 'only one', got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_identity_empty_string() {
+        let id = MiningIdentity {
+            payout_address: Some(
+                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
+            ),
+            payout_script_hex: None,
+            coinbase_identity: Some(String::new()),
+        };
+        let (_, identity_bytes) = id.resolve().unwrap();
+        assert_eq!(
+            identity_bytes, None,
+            "empty string identity should be treated as None"
+        );
+    }
+
+    #[test]
+    fn test_mining_identity_resolve_address_invalid_fails() {
+        let id = MiningIdentity {
+            payout_address: Some("not-a-valid-address".to_string()),
+            payout_script_hex: None,
+            coinbase_identity: None,
+        };
+        let err = id.resolve().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid payout_address"),
+            "error should mention invalid payout_address"
+        );
     }
 }

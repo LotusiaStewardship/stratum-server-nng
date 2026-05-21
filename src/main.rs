@@ -47,8 +47,29 @@ async fn main() -> Result<()> {
 
     // Create shared state
     let stats = Arc::new(RwLock::new(ServerStats::default()));
+
+    // Resolve mining identity before connecting (fail fast on misconfiguration)
+    // Without payout_address, lotusd creates OP_RETURN outputs and block rewards are BURNED.
+    let mining_id = config.pool.mining_identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "[pool.mining_identity] section not found in config. \
+             Without payout_address, lotusd creates OP_RETURN outputs and \
+             block rewards are BURNED. See config.example.toml."
+        ))?;
+    let (coinbase_script, coinbase_identity) = mining_id.resolve()?;
+
+    info!("mining identity resolved: coinbase_script={} bytes, coinbase_identity={}",
+        coinbase_script.len(),
+        coinbase_identity.as_ref().map(|b| b.len()).map_or("none".to_string(), |l| format!("{} bytes", l)),
+    );
+
     // Create NNG RPC client and job cache
-    let nng_client = Arc::new(NngRpcClient::new(config.nng_rpc_url.clone()));
+    let nng_client = Arc::new(NngRpcClient::new(
+        config.nng_rpc_url.clone(),
+        Some(coinbase_script),
+        coinbase_identity,
+    ));
     let job_cache = Arc::new(JobCache::new(512));
 
     // Connect to lotusd and fetch initial template
@@ -62,6 +83,17 @@ async fn main() -> Result<()> {
         height = template.height,
         "fetched mining template"
     );
+
+    // DIAGNOSTIC: verify the template coinbase has spendable (non-OP_RETURN) outputs.
+    // If all outputs are OP_RETURN, block rewards will be burned.
+    if let Err(e) = stratum_server_nng::node_integration::verify_coinbase_outputs(&template) {
+        tracing::warn!(
+            "coinbase output check: {}. \
+             If this pool finds a block, the reward may be BURNED. \
+             Check pool.mining_identity configuration.",
+            e,
+        );
+    }
 
     // Convert template to job and cache it
     let job = template_to_job(&template, false);
