@@ -2,15 +2,9 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use axum::http::StatusCode;
 use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::accounting::PayoutRepository;
-use crate::accounting::FoundBlock;
-
-use super::super::{AppState, AppError, PayoutConfig};
+use super::super::{AppState, AppError};
 
 #[derive(Debug, Serialize)]
 pub struct PayoutBatchResponse {
@@ -164,6 +158,7 @@ mod tests {
     use crate::accounting::{schema::init_schema, PayoutRepository};
     use rusqlite::Connection;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
     use parking_lot::Mutex;
     
     fn setup_repo() -> PayoutRepository {

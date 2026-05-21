@@ -23,7 +23,7 @@ A miner's submission via `mining.submit` Stratum method. The system persists two
 
 **Key invariant:** Each share belongs to exactly one round (via `round_id`). Round membership is resolved at insert time via `resolve_round_for_template(template_id)`, NOT backfilled.
 
-**Key invariant:** When a round is orphaned, its shares remain valid and stay in the PPLNS window. The `round_id` is historical accounting only — PPLNS window calculation is share-ID-based, not round-based. Orphan cost is absorbed by pool fees over time, not by invalidating shares.
+**Key invariant:** When a round is orphaned, its shares remain valid and stay in the PPLNS window. The `round_id` is historical accounting only — PPLNS window calculation is share-ID-based, not round-based. Orphan cost is absorbed by pool fees over time, not by invalidating shares. This means orphaned-round shares ARE included in PPLNS payout calculations (see §Orphaned for rationale).
 
 **Key invariant:** A share whose header hash meets P_diff but NOT N_diff (high-hash share) is still recorded as accepted with `network_target_ok=false`. These shares count toward PPLNS work units.
 
@@ -211,7 +211,7 @@ The trailing set of difficulty-weighted shares used for PPLNS payout calculation
 - Extends backward until cumulative work units reaches `n_multiplier × N_diff`
 - Is share-count-based, NOT template-based (shares from any template can be in window)
 - Aggregates shares by payout address for proportional distribution
-- Excludes orphaned shares (shares from orphaned rounds)
+- Includes orphaned shares (shares from orphaned rounds remain in the window — orphan risk is socialised across miners via window dilution, per PPLNS design)
 - Spans across round boundaries (shares from previous rounds can still be in window)
 
 **Key invariant:** The PPLNS window is a rolling window — shares "fall out" as newer shares arrive, regardless of round boundaries. When a block is found, the window is "snapshotted" for payout calculation.
@@ -298,9 +298,11 @@ A startup-time procedure that validates the pool's `found_blocks` against the cu
 ### Orphaned
 Status applied to blocks/shares when blockchain reorg invalidates them. An orphaned:
 - Block: Was found but is no longer on canonical chain
-- Share: Contributed to an orphaned block (has no payout value)
+- Share: Contributed to an orphaned block. The share remains in the PPLNS window and contributes work toward the next valid found block's payout (see PPLNS Window below)
 
 **Key invariant:** Orphaned status is permanent. Orphaned blocks/shares are never "un-orphaned" even if chain reorgs again.
+
+**Key invariant:** Orphaned shares are NOT excluded from the PPLNS window. They continue to count as work units and are paid when the next valid block is found. The orphan cost is absorbed by the pool's fee over time (typical orphan rate: 0.5-1% of blocks on a well-connected pool). This is a core distinction between PPLNS and PPS: under PPLNS, orphan risk is socialised across miners through window dilution rather than absorbed entirely by the pool.
 
 ### Matured
 Status applied to found blocks when they reach minimum confirmations (default: 100). Matured blocks:

@@ -12,6 +12,8 @@ pub struct BlockSummary {
     pub block_hash: String,
     pub height: i64,
     pub status: String,
+    pub coinbase_value: i64,
+    pub network_target_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +32,8 @@ pub struct BlockDetail {
     pub template_id: Option<i64>,
     pub persist_source: Option<String>,
     pub orphan_reason: Option<String>,
+    pub coinbase_value: i64,
+    pub network_target_hex: String,
 }
 
 pub async fn list_blocks(
@@ -46,6 +50,8 @@ pub async fn list_blocks(
                 block_hash: b.block_hash,
                 height: b.height,
                 status: b.status,
+                coinbase_value: b.coinbase_value,
+                network_target_hex: b.network_target_hex.clone(),
             })
             .collect()
     } else {
@@ -71,6 +77,8 @@ pub async fn get_block(
                 template_id: b.template_id,
                 persist_source: b.persist_source,
                 orphan_reason: b.orphan_reason,
+                coinbase_value: b.coinbase_value,
+                network_target_hex: b.network_target_hex.clone(),
             }),
             _ => None,
         },

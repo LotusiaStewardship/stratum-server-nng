@@ -369,97 +369,107 @@ impl AccountingService {
             &shares,
         );
 
-        // 5. Atomically create batch, payouts, snapshots, and update dust
+        // 5. Atomically create batch, payouts, snapshots, and update dust.
+        // All SQL is inlined through the already-locked `conn` rather than calling
+        // repository methods (which would try to re-lock and deadlock).
         conn.execute_batch("BEGIN TRANSACTION")?;
 
         let result = (|| -> Result<i64> {
             // Create payout batch
-            let batch = self.payout_repo.create_payout_batch(
-                found_block.round_id,
-                plan.gross_reward,
-                plan.pool_fee_amount,
-                plan.pool_fee_address.as_deref(),
-                plan.outputs.iter().filter(|o| o.worker_id > 0).count() as i64,
-                &plan.retry_key,
+            conn.execute(
+                "INSERT INTO payout_batches
+                 (round_id, total_amount, pool_fee_amount, pool_fee_address, miner_count, retry_key, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+                rusqlite::params![
+                    found_block.round_id,
+                    plan.gross_reward,
+                    plan.pool_fee_amount,
+                    plan.pool_fee_address.as_deref(),
+                    plan.outputs.len() as i64,
+                    &plan.retry_key,
+                ],
             )?;
-            let batch_id = batch.id;
+            let batch_id = conn.last_insert_rowid();
 
             // Record individual payouts and build snapshots
             let mut snapshots = Vec::new();
+            let mut payout_stmt = conn.prepare(
+                "INSERT INTO payouts (batch_id, worker_id, payout_address, amount, dust_carried_forward)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
             for output in &plan.outputs {
                 // Record payout (even zero-amount dust entries)
-                self.payout_repo.record_payout(
+                payout_stmt.execute(rusqlite::params![
                     batch_id,
                     output.worker_id,
                     &output.payout_address,
                     output.amount,
                     output.dust_carried_forward,
-                )?;
+                ])?;
 
-                // Create snapshot entries for miner payouts (not fee output)
-                if output.worker_id > 0 && output.amount > 0 {
-                    // Find the shares for this address in the window
-                    for share in &shares {
-                        if share.payout_address == output.payout_address {
-                            snapshots.push(
-                                crate::accounting::PayoutShareSnapshot {
-                                    id: 0,
-                                    batch_id,
-                                    share_id: share.share_id,
-                                    share_outcome_id: share.share_outcome_id,
-                                    payout_address: share.payout_address.clone(),
-                                    work_units: share.difficulty,
-                                    share_created_at: share.created_at.clone(),
-                                }
-                            );
-                        }
+                // Snapshot ALL miner window shares for audit trail (including dusted)
+                for share in &shares {
+                    if share.payout_address == output.payout_address {
+                        snapshots.push(
+                            crate::accounting::PayoutShareSnapshot {
+                                id: 0,
+                                batch_id,
+                                share_id: share.share_id,
+                                share_outcome_id: share.share_outcome_id,
+                                payout_address: share.payout_address.clone(),
+                                work_units: share.difficulty,
+                                share_created_at: share.created_at.clone(),
+                            }
+                        );
                     }
                 }
             }
 
             // Insert snapshots
-            self.payout_repo.snapshot_shares(&snapshots)?;
+            if !snapshots.is_empty() {
+                let mut snap_stmt = conn.prepare(
+                    "INSERT INTO payout_share_snapshots
+                     (batch_id, share_id, share_outcome_id, payout_address, work_units, share_created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                )?;
+                for snap in &snapshots {
+                    snap_stmt.execute(rusqlite::params![
+                        snap.batch_id,
+                        snap.share_id,
+                        snap.share_outcome_id,
+                        &snap.payout_address,
+                        snap.work_units,
+                        &snap.share_created_at,
+                    ])?;
+                }
+            }
 
             // Update dust balances
             let outputs_by_addr: std::collections::BTreeMap<&str, i64> = plan.outputs
                 .iter()
-                .filter(|o| o.worker_id > 0)
                 .map(|o| (o.payout_address.as_str(), o.dust_carried_forward))
                 .collect();
+            let mut dust_upsert = conn.prepare(
+                "INSERT INTO dust_balances (payout_address, balance)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(payout_address) DO UPDATE SET balance = balance + ?2, updated_at = CURRENT_TIMESTAMP"
+            )?;
             for (addr, dust) in &outputs_by_addr {
                 if *dust > 0 {
-                    // Get existing dust balance and add new dust
-                    let (existing, _) = self.payout_repo.get_or_create_dust_balance(addr)?;
-                    let new_balance = existing + dust;
-                    self.payout_repo.update_dust_balance(addr, new_balance)?;
-                }
-            }
-            // Update total dust for addresses that had dust consumed
-            for (addr, _existing_dust) in &dust_balances {
-                if !outputs_by_addr.contains_key(addr.as_str()) {
-                    // Address had dust but no payout this round — keep existing dust
-                    continue;
+                    dust_upsert.execute(rusqlite::params![addr, dust])?;
                 }
             }
 
-            // Record accounting events
-            let event = AccountingEvent {
-                id: 0,
-                event_type: "payout_batch_created".to_string(),
-                status: "pending".to_string(),
-                session_id: None,
-                worker_id: None,
-                worker_name: None,
-                payout_address: None,
-                round_id: Some(found_block.round_id),
-                template_id: None,
-                template_epoch: None,
-                job_id: None,
-                block_hash: Some(found_block.block_hash.clone()),
-                height: Some(found_block.height),
-                payload_json: None,
-            };
-            self.event_repo.record_event(&event)?;
+            // Record accounting event
+            conn.execute(
+                "INSERT INTO accounting_events (event_type, status, round_id, block_hash, height)
+                 VALUES ('payout_batch_created', 'pending', ?1, ?2, ?3)",
+                rusqlite::params![
+                    found_block.round_id,
+                    &found_block.block_hash,
+                    found_block.height,
+                ],
+            )?;
 
             Ok(batch_id)
         })();
@@ -923,5 +933,277 @@ mod tests {
         // Only one accounting event
         let events = svc.event_repo.list_by_type("share_outcome", 10, 0).unwrap();
         assert_eq!(events.len(), 1, "only one accounting event should exist");
+    }
+
+    #[test]
+    fn test_snapshot_includes_dusted_miner_shares() {
+        // Verify that the payout share snapshot captures ALL miner shares in the
+        // PPLNS window, even when a miner's payout falls below min_payout_sat
+        // and their output is clipped to dust.
+        let f = NamedTempFile::new().unwrap();
+        let db_path = f.path().to_path_buf();
+
+        // Set up schema and test data BEFORE creating the service.
+        // Use a dedicated setup connection so we don't interfere with the
+        // service's connection pool.
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+
+            setup.execute(
+                "INSERT INTO workers (id, payout_address) VALUES (1, 'big_addr')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO workers (id, payout_address) VALUES (2, 'small_addr')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open')",
+                [],
+            ).unwrap();
+
+            // Big miner share (diff 500)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (1, 1, 's1', 'j1', 100, 1, 'e1', 'en2', 'ntime', 'nonce', 500.0, 'dk1')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (1, 1, 's1', 1, 'j1', 1, 'dk1', 'accepted', 1, 0, '2026-05-20T12:00:01')",
+                [],
+            ).unwrap();
+
+            // Small miner share (diff 1)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (2, 2, 's2', 'j2', 100, 2, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk2')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (2, 2, 's2', 2, 'j2', 1, 'dk2', 'accepted', 1, 0, '2026-05-20T12:00:02')",
+                [],
+            ).unwrap();
+
+            // Block-finding share (belongs to big miner)
+            let block_hash = "00000000deadbeef00000000000000000000000000000000000000000000000000";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (3, 1, 's1', 'j3', 100, 3, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk3')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (3, 3, 's1', 1, 'j3', 1, 'dk3', 'accepted', 1, 1, ?1, '2026-05-20T12:00:03')",
+                rusqlite::params![block_hash],
+            ).unwrap();
+        }
+        // setup connection dropped: schema + test data committed
+
+        // Now create the service on a fresh connection to the same db file
+        let conn = Connection::open(&db_path).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        // Record the found block with a modest coinbase_value
+        let block_hash = "00000000deadbeef00000000000000000000000000000000000000000000000000";
+        let found_block = svc.record_found_block(
+            1,      // round_id
+            block_hash,
+            5000,
+            Some(1),  // big miner found it
+            Some(100),
+            Some("json-rpc"),
+            1000,          // coinbase_value = 1000 sat
+            "0000ffff0000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+
+        // Calculate payout with min_payout_sat high enough that small miner gets dusted
+        let batch_id = svc.create_payout_for_found_block(
+            &found_block,
+            0,                         // 0 bps fee
+            None,                      // no fee address
+            500,                       // min_payout_sat = 500
+            10.0,                      // n_multiplier = 10.0 (window covers all shares)
+        ).unwrap();
+
+        // Query snapshots for this batch
+        let snapshots = svc.payout_repo.get_snapshots_by_batch(batch_id).unwrap();
+
+        // Assert BOTH miners have snapshot entries
+        let big_snaps: Vec<_> = snapshots.iter().filter(|s| s.payout_address == "big_addr").collect();
+        let small_snaps: Vec<_> = snapshots.iter().filter(|s| s.payout_address == "small_addr").collect();
+
+        assert!(!big_snaps.is_empty(),
+            "big miner should have snapshot entries (amount >= min_payout_sat)");
+        assert!(!small_snaps.is_empty(),
+            "small miner should have snapshot entries even though payout was dusted");
+
+        // Verify the payouts show the dusted amount correctly
+        let payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
+        let small_payout = payouts.iter().find(|p| p.payout_address == "small_addr").unwrap();
+        assert_eq!(small_payout.amount, 0, "dusted miner's payout amount should be 0");
+        assert!(small_payout.dust_carried_forward > 0, "dusted miner should have dust carried forward");
+    }
+
+    #[test]
+    fn test_full_payout_flow_integration() {
+        // Full end-to-end integration test for create_payout_for_found_block:
+        //   workers, shares, found block → payout plan → batch → payouts →
+        //   snapshots → dust tracking → accounting event.
+        let f = NamedTempFile::new().unwrap();
+        let db_path = f.path().to_path_buf();
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+
+            // Workers
+            setup.execute_batch(
+                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');"
+            ).unwrap();
+
+            // Round
+            setup.execute(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                [],
+            ).unwrap();
+
+            // Alice: diff 300 (75% of work)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (1, 1, 's1', 'j1', 200, 1, 'e1', 'en2', 'ntime', 'nonce', 300.0, 'dk1')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (1, 1, 's1', 1, 'j1', 1, 'dk1', 'accepted', 1, 0, '2026-05-20T12:00:01')",
+                [],
+            ).unwrap();
+
+            // Bob: diff 100 (25% of work)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (2, 2, 's2', 'j2', 200, 2, 'e1', 'en2', 'ntime', 'nonce', 100.0, 'dk2')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (2, 2, 's2', 2, 'j2', 1, 'dk2', 'accepted', 1, 0, '2026-05-20T12:00:02')",
+                [],
+            ).unwrap();
+
+            // Block-finding share (found by Alice)
+            let block_hash = "00000000cafebabe00000000000000000000000000000000000000000000000000";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (3, 1, 's1', 'j3', 200, 3, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk3')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (3, 3, 's1', 1, 'j3', 1, 'dk3', 'accepted', 1, 1, ?1, '2026-05-20T12:00:03')",
+                rusqlite::params![block_hash],
+            ).unwrap();
+
+            // Pre-existing dust for Alice (50 sat carried from previous round)
+            setup.execute(
+                "INSERT INTO dust_balances (payout_address, balance) VALUES ('alice', 50)",
+                [],
+            ).unwrap();
+        }
+
+        // Create the service on a fresh connection
+        let conn = Connection::open(&db_path).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let block_hash = "00000000cafebabe00000000000000000000000000000000000000000000000000";
+        let found_block = svc.record_found_block(
+            1, block_hash,
+            9999, Some(1), Some(200), Some("json-rpc"),
+            10000,  // coinbase_value = 10000 sat
+            "0000ffff0000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+
+        // Payout: 200 bps (2%) fee, n_multiplier covers all shares
+        let batch_id = svc.create_payout_for_found_block(
+            &found_block,
+            200,                       // 2% fee
+            Some("fee_pool"),          // fee address
+            1,                         // min_payout_sat = 1 (no dust)
+            10.0,                      // window covers everything
+        ).unwrap();
+
+        let batch = svc.payout_repo.get_batch_by_id(batch_id).unwrap().unwrap();
+        assert_eq!(batch.status, "pending", "fresh payout batch should be pending");
+        assert_eq!(batch.round_id, 1);
+
+        // Fee = 10000 * 200 / 10000 = 200 sat
+        assert_eq!(batch.pool_fee_amount, 200);
+        assert_eq!(batch.pool_fee_address.as_deref(), Some("fee_pool"));
+
+        // Gross = 10000, Fee = 200, Net = 9800
+        // Alice: (300 + 50 dust_weight) / (400 + 50 dust_weight) ≈ 0.7778 of net
+        // Bob: 100 / (400 + 50 dust_weight) ≈ 0.2222 of net
+        // We don't check exact amounts (dust weight makes it fuzzy); verify sums instead.
+        let payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
+        let total_payouts: i64 = payouts.iter().map(|p| p.amount).sum();
+        let total_dust: i64 = payouts.iter().map(|p| p.dust_carried_forward).sum();
+        assert_eq!(
+            total_payouts + batch.pool_fee_amount + total_dust,
+            10000,
+            "gross reward should equal sum of payouts + fee + dust",
+        );
+
+        // Fee is tracked in payout_batches.pool_fee_amount, not in individual payouts.
+        assert_eq!(batch.pool_fee_amount, 200);
+        assert_eq!(batch.pool_fee_address.as_deref(), Some("fee_pool"));
+
+        // Verify Alice (worker 1) and Bob (worker 2) each have a payout
+        assert!(payouts.iter().any(|p| p.worker_id == 1), "Alice should have a payout");
+        assert!(payouts.iter().any(|p| p.worker_id == 2), "Bob should have a payout");
+
+        // Snapshots cover all shares
+        let snapshots = svc.payout_repo.get_snapshots_by_batch(batch_id).unwrap();
+        assert_eq!(snapshots.len(), 2, "one snapshot per miner (2 share rows)");
+        assert!(snapshots.iter().any(|s| s.payout_address == "alice"));
+        assert!(snapshots.iter().any(|s| s.payout_address == "bob"));
+
+        // Retry_key format: "{block_hash}:{num_outputs}"
+        assert!(
+            batch.retry_key.as_deref().unwrap().starts_with("00000000cafebabe00000000000000000000000000000000000000000000000000:"),
+            "retry_key should start with block_hash, got: {:?}",
+            batch.retry_key,
+        );
+
+        // Dust: Alice had 50 pre-existing dust, which was consumed as bonus weight.
+        // Bob had no pre-existing dust, so no new dust was created for him.
+        // Alice's payout > min_payout_sat so no new dust for her either.
+        // Total dust carried forward = sum of dust_carried_forward across payouts.
+        // Since min_payout_sat=1, no payouts were clipped to dust.
+        assert!(
+            total_dust == 0,
+            "no dust should be generated when min_payout_sat=1 and all miners get >=1 sat",
+        );
+
+        // Verify dust_balances table: Alice's pre-existing dust (50) was used as bonus
+        // weight in the payout calculation but is NOT decremented in the DB — the dust
+        // ledger is additive only (dust is never removed, only accumulated).
+        let (alice_dust, _) = svc.payout_repo.get_or_create_dust_balance("alice").unwrap();
+        assert_eq!(alice_dust, 50, "Alice's pre-existing dust remains in balance (additive-only ledger)");
     }
 }

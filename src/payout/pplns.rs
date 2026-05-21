@@ -24,7 +24,9 @@ pub struct PplnsShareEntry {
 /// If the window is shorter than the threshold (not enough shares), all available
 /// shares are returned.
 ///
-/// Excludes shares from orphaned rounds per UBQ invariant.
+/// Includes all accepted shares regardless of round status.
+/// Orphaned-round shares remain in the window — orphan risk is socialised
+/// via window dilution per PPLNS design (UBQ invariant).
 pub fn calculate_pplns_window(
     conn: &Connection,
     found_at: &str,
@@ -39,7 +41,6 @@ pub fn calculate_pplns_window(
         JOIN workers w ON w.id = so.worker_id
         JOIN rounds r ON r.id = so.round_id
         WHERE so.status = 'accepted'
-          AND r.status != 'orphaned'
           AND so.created_at <= ?1
         ORDER BY so.created_at DESC
     ";
@@ -142,7 +143,7 @@ mod tests {
             [],
         ).unwrap();
 
-        // Orphaned round share (should be excluded)
+        // Orphaned round share (stays in window per UBQ invariant)
         conn.execute(
             "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
                                  extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
@@ -164,12 +165,16 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_shares(&conn);
 
-        // Shares: [4.0 (w2), 2.0 (w1), 1.5 (w1)] in DESC order
+        // Shares: [999.0 (orphan), 4.0 (w2), 2.0 (w1), 1.5 (w1)] in DESC order
         // Threshold = 3.0 * 2.0 = 6.0
-        // Cumulative: 4.0 + 2.0 = 6.0 >= 6.0 => cutoff after share 2 (index 0 and 1)
+        // Cumulative: 999.0 >= 6.0 => cutoff at index 0 (orphaned-round share alone meets threshold)
         let result = calculate_pplns_window(&conn, "9999-12-31", 3.0, 2.0).unwrap();
-        assert_eq!(result.len(), 2, "should include exactly 2 shares to meet threshold");
-        assert!(result[0].difficulty >= 2.0, "first share should be highest difficulty");
+        assert_eq!(result.len(), 1, "orphaned-round share (999.0) alone meets threshold");
+        assert!(
+            (result[0].difficulty - 999.0).abs() < f64::EPSILON,
+            "first share should be the orphaned-round share (999.0), got: {}",
+            result[0].difficulty,
+        );
     }
 
     #[test]
@@ -181,23 +186,28 @@ mod tests {
 
         // Very high threshold that no amount of shares can meet
         let result = calculate_pplns_window(&conn, "9999-12-31", 9999.0, 1.0).unwrap();
-        assert_eq!(result.len(), 3, "should return all 3 non-orphaned shares");
+        assert_eq!(result.len(), 4, "should return all 4 shares including orphaned-round share");
+        // Verify the orphaned-round share (diff 999.0) is among them
+        assert!(result.iter().any(|e| (e.difficulty - 999.0).abs() < f64::EPSILON));
     }
 
     #[test]
-    fn test_window_excludes_orphaned_round_shares() {
+    fn test_window_includes_orphaned_round_shares() {
         let f = NamedTempFile::new().unwrap();
         let conn = Connection::open(f.path()).unwrap();
         init_schema(&conn).unwrap();
         setup_shares(&conn);
 
-        // Threshold = 1.0 (small) — should pick up only non-orphaned shares
+        // With a tiny threshold (0.5), the newest share (diff 999.0) alone
+        // meets it. This share belongs to orphaned round 2. Under PPLNS design
+        // orphaned-round shares remain in the window.
         let result = calculate_pplns_window(&conn, "9999-12-31", 0.5, 1.0).unwrap();
-        // Only the first few shares up to threshold, none from orphaned round
-        for entry in &result {
-            // All returned shares should have reasonable difficulties (not 999.0)
-            assert!(entry.difficulty < 100.0, "orphaned round share should be excluded");
-        }
+        assert_eq!(result.len(), 1, "orphaned-round share should be included and meet threshold alone");
+        assert!(
+            (result[0].difficulty - 999.0).abs() < f64::EPSILON,
+            "orphaned-round share should be the 999.0-difficulty share, got: {}",
+            result[0].difficulty,
+        );
     }
 
     #[test]
@@ -219,10 +229,13 @@ mod tests {
         init_schema(&conn).unwrap();
         setup_shares(&conn);
 
-        // Threshold = 5.5 -> cumulative: 4.0 + 2.0 = 6.0 >= 5.5 => first 2 shares
+        // Threshold = 5.5 -> cumulative: 999.0 >= 5.5 => orphaned-round share alone meets threshold
         let result = calculate_pplns_window(&conn, "9999-12-31", 2.75, 2.0).unwrap();
-        assert_eq!(result.len(), 2, "threshold=5.5 should stop after share with diff=2.0");
-        let cum: f64 = result.iter().map(|e| e.difficulty).sum();
-        assert!(cum >= 5.5, "cumulative difficulty should meet threshold");
+        assert_eq!(result.len(), 1, "threshold=5.5 met by orphaned-round share alone");
+        assert!(
+            (result[0].difficulty - 999.0).abs() < f64::EPSILON,
+            "first (and only) share should be orphaned-round share (999.0), got: {}",
+            result[0].difficulty,
+        );
     }
 }

@@ -305,6 +305,31 @@ impl PayoutRepository {
         }
         Ok(count)
     }
+
+    /// Get share snapshots for a payout batch.
+    pub fn get_snapshots_by_batch(&self, batch_id: i64) -> Result<Vec<PayoutShareSnapshot>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, batch_id, share_id, share_outcome_id, payout_address, work_units, share_created_at
+             FROM payout_share_snapshots WHERE batch_id = ?1 ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map(params![batch_id], |row| {
+            Ok(PayoutShareSnapshot {
+                id: row.get(0)?,
+                batch_id: row.get(1)?,
+                share_id: row.get(2)?,
+                share_outcome_id: row.get(3)?,
+                payout_address: row.get(4)?,
+                work_units: row.get(5)?,
+                share_created_at: row.get(6)?,
+            })
+        })?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(row?);
+        }
+        Ok(snapshots)
+    }
 }
 
 #[cfg(test)]

@@ -794,7 +794,7 @@ Implement PPLNS payout calculation. When a block matures, calculate miner payout
   - Work units = share.difficulty (P_diff at assignment time, immutable)
   - Aggregates by payout_address
   - Includes shares where `network_target_ok=false` (high-hash shares count as work)
-  - Excludes orphaned shares (shares from orphaned rounds)
+  - Includes orphaned shares (shares from orphaned rounds remain in the window — orphan risk is socialised via window dilution)
 - [x] Payout plan construction:
   - Gross reward = coinbase_value from found_block record (populated from MiningJob at block-find time)
   - Fee = `gross_reward * fee_bps / 10000`
@@ -838,7 +838,7 @@ Implement PPLNS payout calculation. When a block matures, calculate miner payout
 src/
 ├── payout/
 │   ├── mod.rs              # Re-exports pplns and plan
-│   ├── pplns.rs            # PPLNS window calculation (cumulative-difficulty, excludes orphaned rounds)
+│   ├── pplns.rs            # PPLNS window calculation (cumulative-difficulty threshold, includes orphaned-round shares per UBQ invariant)
 │   └── plan.rs             # PayoutPlan struct, PayoutOutput, build_payout_plan()
 ├── accounting/
 │   ├── payout_repository.rs # Payout batch CRUD, individual payouts, dust balance, share snapshots
@@ -1129,7 +1129,7 @@ Key UBQ invariants that span multiple slices:
 | High-hash share: accepted with network_target_ok=false | UBQ §Accepted Share | Slice 3 |
 | Authorization events are immutable | UBQ §Authorization Event | Slice 1 (authorization_events table) |
 | Round membership resolved at insert time | UBQ §Share | Slice 5 |
-| Orphaned shares remain in PPLNS window | UBQ §Round | Slice 6, Slice 7 |
+| Orphaned shares remain in PPLNS window | UBQ §Orphaned, §PPLNS Window | Slice 6, Slice 7 |
 | clean_jobs=true → ALL previous jobs stale | UBQ §Job | Slice 2, Slice 6 |
 | Accounting events are append-only | UBQ §Accounting Event | Slice 5 |
 | Payout share snapshot for audit | UBQ §Payout Share Snapshot | Slice 7 |

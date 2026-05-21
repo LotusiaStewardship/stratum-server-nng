@@ -76,7 +76,7 @@ pub fn build_payout_plan(
 
     // 2. Add existing dust as bonus weight
     let dust_map: std::collections::HashMap<&str, i64> = dust_balances.iter().map(|(a, b)| (a.as_str(), *b)).collect();
-    for (addr, (worker_id, work_units)) in work_by_addr.iter_mut() {
+    for (addr, (_worker_id, work_units)) in work_by_addr.iter_mut() {
         if let Some(dust) = dust_map.get(addr.as_str()) {
             // Dust is converted to fractional work units proportional to the gross_reward.
             // A 1-dust bonus = (1 / gross_reward) * total_work_units additional weight.
@@ -104,23 +104,22 @@ pub fn build_payout_plan(
 
     if total_work_units > 0.0 && net_reward > 0 {
         // Calculate exact amounts with fractional parts
+        #[allow(dead_code)]
         struct Alloc {
             address: String,
             worker_id: i64,
-            exact: f64,
             whole: i64,
             fractional: f64,
         }
         let mut allocs: Vec<Alloc> = work_by_addr
             .iter()
             .map(|(addr, (wid, work))| {
-                let exact = *work as f64 / total_work_units * net_reward as f64;
-                let whole = exact.floor() as i64;
-                let fractional = exact - whole as f64;
+                let fractional_reward = *work as f64 / total_work_units * net_reward as f64;
+                let whole = fractional_reward.floor() as i64;
+                let fractional = fractional_reward - whole as f64;
                 Alloc {
                     address: addr.clone(),
                     worker_id: *wid,
-                    exact,
                     whole,
                     fractional,
                 }
@@ -167,27 +166,10 @@ pub fn build_payout_plan(
         }
     }
 
-    // 8. Build fee output if fee_address is configured
-    if pool_fee_amount > 0 {
-        if let Some(fee_addr) = fee_address {
-            // Fee output is always included regardless of min_payout threshold
-            outputs.push(PayoutOutput {
-                payout_address: fee_addr.to_string(),
-                worker_id: 0, // sentinel: no worker associated with fee
-                amount: pool_fee_amount,
-                dust_carried_forward: 0,
-            });
-        } else {
-            // No fee address configured — fee becomes "dust" (accumulates or burns)
-            // This is tracked separately; it doesn't go into per-address dust.
-            // For now, the fee amount remains as pool_fee_amount on the batch and
-            // is not distributed to miners. It's accounted for but unallocated.
-            // A future enhancement could add a config for "fee destination = miners"
-            // to redistribute unclaimed fee.
-        }
-    }
+    // 8. Fee is tracked via pool_fee_amount / pool_fee_address on PayoutPlan.
+    // It is NOT added to outputs — outputs are miner-only.
+    // If no fee_address is configured the amount stays unallocated on the batch.
 
-    let miner_count = outputs.iter().filter(|o| o.worker_id > 0).count() as i64;
     let retry_key = format!("{}:{}", block_hash, outputs.len());
 
     PayoutPlan {
@@ -261,11 +243,10 @@ mod tests {
             100000, 100,
             Some("fee_addr"), 546, &[], &shares,
         );
-        // Outputs: miner + fee
-        assert_eq!(plan.outputs.len(), 2);
-        let fee_output = plan.outputs.iter().find(|o| o.payout_address == "fee_addr").unwrap();
-        assert_eq!(fee_output.amount, 1000);
-        assert_eq!(fee_output.worker_id, 0); // sentinel
+        // Fee is tracked on the plan, not in outputs
+        assert_eq!(plan.pool_fee_amount, 1000);
+        assert_eq!(plan.pool_fee_address.as_deref(), Some("fee_addr"));
+        assert_eq!(plan.outputs.len(), 1, "outputs should contain only the miner payout");
     }
 
     #[test]
