@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::shutdown::ShutdownSignal;
+use crate::stratum_protocol::params;
 
 /// NNG RPC client for communicating with lotusd.
 pub struct NngRpcClient {
@@ -67,7 +68,9 @@ impl NngRpcClient {
         let template = interface.get_mining_template(
             self.coinbase_script.as_deref(),
             self.coinbase_identity.as_deref(),
-            4, 4, true,
+            params::EXTRANONCE_1_SIZE.into(),
+            params::EXTRANONCE_2_SIZE.into(),
+            true,
         )
             .map_err(|e| anyhow::anyhow!("failed to fetch mining template: {}", e))?;
         Ok(template)

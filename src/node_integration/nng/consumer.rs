@@ -156,7 +156,18 @@ impl NngEventConsumer {
         // Lotus header includes block_size, which changes with every mempool update.
         // The reason code (NewTip/Reorg/MempoolRefresh/ManualInvalidation) is for
         // logging and observability only — not for behavioral branching.
-        let job = Arc::new(template_to_job(&template, true));
+        let job = match template_to_job(&template, true) {
+            Ok(job) => Arc::new(job),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    template_id = template.template_id,
+                    height = template.height,
+                    "failed to convert mining template to job — skipping refresh",
+                );
+                return;
+            }
+        };
         self.job_cache.insert((*job).clone()).await;
 
         if self.debug {

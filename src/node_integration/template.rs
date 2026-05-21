@@ -1,4 +1,5 @@
 use crate::stratum_protocol::job::MiningJob;
+use crate::stratum_protocol::params;
 use bitcoinsuite_bitcoind_nng::MiningTemplate;
 use bitcoinsuite_core::{BitcoinCode, Bytes, BytesMut, Hashed, LotusBlock, LotusHeader, Tx};
 
@@ -10,23 +11,21 @@ use bitcoinsuite_core::{BitcoinCode, Bytes, BytesMut, Hashed, LotusBlock, LotusH
 /// coinbase (after re-serialization) and a candidate coinbase with 8-byte
 /// dummy extranonce, then adjusts the template block length accordingly.
 ///
-/// Falls back to `template.block.len()` if deserialization fails.
+/// Returns `Err` if the template block cannot be deserialized, the coinbase
+/// cannot be decoded, or the coinbase transaction cannot be parsed.
+/// Any of these failures means the template is corrupt and should NOT be used
+/// to mine against — block_size must be accurate for valid hashes.
 fn compute_block_size_with_extranonce(
     template_block: &[u8],
     coinbase1: &str,
     coinbase2: &str,
-) -> u64 {
+) -> anyhow::Result<u64> {
     // Deserialize the template block to access the template's coinbase
-    let block = match LotusBlock::deser(&mut Bytes::from_slice(template_block)) {
-        Ok(b) => b,
-        Err(_) => {
-            tracing::warn!(
-                block_len = template_block.len(),
-                "compute_block_size: failed to deserialize template block, falling back to raw length",
-            );
-            return template_block.len() as u64;
-        },
-    };
+    let block = LotusBlock::deser(&mut Bytes::from_slice(template_block))
+        .map_err(|e| anyhow::anyhow!(
+            "failed to deserialize template block ({} bytes): {}",
+            template_block.len(), e,
+        ))?;
 
     // Get Rust-serialized size of the template's coinbase
     let template_coinbase_size = match block.txs.first() {
@@ -36,38 +35,26 @@ fn compute_block_size_with_extranonce(
             buf.freeze().len()
         }
         None => {
-            tracing::warn!(
-                block_len = template_block.len(),
-                "compute_block_size: template block has no transactions, falling back to raw length",
-            );
-            return template_block.len() as u64;
+            return Err(anyhow::anyhow!(
+                "template block has no transactions ({} bytes)",
+                template_block.len(),
+            ));
         },
     };
 
-    // Build a sample coinbase with dummy extranonce (0u64 = 8 zero bytes)
-    let sample_hex = format!("{}{:016x}{}", coinbase1, 0u64, coinbase2);
-    let sample_bytes = match hex::decode(&sample_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                coinbase1_len = coinbase1.len(),
-                coinbase2_len = coinbase2.len(),
-                "compute_block_size: failed to hex-decode sample coinbase, falling back to raw length",
-            );
-            return template_block.len() as u64;
-        },
-    };
-    let sample_tx = match Tx::deser(&mut Bytes::from_slice(&sample_bytes)) {
-        Ok(tx) => tx,
-        Err(_) => {
-            tracing::warn!(
-                sample_bytes_len = sample_bytes.len(),
-                "compute_block_size: failed to deserialize sample coinbase tx, falling back to raw length",
-            );
-            return template_block.len() as u64;
-        },
-    };
+    // Build a sample coinbase with dummy extranonce (total_extranonce_size zero bytes)
+    let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
+    let sample_hex = format!("{}{}{}", coinbase1, dummy_extranonce, coinbase2);
+    let sample_bytes = hex::decode(&sample_hex)
+        .map_err(|e| anyhow::anyhow!(
+            "failed to hex-decode sample coinbase: {} (coinbase1={}B, coinbase2={}B)",
+            e, coinbase1.len(), coinbase2.len(),
+        ))?;
+    let sample_tx = Tx::deser(&mut Bytes::from_slice(&sample_bytes))
+        .map_err(|e| anyhow::anyhow!(
+            "failed to deserialize sample coinbase tx ({} bytes): {}",
+            sample_bytes.len(), e,
+        ))?;
 
     // Get Rust-serialized size of the candidate coinbase
     let candidate_coinbase_size = {
@@ -78,7 +65,7 @@ fn compute_block_size_with_extranonce(
 
     // Compute adjusted block size
     let delta = (candidate_coinbase_size as i64) - (template_coinbase_size as i64);
-    ((template_block.len() as i64) + delta) as u64
+    Ok(((template_block.len() as i64) + delta) as u64)
 }
 
 /// Convert a MiningTemplate from lotusd into a MiningJob for stratum protocol.
@@ -96,7 +83,7 @@ fn compute_block_size_with_extranonce(
 /// * `template` - The mining template from lotusd.
 /// * `clean_jobs` - Whether this job should invalidate all previous jobs.
 ///   Pass `true` for miningwrkchg-triggered refreshes, `false` for initial startup.
-pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> MiningJob {
+pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> anyhow::Result<MiningJob> {
     // Extract header fields from serialized LotusHeader bytes
     let (epoch_hash, extended_metadata_hash) = if !template.header.is_empty() {
         let mut data = Bytes::from_slice(&template.header);
@@ -122,9 +109,9 @@ pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> MiningJob
         &template.block,
         &template.coinbase1,
         &template.coinbase2,
-    );
+    )?;
 
-    MiningJob {
+    Ok(MiningJob {
         job_id: format!("job-{}-{}", template.template_id, template.curtime),
         template_id: template.template_id,
         prevhash: template.prev_hash_stratum.clone(),
@@ -142,7 +129,7 @@ pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> MiningJob
         extended_metadata_hash,
         block_size,
         block_bytes: template.block.clone(),
-    }
+    })
 }
 
 /// Verify that a mining template's coinbase has at least one spendable (non-OP_RETURN)
@@ -157,9 +144,10 @@ pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> 
     // Reconstruct the full coinbase with an 8-byte dummy extranonce (4B en1 + 4B en2).
     // The extranonce bytes sit in the scriptSig (coinbase input) and do not affect
     // the outputs, so any placeholder value works for output verification.
+    let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
     let coinbase_hex = format!(
-        "{}{:016x}{}",
-        template.coinbase1, 0u64, template.coinbase2
+        "{}{}{}",
+        template.coinbase1, dummy_extranonce, template.coinbase2
     );
     let coinbase_bytes = hex::decode(&coinbase_hex)
         .map_err(|e| format!("failed to hex-decode reconstructed coinbase: {}", e))?;
@@ -193,18 +181,63 @@ pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stratum_protocol::params;
     use bitcoinsuite_core::{Sha256d, LotusBlock, LotusHeader, Tx, BitcoinCode, Bytes, BytesMut};
 
     fn create_test_template() -> MiningTemplate {
-        // Real-world template data (lotusd block height 1292529)
+        // Build a minimal serialized LotusBlock from the template's coinbase parts.
+        // We use the same coinbase1/coinbase2 throughout the test suite and reconstruct
+        // the full coinbase with a dummy extranonce (8 zero bytes) to produce a valid
+        // serialized block. This mirrors what lotusd would provide at runtime.
+        let coinbase1 = "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f";
+        let coinbase2 = "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000";
+
+        let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
+        let coinbase_hex = format!("{}{}{}", coinbase1, dummy_extranonce, coinbase2);
+        let coinbase_bytes = hex::decode(&coinbase_hex).unwrap();
+        let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
+        let coinbase_tx: Tx = BitcoinCode::deser(&mut coinbase_buf).unwrap();
+
+        let mut block = LotusBlock {
+            header: LotusHeader {
+                prev_block: Sha256d::new([0u8; 32]),
+                bits: 0x1c09d010,
+                timestamp: 0,
+                reserved: 0,
+                nonce: 0,
+                version: 1,
+                size: 0,
+                height: 1292529,
+                epoch_hash: Sha256d::from_hex_be(
+                    "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7",
+                )
+                .unwrap(),
+                merkle_root: Sha256d::new([0u8; 32]),
+                extended_metadata_hash: Sha256d::new([0u8; 32]),
+            },
+            metadata: vec![],
+            txs: vec![coinbase_tx],
+        };
+        block.update_merkle_root();
+        block.update_extended_metadata_hash();
+        block.update_size();
+
+        let mut block_buf = BytesMut::new();
+        block.ser_to(&mut block_buf);
+        let block_bytes = block_buf.freeze().to_vec();
+
+        let mut header_buf = BytesMut::new();
+        block.header.ser_to(&mut header_buf);
+        let header_bytes = header_buf.freeze().to_vec();
+
         MiningTemplate {
             template_id: 890,
-            block: vec![],
-            header: vec![],
-            previous_block_hash: Sha256d::new([0u8; 32]),
-            height: 1000,
-            version: 1,
-            bits: 486604799,
+            block: block_bytes,
+            header: header_bytes,
+            previous_block_hash: block.header.prev_block.clone(),
+            height: block.header.height,
+            version: block.header.version as u32,
+            bits: block.header.bits,
             target: Sha256d::new([0u8; 32]),
             curtime: 100,
             mintime: 0,
@@ -212,8 +245,8 @@ mod tests {
             coinbase_value: 5000000000,
             coinbase_tx: vec![],
             transactions: vec![],
-            coinbase1: "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f".to_string(),
-            coinbase2: "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000".to_string(),
+            coinbase1: coinbase1.to_string(),
+            coinbase2: coinbase2.to_string(),
             merkle_branches: vec![
                 "796f6be745741765f8b19cfa4209ff68447d9e76198fee5d33fbe2c944224f16".to_string(),
                 "4b0ce2ddbf0f5352b721b7688109a1e1007722f96fa07f61ea8e655ac804964f".to_string(),
@@ -228,7 +261,7 @@ mod tests {
     #[test]
     fn test_template_to_job_basic_conversion() {
         let template = create_test_template();
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         // Job ID format per UBQ: job-{template_id}-{epoch}
         assert_eq!(job.job_id, "job-890-100");
@@ -247,7 +280,7 @@ mod tests {
     #[test]
     fn test_template_to_job_clean_jobs_false_explicit() {
         let template = create_test_template();
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
         assert_eq!(job.clean_jobs, false,
             "initial template should have clean_jobs=false"
         );
@@ -256,7 +289,7 @@ mod tests {
     #[test]
     fn test_template_to_job_clean_jobs_true() {
         let template = create_test_template();
-        let job = template_to_job(&template, true);
+        let job = template_to_job(&template, true).unwrap();
         assert_eq!(job.clean_jobs, true,
             "miningwrkchg-triggered job should have clean_jobs=true"
         );
@@ -278,7 +311,7 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF,
         ]);
 
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         assert_eq!(
             job.network_target_hex,
@@ -295,7 +328,7 @@ mod tests {
             "branch3".to_string(),
         ];
 
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         assert_eq!(job.merkle_branches.len(), 3);
         assert_eq!(job.merkle_branches[0], "branch1");
@@ -332,7 +365,7 @@ mod tests {
         header.ser_to(&mut buf);
         template.header = buf.as_slice().to_vec();
 
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         assert_eq!(job.height, 1292529);
         assert_eq!(
@@ -414,7 +447,8 @@ mod tests {
         let coinbase2 = "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000";
 
         // Build the coinbase WITH 8-byte placeholder extranonce (as lotusd would)
-        let coinbase_hex = format!("{}{:016x}{}", coinbase1, 0u64, coinbase2);
+        let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
+        let coinbase_hex = format!("{}{}{}", coinbase1, dummy_extranonce, coinbase2);
         let coinbase_bytes = hex::decode(&coinbase_hex).unwrap();
         let coinbase_tx: Tx = BitcoinCode::deser(&mut Bytes::from_slice(&coinbase_bytes)).unwrap();
 
@@ -455,13 +489,75 @@ mod tests {
             "6adc0c6a0000",
         );
 
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         assert_eq!(
             job.block_size, expected_rust_size,
             "template_to_job should compute block_size matching the actual Rust-serialized block size.\n\
              expected={}, got={}",
             expected_rust_size, job.block_size,
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // template_to_job error propagation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_template_to_job_fails_on_empty_block() {
+        // If the template block is empty (corrupt), template_to_job must return Err
+        // so the operator sees a hard stop, not a silent fallback.
+        let mut template = create_test_template();
+        template.block = vec![];  // empty — LotusBlock::deser will fail
+
+        let err = template_to_job(&template, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to deserialize template block"),
+            "error should mention block deserialization failure, got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn test_template_to_job_fails_on_empty_txs() {
+        // If the template block has no transactions, template_to_job must return Err.
+        // We construct a valid LotusBlock with an empty txs vec to trigger the
+        // "no transactions" guard in compute_block_size_with_extranonce.
+        let empty_tx_block = LotusBlock {
+            header: LotusHeader {
+                prev_block: Sha256d::new([0u8; 32]),
+                bits: 0x1c09d010,
+                timestamp: 0,
+                reserved: 0,
+                nonce: 0,
+                version: 1,
+                size: 0,
+                height: 1292529,
+                epoch_hash: Sha256d::from_hex_be(
+                    "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7",
+                ).unwrap(),
+                merkle_root: Sha256d::new([0u8; 32]),
+                extended_metadata_hash: Sha256d::new([0u8; 32]),
+            },
+            metadata: vec![],
+            txs: vec![],  // no coinbase
+        };
+        let block_bytes = {
+            let mut buf = BytesMut::new();
+            empty_tx_block.ser_to(&mut buf);
+            buf.freeze().to_vec()
+        };
+
+        let mut template = create_test_template();
+        template.block = block_bytes;
+
+        let err = template_to_job(&template, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no transactions"),
+            "error should mention no transactions, got: {}",
+            msg,
         );
     }
 

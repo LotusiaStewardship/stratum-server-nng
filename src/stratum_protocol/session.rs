@@ -1,12 +1,9 @@
 use crate::share_processing::{VarDiff, VarDiffConfig};
 use crate::stratum_protocol::protocol::{StratumRequest, StratumResponse};
+use crate::stratum_protocol::params;
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
-use rand::Rng;
-
-/// Maximum assigned jobs per session (per UBQ invariant). See UBQ §Assigned Job.
-const MAX_ASSIGNED_JOBS_PER_SESSION: usize = 128;
 
 /// A record of a job that was dispatched to the miner via mining.notify.
 /// Per UBQ §Assigned Job: each assigned job captures (job_id, P_diff, ntime).
@@ -33,13 +30,11 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(session_id: String, vardiff_config: VarDiffConfig, n_diff: f64) -> Self {
-        // Generate random extranonce1 (4 bytes = 8 hex chars)
-        let extranonce1 = format!("{:08x}", rand::thread_rng().gen::<u32>());
+    pub fn new(session_id: String, extranonce1: String, vardiff_config: VarDiffConfig, n_diff: f64) -> Self {
         Self {
             session_id,
             extranonce1,
-            extranonce2_size: 4,
+            extranonce2_size: params::EXTRANONCE_2_SIZE,
             is_subscribed: false,
             is_authorized: false,
             authorized_workers: HashSet::new(),
@@ -81,7 +76,7 @@ impl SessionState {
     /// Record an assigned job (dispatched mining.notify) in the session.
     /// Per UBQ: tracks (job_id, P_diff, ntime) and caps at MAX_ASSIGNED_JOBS_PER_SESSION.
     pub fn record_assigned_job(&mut self, job_id: String, p_diff: f64, ntime: String) {
-        if self.assigned_jobs.len() >= MAX_ASSIGNED_JOBS_PER_SESSION {
+        if self.assigned_jobs.len() >= params::MAX_ASSIGNED_JOBS_PER_SESSION {
             self.assigned_jobs.pop_front();
         }
         self.assigned_jobs.push_back(AssignedJob {
@@ -136,10 +131,12 @@ pub struct WorkerName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stratum_protocol::params;
     use crate::stratum_protocol::protocol::Method;
 
     fn test_session(id: &str) -> SessionState {
-        SessionState::new(id.to_string(), VarDiffConfig::default(), 100.0)
+        // Use a fixed but unique per-test extranonce1.
+        SessionState::new(id.to_string(), "00000001".to_string(), VarDiffConfig::default(), 100.0)
     }
 
     #[test]
@@ -196,7 +193,7 @@ mod tests {
     #[test]
     fn test_assigned_jobs_cap() {
         let mut session = test_session("sess-8");
-        for i in 0..MAX_ASSIGNED_JOBS_PER_SESSION + 10 {
+        for i in 0..params::MAX_ASSIGNED_JOBS_PER_SESSION + 10 {
             session.record_assigned_job(
                 format!("job-{}", i),
                 1.0,
@@ -204,11 +201,11 @@ mod tests {
             );
         }
         
-        assert_eq!(session.assigned_jobs.len(), MAX_ASSIGNED_JOBS_PER_SESSION);
+        assert_eq!(session.assigned_jobs.len(), params::MAX_ASSIGNED_JOBS_PER_SESSION);
         assert!(session.get_assigned_job("job-0").is_none());
         assert!(session.get_assigned_job("job-1").is_none());
         assert!(session.get_assigned_job(
-            &format!("job-{}", MAX_ASSIGNED_JOBS_PER_SESSION + 9)
+            &format!("job-{}", params::MAX_ASSIGNED_JOBS_PER_SESSION + 9)
         ).is_some());
     }
 
@@ -268,17 +265,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unique_extranonce1_per_session() {
-        let session1 = test_session("sess-1");
-        let session2 = test_session("sess-2");
-        let session3 = test_session("sess-3");
-        
-        assert_eq!(session1.extranonce1.len(), 8);
-        assert_eq!(session2.extranonce1.len(), 8);
-        assert_eq!(session3.extranonce1.len(), 8);
-        
-        assert_ne!(session1.extranonce1, session2.extranonce1);
-        assert_ne!(session2.extranonce1, session3.extranonce1);
-        assert_ne!(session1.extranonce1, session3.extranonce1);
+    fn test_extranonce1_stores_provided_value() {
+        // The session should store the extranonce1 that was given to it.
+        // This test uses the constructor directly (not test_session) to
+        // verify explicit extranonce1 injection works.
+        let session = SessionState::new(
+            "sess-ext".to_string(),
+            "deadbeef".to_string(),
+            VarDiffConfig::default(),
+            100.0,
+        );
+        assert_eq!(session.extranonce1, "deadbeef");
+        assert_eq!(session.extranonce1.len(), 8);
+        assert!(session.extranonce1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -94,26 +94,80 @@ pub fn build_submit_block(
     // Serialize the block back to hex for submitblock
     let mut out = BytesMut::new();
     block.ser_to(&mut out);
-    Ok((hex::encode(out.freeze()), block_hash))
+    let serialized = out.freeze();
+
+    // Sanity check: the actual serialized length should match job.block_size.
+    // If they diverge, the block_size computation (compute_block_size_with_extranonce)
+    // has a bug that will cause lotusd to reject the block with "bad-blk-size-mismatch".
+    debug_assert!(
+        (serialized.len() as i64 - job.block_size as i64).abs() <= 1,
+        "block size mismatch: serialized={} vs job.block_size={} — \
+         compute_block_size_with_extranonce may be wrong",
+        serialized.len(), job.block_size,
+    );
+
+    Ok((hex::encode(serialized), block_hash))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node_integration::template::template_to_job;
+    use crate::stratum_protocol::params;
     use bitcoinsuite_bitcoind_nng::MiningTemplate;
     use bitcoinsuite_core::{Sha256d, LotusHeader, Tx, Hashed};
 
     fn test_template() -> MiningTemplate {
-        // Template data from lotusd at height 1292529-ish, trimmed for testing
+        // Build a minimal serialized LotusBlock from the template's coinbase parts.
+        let coinbase1 = "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f";
+        let coinbase2 = "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000";
+
+        let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
+        let coinbase_hex = format!("{}{}{}", coinbase1, dummy_extranonce, coinbase2);
+        let coinbase_bytes = hex::decode(&coinbase_hex).unwrap();
+        let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
+        let coinbase_tx: Tx = BitcoinCode::deser(&mut coinbase_buf).unwrap();
+
+        let mut block = LotusBlock {
+            header: LotusHeader {
+                prev_block: Sha256d::new([0u8; 32]),
+                bits: 0x1c09d010,
+                timestamp: 0,
+                reserved: 0,
+                nonce: 0,
+                version: 1,
+                size: 0,
+                height: 1292529,
+                epoch_hash: Sha256d::from_hex_be(
+                    "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7",
+                )
+                .unwrap(),
+                merkle_root: Sha256d::new([0u8; 32]),
+                extended_metadata_hash: Sha256d::new([0u8; 32]),
+            },
+            metadata: vec![],
+            txs: vec![coinbase_tx],
+        };
+        block.update_merkle_root();
+        block.update_extended_metadata_hash();
+        block.update_size();
+
+        let mut block_buf = BytesMut::new();
+        block.ser_to(&mut block_buf);
+        let block_bytes = block_buf.freeze().to_vec();
+
+        let mut header_buf = BytesMut::new();
+        block.header.ser_to(&mut header_buf);
+        let header_bytes = header_buf.freeze().to_vec();
+
         MiningTemplate {
             template_id: 890,
-            block: vec![],  // Will be set per test
-            header: vec![],
-            previous_block_hash: Sha256d::new([0u8; 32]),
-            height: 1000,
-            version: 1,
-            bits: 486604799,
+            block: block_bytes,
+            header: header_bytes,
+            previous_block_hash: block.header.prev_block.clone(),
+            height: block.header.height,
+            version: block.header.version as u32,
+            bits: block.header.bits,
             target: Sha256d::new([0u8; 32]),
             curtime: 100,
             mintime: 0,
@@ -121,8 +175,8 @@ mod tests {
             coinbase_value: 5000000000,
             coinbase_tx: vec![],
             transactions: vec![],
-            coinbase1: "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f".to_string(),
-            coinbase2: "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000".to_string(),
+            coinbase1: coinbase1.to_string(),
+            coinbase2: coinbase2.to_string(),
             merkle_branches: vec![],
             prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
             nbits_stratum: "10d0091c".to_string(),
@@ -133,15 +187,16 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_empty_template() {
         let template = test_template();
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
+        // Pass an explicitly empty block slice to test build_submit_block rejection.
         let result = build_submit_block(
             &job,
             "00000001",
             "00000002",
             "6adc0c6a0000",
             "0000000000000001",
-            &template.block,
+            &[],  // empty block — deserialization will fail
         );
 
         assert!(
@@ -153,7 +208,7 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_invalid_ntime() {
         let template = test_template();
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         let result = build_submit_block(
             &job,
@@ -170,7 +225,7 @@ mod tests {
     #[test]
     fn test_build_submit_block_rejects_invalid_nonce() {
         let template = test_template();
-        let job = template_to_job(&template, false);
+        let job = template_to_job(&template, false).unwrap();
 
         let result = build_submit_block(
             &job,
@@ -260,7 +315,7 @@ mod tests {
             ntime_stratum: "6adc0c6a0000".to_string(),
         };
 
-        template_to_job(&template, false)
+        template_to_job(&template, false).unwrap()
     }
 
     #[test]
@@ -388,4 +443,6 @@ mod tests {
             expected_hash, built_hash,
         );
     }
+
+
 }

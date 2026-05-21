@@ -29,7 +29,11 @@ pub struct MiningJob {
     pub extended_metadata_hash: String,
     pub block_size: u64,
     /// Full serialized block bytes from the mining template.
-    /// Used by block_builder to reconstruct the block with miner's submission.
+    /// Used by `block_builder::build_submit_block` to reconstruct the full block
+    /// with the miner's extranonce1, extranonce2, ntime, and nonce. The template
+    /// coinbase (txs[0]) is replaced with the miner's reconstructed coinbase;
+    /// the header is rebuilt via `build_stratum_header` to match the hash the
+    /// validator computed.
     pub block_bytes: Vec<u8>,
 }
 

@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::stratum_protocol::session::SessionState;
+use crate::stratum_protocol::params;
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
 use crate::accounting::{ShareRepository, AuthorizationEvent, AccountingService};
@@ -112,14 +113,21 @@ impl StratumServer {
                             debug!(addr = %addr, "new miner connection");
                             // Per UBQ: extranonce1 must be globally unique across active sessions.
                             // Derive from the session counter to guarantee uniqueness without
-                            // collision-checking. The counter wraps at u32::MAX (~4B connections),
-                            // which is not practically reachable.
+                            // collision-checking. The counter wraps at EXTRANONCE_1_SIZE bytes
+                            // (currently 4, ~4B connections), which is not practically reachable.
+                            // Use params constants so the mask and hex width track when
+                            // EXTRANONCE_1_SIZE changes.
                             let mut counter = self.session_counter.write().await;
                             *counter += 1;
                             let count = *counter;
                             drop(counter);
                             let session_id = format!("sess-{}", count);
-                            let extranonce1 = format!("{:08x}", count as u32);
+                            let wrap_mask = (1u64 << (params::EXTRANONCE_1_SIZE as u64 * 8)) - 1;
+                            let extranonce1 = format!(
+                                "{:0width$x}",
+                                count & wrap_mask,
+                                width = params::EXTRANONCE_1_HEX_CHARS,
+                            );
 
                             // Compute N_diff from the latest job's network target
                             let n_diff = self
@@ -128,12 +136,12 @@ impl StratumServer {
                                 .await
                                 .and_then(|job| network_target_hex_to_difficulty(&job.network_target_hex))
                                 .unwrap_or(1.0);
-                            let mut session = SessionState::new(
+                            let session = SessionState::new(
                                 session_id.clone(),
+                                extranonce1,
                                 self.vardiff_config.clone(),
                                 n_diff,
                             );
-                            session.extranonce1 = extranonce1;
                             
                             // Clone Arcs for the connection handler
                             let connected_miners = self.connected_miners.clone();
@@ -181,13 +189,7 @@ impl StratumServer {
         Ok(())
     }
 
-    /// Generate a unique session ID.
-    #[cfg(test)]
-    async fn generate_session_id(&self) -> String {
-        let mut counter = self.session_counter.write().await;
-        *counter += 1;
-        format!("sess-{}", *counter)
-    }
+
 }
 
 /// Handle a single miner connection.
@@ -1020,9 +1022,21 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
         
-        let id1 = server.generate_session_id().await;
-        let id2 = server.generate_session_id().await;
-        let id3 = server.generate_session_id().await;
+        let id1 = {
+            let mut c = server.session_counter.write().await;
+            *c += 1;
+            format!("sess-{}", *c)
+        };
+        let id2 = {
+            let mut c = server.session_counter.write().await;
+            *c += 1;
+            format!("sess-{}", *c)
+        };
+        let id3 = {
+            let mut c = server.session_counter.write().await;
+            *c += 1;
+            format!("sess-{}", *c)
+        };
         
         assert_eq!(id1, "sess-1");
         assert_eq!(id2, "sess-2");
