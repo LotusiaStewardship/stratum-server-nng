@@ -369,7 +369,26 @@ impl AccountingService {
             &shares,
         );
 
-        // 5. Atomically create batch, payouts, snapshots, and update dust.
+        // 5. Guard: reject if a payout batch already exists for this block_hash.
+        // Uses retry_key prefix match (same pattern as the scheduler).
+        // Prevents duplicate batches regardless of caller.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM payout_batches WHERE retry_key LIKE ?1"
+            )?;
+            let existing: i64 = stmt.query_row(
+                rusqlite::params![format!("{}%", found_block.block_hash)],
+                |row| row.get(0),
+            )?;
+            if existing > 0 {
+                anyhow::bail!(
+                    "payout batch already exists for block hash {}",
+                    found_block.block_hash,
+                );
+            }
+        }
+
+        // 6. Atomically create batch, payouts, snapshots, and update dust.
         // All SQL is inlined through the already-locked `conn` rather than calling
         // repository methods (which would try to re-lock and deadlock).
         conn.execute_batch("BEGIN TRANSACTION")?;
@@ -1205,5 +1224,260 @@ mod tests {
         // ledger is additive only (dust is never removed, only accumulated).
         let (alice_dust, _) = svc.payout_repo.get_or_create_dust_balance("alice").unwrap();
         assert_eq!(alice_dust, 50, "Alice's pre-existing dust remains in balance (additive-only ledger)");
+    }
+
+    #[test]
+    fn test_create_payout_rejects_duplicate_block() {
+        // Verify that create_payout_for_found_block rejects a second call
+        // with the same block_hash (prevents duplicate payout batches).
+        let f = NamedTempFile::new().unwrap();
+        let db_path = f.path().to_path_buf();
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+
+            // Workers
+            setup.execute_batch(
+                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');"
+            ).unwrap();
+
+            // Round
+            setup.execute(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                [],
+            ).unwrap();
+
+            // Alice: diff 300 (75% of work)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (1, 1, 's1', 'j1', 200, 1, 'e1', 'en2', 'ntime', 'nonce', 300.0, 'dk1')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (1, 1, 's1', 1, 'j1', 1, 'dk1', 'accepted', 1, 0, '2026-05-20T12:00:01')",
+                [],
+            ).unwrap();
+
+            // Bob: diff 100 (25% of work)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (2, 2, 's2', 'j2', 200, 2, 'e1', 'en2', 'ntime', 'nonce', 100.0, 'dk2')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (2, 2, 's2', 2, 'j2', 1, 'dk2', 'accepted', 1, 0, '2026-05-20T12:00:02')",
+                [],
+            ).unwrap();
+
+            // Block-finding share (network_target_ok=1, block_hash set)
+            let block_hash = "0000deadbeef000000000000000000000000000000000000000000000000000000";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (3, 1, 's1', 'j3', 200, 3, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk3')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (3, 3, 's1', 1, 'j3', 1, 'dk3', 'accepted', 1, 1, ?1, '2026-05-20T12:00:03')",
+                rusqlite::params![block_hash],
+            ).unwrap();
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let block_hash = "0000deadbeef000000000000000000000000000000000000000000000000000000";
+        let found_block = svc.record_found_block(
+            1, block_hash,
+            10000, Some(1), Some(200), Some("json-rpc"),
+            10000,
+            "0000ffff0000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+
+        // First call — succeeds
+        let _batch_id = svc.create_payout_for_found_block(
+            &found_block, 200, Some("fee_pool"), 1, 10.0,
+        ).unwrap();
+
+        // Second call with same block — fails
+        let err = svc.create_payout_for_found_block(
+            &found_block, 200, Some("fee_pool"), 1, 10.0,
+        ).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "should reject duplicate block, got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_dust_accumulates_across_multiple_rounds() {
+        // Verify that dust_balances grow additively across multiple payout rounds
+        // (additive-only ledger: dust is never decremented).
+        let f = NamedTempFile::new().unwrap();
+        let db_path = f.path().to_path_buf();
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+
+            // Workers
+            setup.execute_batch(
+                "INSERT INTO workers (id, payout_address) VALUES (1, 'big_miner');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'small_miner');"
+            ).unwrap();
+
+            // Two rounds
+            setup.execute_batch(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open');
+                 INSERT INTO rounds (id, start_template_id, status) VALUES (2, 200, 'open');"
+            ).unwrap();
+
+            // === Round 1 shares ===
+            // Big miner: diff 8.0 (80%)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (1, 1, 's1', 'j1', 100, 1, 'e1', 'en2', 'ntime', 'nonce', 8.0, 'dk1')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (1, 1, 's1', 1, 'j1', 1, 'dk1', 'accepted', 1, 0, '2026-01-01T12:00:00')",
+                [],
+            ).unwrap();
+
+            // Small miner: diff 2.0 (20%)
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (2, 2, 's2', 'j2', 100, 2, 'e1', 'en2', 'ntime', 'nonce', 2.0, 'dk2')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (2, 2, 's2', 2, 'j2', 1, 'dk2', 'accepted', 1, 0, '2026-01-01T12:00:01')",
+                [],
+            ).unwrap();
+
+            // Block-finding share for R1 (big miner, network_target_ok=1, block_hash set)
+            let r1_hash = "00000000000000000000000000000000000000000000000000000000000000aa";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (3, 1, 's1', 'j3', 100, 3, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk3')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (3, 3, 's1', 1, 'j3', 1, 'dk3', 'accepted', 1, 1, ?1, '2026-01-01T12:00:02')",
+                rusqlite::params![r1_hash],
+            ).unwrap();
+
+            // === Round 2 shares (same distribution, later timestamps) ===
+            // Big miner: diff 8.0
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (4, 1, 's1', 'j4', 200, 4, 'e1', 'en2', 'ntime', 'nonce', 8.0, 'dk4')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (4, 4, 's1', 1, 'j4', 2, 'dk4', 'accepted', 1, 0, '2026-01-02T12:00:00')",
+                [],
+            ).unwrap();
+
+            // Small miner: diff 2.0
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (5, 2, 's2', 'j5', 200, 5, 'e1', 'en2', 'ntime', 'nonce', 2.0, 'dk5')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (5, 5, 's2', 2, 'j5', 2, 'dk5', 'accepted', 1, 0, '2026-01-02T12:00:01')",
+                [],
+            ).unwrap();
+
+            // Block-finding share for R2 (big miner, different block_hash)
+            let r2_hash = "00000000000000000000000000000000000000000000000000000000000000bb";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (6, 1, 's1', 'j6', 200, 6, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk6')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (6, 6, 's1', 1, 'j6', 2, 'dk6', 'accepted', 1, 1, ?1, '2026-01-02T12:00:02')",
+                rusqlite::params![r2_hash],
+            ).unwrap();
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let r1_hash = "00000000000000000000000000000000000000000000000000000000000000aa";
+        let r2_hash = "00000000000000000000000000000000000000000000000000000000000000bb";
+
+        // Record both found blocks
+        let found_block_1 = svc.record_found_block(
+            1, r1_hash,
+            10000, Some(1), Some(100), Some("json-rpc"),
+            1000,
+            "0000ffff0000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let found_block_2 = svc.record_found_block(
+            2, r2_hash,
+            10001, Some(1), Some(200), Some("json-rpc"),
+            1000,
+            "0000ffff0000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+
+        // Round 1 payout: small_miner gets < 500 sat → dusted
+        let _batch_1 = svc.create_payout_for_found_block(
+            &found_block_1,
+            0,        // no fee
+            None,     // no fee address
+            500,      // min_payout_sat
+            10.0,     // large n_multiplier ensures all shares in window
+        ).unwrap();
+
+        let (dust_after_1, _) = svc.payout_repo
+            .get_or_create_dust_balance("small_miner").unwrap();
+        assert!(
+            dust_after_1 > 0,
+            "small_miner should have dust after round 1, got: {dust_after_1}",
+        );
+
+        // Round 2 payout: small_miner's dust balance grows (additive-only)
+        let _batch_2 = svc.create_payout_for_found_block(
+            &found_block_2,
+            0, None, 500, 10.0,
+        ).unwrap();
+
+        let (dust_after_2, _) = svc.payout_repo
+            .get_or_create_dust_balance("small_miner").unwrap();
+        assert!(
+            dust_after_2 > dust_after_1,
+            "dust should grow across rounds (additive-only): after_1={dust_after_1}, after_2={dust_after_2}",
+        );
     }
 }
