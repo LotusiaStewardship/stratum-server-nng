@@ -129,6 +129,7 @@ pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> anyhow::R
         extended_metadata_hash,
         block_size,
         block_bytes: template.block.clone(),
+        coinbase_value: template.coinbase_value,
     })
 }
 

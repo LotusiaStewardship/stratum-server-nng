@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 use super::{
     ShareRepository, WorkerRepository, RoundRepository,
-    FoundBlockRepository, AccountingEventRepository,
+    FoundBlockRepository, AccountingEventRepository, PayoutRepository,
     Share, ShareOutcome, Round, AccountingEvent, FoundBlock,
 };
 
@@ -21,6 +21,8 @@ pub struct AccountingService {
     pub round_repo: RoundRepository,
     pub event_repo: AccountingEventRepository,
     pub found_block_repo: FoundBlockRepository,
+    pub payout_repo: PayoutRepository,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl AccountingService {
@@ -31,6 +33,8 @@ impl AccountingService {
             round_repo: RoundRepository::new(conn.clone()),
             event_repo: AccountingEventRepository::new(conn.clone()),
             found_block_repo: FoundBlockRepository::new(conn.clone()),
+            payout_repo: PayoutRepository::new(conn.clone()),
+            conn,
         }
     }
 
@@ -234,9 +238,12 @@ impl AccountingService {
         worker_id: Option<i64>,
         template_id: Option<i64>,
         persist_source: Option<&str>,
+        coinbase_value: i64,
+        network_target_hex: &str,
     ) -> Result<FoundBlock> {
         let block = self.found_block_repo.record_found_block(
             round_id, block_hash, height, worker_id, template_id, persist_source,
+            coinbase_value, network_target_hex,
         )?;
         // Record accounting event
         let event = AccountingEvent {
@@ -262,6 +269,211 @@ impl AccountingService {
     /// Record an accounting event.
     pub fn record_event(&self, event: &AccountingEvent) -> Result<i64> {
         self.event_repo.record_event(event)
+    }
+
+    /// Calculate PPLNS payout for a found block and create the payout batch atomically.
+    ///
+    /// 1. Reads coinbase_value and network_target_hex from the found_block record
+    /// 2. Looks up the found_at timestamp from the block's share_outcome
+    /// 3. Calculates the PPLNS window using the converted network difficulty
+    /// 4. Builds the payout plan with fee and dust
+    /// 5. Creates the payout batch, payouts, snapshots, and updates dust balances
+    /// 6. Records accounting events
+    ///
+    /// Returns the PayoutBatch ID.
+    pub fn create_payout_for_found_block(
+        &self,
+        found_block: &FoundBlock,
+        fee_bps: u32,
+        fee_address: Option<&str>,
+        min_payout_sat: i64,
+        n_multiplier: f64,
+    ) -> Result<i64> {
+        use crate::payout::pplns::calculate_pplns_window;
+        use crate::payout::plan::build_payout_plan;
+        use crate::share_processing::network_target_hex_to_difficulty;
+
+        // 1. Read the coinbase_value and network difficulty from the found_block
+        let gross_reward = found_block.coinbase_value;
+        let network_difficulty = network_target_hex_to_difficulty(&found_block.network_target_hex)
+            .unwrap_or(1.0);
+        if found_block.coinbase_value == 0 {
+            tracing::warn!(
+                hash = %found_block.block_hash,
+                "create_payout_for_found_block: coinbase_value is 0 — block reward may be unset",
+            );
+        }
+
+        let conn = self.conn.lock();
+
+        // 2. Find the found_at timestamp — the share_outcome that found this block.
+        // Query by block_hash from share_outcomes for this found block.
+        let found_at: Option<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT so.created_at
+                 FROM share_outcomes so
+                 WHERE so.block_hash = ?1
+                   AND so.status = 'accepted'
+                   AND so.network_target_ok = 1
+                 LIMIT 1"
+            )?;
+            let result = stmt.query_row(rusqlite::params![&found_block.block_hash], |row| {
+                row.get::<_, String>(0)
+            });
+            match result {
+                Ok(ts) => Some(ts),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        let found_at = match found_at {
+            Some(ts) => ts,
+            None => {
+                anyhow::bail!(
+                    "no accepted share_outcome with network_target_ok=1 for block hash {}",
+                    found_block.block_hash,
+                );
+            }
+        };
+
+        // 2. Calculate PPLNS window
+        let shares = calculate_pplns_window(&conn, &found_at, n_multiplier, network_difficulty)?;
+
+        // 3. Read existing dust balances
+        let dust_balances: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT payout_address, balance FROM dust_balances"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut balances = Vec::new();
+            for row in rows {
+                balances.push(row?);
+            }
+            balances
+        };
+
+        // 4. Build payout plan
+        let plan = build_payout_plan(
+            found_block.round_id,
+            found_block.height,
+            &found_block.block_hash,
+            network_difficulty,
+            gross_reward,
+            fee_bps,
+            fee_address,
+            min_payout_sat,
+            &dust_balances,
+            &shares,
+        );
+
+        // 5. Atomically create batch, payouts, snapshots, and update dust
+        conn.execute_batch("BEGIN TRANSACTION")?;
+
+        let result = (|| -> Result<i64> {
+            // Create payout batch
+            let batch = self.payout_repo.create_payout_batch(
+                found_block.round_id,
+                plan.gross_reward,
+                plan.pool_fee_amount,
+                plan.pool_fee_address.as_deref(),
+                plan.outputs.iter().filter(|o| o.worker_id > 0).count() as i64,
+                &plan.retry_key,
+            )?;
+            let batch_id = batch.id;
+
+            // Record individual payouts and build snapshots
+            let mut snapshots = Vec::new();
+            for output in &plan.outputs {
+                // Record payout (even zero-amount dust entries)
+                self.payout_repo.record_payout(
+                    batch_id,
+                    output.worker_id,
+                    &output.payout_address,
+                    output.amount,
+                    output.dust_carried_forward,
+                )?;
+
+                // Create snapshot entries for miner payouts (not fee output)
+                if output.worker_id > 0 && output.amount > 0 {
+                    // Find the shares for this address in the window
+                    for share in &shares {
+                        if share.payout_address == output.payout_address {
+                            snapshots.push(
+                                crate::accounting::PayoutShareSnapshot {
+                                    id: 0,
+                                    batch_id,
+                                    share_id: share.share_id,
+                                    share_outcome_id: share.share_outcome_id,
+                                    payout_address: share.payout_address.clone(),
+                                    work_units: share.difficulty,
+                                    share_created_at: share.created_at.clone(),
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Insert snapshots
+            self.payout_repo.snapshot_shares(&snapshots)?;
+
+            // Update dust balances
+            let outputs_by_addr: std::collections::BTreeMap<&str, i64> = plan.outputs
+                .iter()
+                .filter(|o| o.worker_id > 0)
+                .map(|o| (o.payout_address.as_str(), o.dust_carried_forward))
+                .collect();
+            for (addr, dust) in &outputs_by_addr {
+                if *dust > 0 {
+                    // Get existing dust balance and add new dust
+                    let (existing, _) = self.payout_repo.get_or_create_dust_balance(addr)?;
+                    let new_balance = existing + dust;
+                    self.payout_repo.update_dust_balance(addr, new_balance)?;
+                }
+            }
+            // Update total dust for addresses that had dust consumed
+            for (addr, _existing_dust) in &dust_balances {
+                if !outputs_by_addr.contains_key(addr.as_str()) {
+                    // Address had dust but no payout this round — keep existing dust
+                    continue;
+                }
+            }
+
+            // Record accounting events
+            let event = AccountingEvent {
+                id: 0,
+                event_type: "payout_batch_created".to_string(),
+                status: "pending".to_string(),
+                session_id: None,
+                worker_id: None,
+                worker_name: None,
+                payout_address: None,
+                round_id: Some(found_block.round_id),
+                template_id: None,
+                template_epoch: None,
+                job_id: None,
+                block_hash: Some(found_block.block_hash.clone()),
+                height: Some(found_block.height),
+                payload_json: None,
+            };
+            self.event_repo.record_event(&event)?;
+
+            Ok(batch_id)
+        })();
+
+        match result {
+            Ok(id) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
     }
 
     /// Reconcile confirmed found_blocks against the current chain state at startup.
@@ -465,7 +677,7 @@ mod tests {
 
         // Record a found block using the resolved round.id (NOT template_id)
         let found = svc
-            .record_found_block(round.id, "0000abc", 1292529, None, Some(42), Some("json-rpc"))
+            .record_found_block(round.id, "0000abc", 1292529, None, Some(42), Some("json-rpc"), 0, "")
             .unwrap();
 
         // The found_block.round_id must equal the resolved round.id
@@ -491,7 +703,7 @@ mod tests {
 
         // Create a round and record a found_block
         let _round = svc.get_or_create_current_round(42).unwrap();
-        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 1000, None, Some(42), Some("json-rpc")).unwrap();
+        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 1000, None, Some(42), Some("json-rpc"), 0, "").unwrap();
 
         // Reconcile with a different canonical hash at height 1000
         // The mock returns a different hash, simulating a reorg
@@ -532,7 +744,7 @@ mod tests {
 
         // Create a round and record a found_block with height above tip
         let _round = svc.get_or_create_current_round(42).unwrap();
-        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 999, None, Some(42), Some("json-rpc")).unwrap();
+        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 999, None, Some(42), Some("json-rpc"), 0, "").unwrap();
 
         // Reconcile with tip = 100 — block at height 999 is above tip
         svc.reconcile_found_blocks(100, |_height| async {
@@ -587,7 +799,7 @@ mod tests {
         let template_id: i64 = 42;
         let round = svc.resolve_round_for_template(template_id).unwrap();
         let _found = svc
-            .record_found_block(round.id, "foundblockhash", 1000, None, Some(template_id), Some("json-rpc"))
+            .record_found_block(round.id, "foundblockhash", 1000, None, Some(template_id), Some("json-rpc"), 0, "")
             .unwrap();
         svc.close_round(round.id, template_id, "found").unwrap();
 

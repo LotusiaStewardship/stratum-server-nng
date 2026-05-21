@@ -35,6 +35,9 @@ pub struct MiningJob {
     /// the header is rebuilt via `build_stratum_header` to match the hash the
     /// validator computed.
     pub block_bytes: Vec<u8>,
+    /// Total coinbase output value (subsidy + tx fees) in satoshis.
+    /// From the MiningTemplate's coinbase_value field.
+    pub coinbase_value: u64,
 }
 
 impl MiningJob {

@@ -285,6 +285,7 @@ mod tests {
             extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
             block_bytes: vec![],
+            coinbase_value: 5000000000,
         }
     }
 

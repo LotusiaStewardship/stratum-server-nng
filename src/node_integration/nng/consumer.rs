@@ -420,7 +420,7 @@ mod tests {
         )
         .unwrap();
         let repo = FoundBlockRepository::new(conn_arc.clone());
-        repo.record_found_block(1, "000000000000000000000000000000000000000000000000000000000000abc1", 1000, None, Some(42), Some("json-rpc"))
+        repo.record_found_block(1, "000000000000000000000000000000000000000000000000000000000000abc1", 1000, None, Some(42), Some("json-rpc"), 0, "")
             .unwrap();
 
         let accounting = AccountingService::new(conn_arc);
@@ -454,7 +454,7 @@ mod tests {
         )
         .unwrap();
         let repo = FoundBlockRepository::new(conn_arc.clone());
-        repo.record_found_block(1, "000000000000000000000000000000000000000000000000000000000000000a", 1000, None, Some(42), Some("json-rpc"))
+        repo.record_found_block(1, "000000000000000000000000000000000000000000000000000000000000000a", 1000, None, Some(42), Some("json-rpc"), 0, "")
             .unwrap();
 
         let accounting = AccountingService::new(conn_arc);

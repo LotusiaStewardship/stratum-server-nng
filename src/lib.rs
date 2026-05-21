@@ -5,3 +5,4 @@ pub mod accounting;
 pub mod http_api;
 pub mod shutdown;
 pub mod node_integration;
+pub mod payout;

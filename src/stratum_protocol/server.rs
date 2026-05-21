@@ -855,6 +855,8 @@ async fn handle_submit(
                                             None,
                                             Some(job.template_id as i64),
                                             Some("json-rpc"),
+                                            job.coinbase_value as i64,
+                                            &job.network_target_hex,
                                         );
                                         // Close the round: transition from 'open' to 'found'
                                         let _ = acct.close_round(round.id, template_id, "found");
@@ -971,6 +973,7 @@ mod tests {
             extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
             block_bytes: vec![],
+            coinbase_value: 5000000000,
         }
     }
 

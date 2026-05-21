@@ -69,6 +69,9 @@ mod tests {
             worker_repo: None,
             round_repo: None,
             found_block_repo: None,
+            payout_repo: None,
+            accounting_service: None,
+            payout_config: None,
             api_token: "test".to_string(),
         }))
         .await;
@@ -93,6 +96,9 @@ mod tests {
             worker_repo: None,
             round_repo: None,
             found_block_repo: None,
+            payout_repo: None,
+            accounting_service: None,
+            payout_config: None,
             api_token: "test".to_string(),
         }))
         .await;
@@ -156,6 +162,9 @@ mod tests {
             worker_repo: None,
             round_repo: None,
             found_block_repo: None,
+            payout_repo: None,
+            accounting_service: None,
+            payout_config: None,
             api_token: "test".to_string(),
         }))
         .await;

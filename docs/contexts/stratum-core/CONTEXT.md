@@ -127,7 +127,7 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 |-------|--------|
 | 1–5 | ✅ Complete |
 | 6 | ✅ Complete — JSON-RPC client, block builder, found block repo, NNG pub/sub event consumer, block reconciliation |
-| 7 | ⬜ Pending — PPLNS payout calculation |
+| 7 | ✅ Complete — PPLNS window calculation, payout plan, repositories, HTTP API, payout scheduler shell, manual trigger endpoint |
 | 8 | ⬜ Pending — Complete HTTP API (shares, blocks, payouts, pagination) |
 | 9 | ⬜ Pending — Payout signer abstraction |
 
@@ -155,6 +155,6 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 
 ## Future Considerations
 
-- Slice 7: PPLNS payout calculation
-- Slice 8: Complete HTTP API (shares, blocks, payouts, pagination)
-- Slice 9: Payout signer abstraction
+- Slice 8: Complete HTTP API (shares, share-outcomes, pagination, hashrate)
+- Slice 9: Payout signer abstraction (Signer trait, internal/external signer, batch submission)
+- Slice 7 follow-ups: FIFO dust ledger for stronger auditability, maturation check for scheduler, found_block → paid status transition

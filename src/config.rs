@@ -73,6 +73,117 @@ pub struct PoolSettings {
     /// Mining identity configuration (payout destination + optional scriptSig tag).
     /// If None or missing, lotusd defaults to OP_RETURN — block rewards are burned.
     pub mining_identity: Option<MiningIdentity>,
+    /// Pool fee configuration.
+    #[serde(default)]
+    pub fee: FeeSettings,
+    /// PPLNS payout scheme configuration.
+    #[serde(default)]
+    pub pplns: PplnsSettings,
+    /// Payout signing configuration.
+    #[serde(default)]
+    pub signing: SigningSettings,
+}
+
+/// Pool fee configuration from `[pool.fee]`.
+/// Controls fee deduction from block rewards before miner payouts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeeSettings {
+    /// Enable or disable pool fee collection.
+    #[serde(default = "default_fee_enabled")]
+    pub enabled: bool,
+    /// Fee rate in basis points (100 = 1.00%, 50 = 0.50%).
+    #[serde(default = "default_fee_bps")]
+    pub fee_bps: u32,
+    /// Lotus address for fee collection (alternative to fee_script_hex).
+    pub fee_address: Option<String>,
+    /// Raw hex-encoded output script for fee collection.
+    pub fee_script_hex: Option<String>,
+}
+
+impl Default for FeeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_fee_enabled(),
+            fee_bps: default_fee_bps(),
+            fee_address: None,
+            fee_script_hex: None,
+        }
+    }
+}
+
+/// PPLNS payout scheme configuration from `[pool.pplns]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PplnsSettings {
+    /// Difficulty-weighted PPLNS window multiplier.
+    #[serde(default = "default_pplns_n_multiplier")]
+    pub n_multiplier: f64,
+    /// Minimum miner payout threshold in satoshis.
+    #[serde(default = "default_pplns_min_payout_sat")]
+    pub min_payout_sat: i64,
+    /// Scheduler interval in seconds.
+    #[serde(default = "default_pplns_payout_interval_secs")]
+    pub payout_interval_secs: u64,
+    /// Minimum confirmations before payout-eligible.
+    #[serde(default = "default_pplns_min_confirmations")]
+    pub min_confirmations: u64,
+    /// Invalid share banning configuration.
+    #[serde(default)]
+    pub banning: BanningSettings,
+}
+
+impl Default for PplnsSettings {
+    fn default() -> Self {
+        Self {
+            n_multiplier: default_pplns_n_multiplier(),
+            min_payout_sat: default_pplns_min_payout_sat(),
+            payout_interval_secs: default_pplns_payout_interval_secs(),
+            min_confirmations: default_pplns_min_confirmations(),
+            banning: BanningSettings::default(),
+        }
+    }
+}
+
+/// Invalid share banning configuration from `[pool.pplns.banning]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BanningSettings {
+    /// Enable banning.
+    #[serde(default = "default_banning_enabled")]
+    pub enabled: bool,
+    /// Number of shares to collect before checking rejection ratio.
+    #[serde(default = "default_banning_check_threshold")]
+    pub check_threshold: u64,
+    /// Maximum allowed rejection percentage.
+    #[serde(default = "default_banning_invalid_percent")]
+    pub invalid_percent: f64,
+}
+
+impl Default for BanningSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_banning_enabled(),
+            check_threshold: default_banning_check_threshold(),
+            invalid_percent: default_banning_invalid_percent(),
+        }
+    }
+}
+
+/// Payout signing configuration from `[pool.signing]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SigningSettings {
+    /// Signing mode: "internal" or "external".
+    #[serde(default = "default_signing_mode")]
+    pub mode: String,
+    /// Private key material for internal signing (32-byte hex or WIF).
+    pub private_key: Option<String>,
+}
+
+impl Default for SigningSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_signing_mode(),
+            private_key: None,
+        }
+    }
 }
 
 /// Mining identity configuration from `[pool.mining_identity]`.
@@ -191,6 +302,20 @@ fn default_api_token() -> String {
     "devtoken".to_string()
 }
 
+fn default_fee_enabled() -> bool { true }
+fn default_fee_bps() -> u32 { 100 }
+
+fn default_pplns_n_multiplier() -> f64 { 2.0 }
+fn default_pplns_min_payout_sat() -> i64 { 546 }
+fn default_pplns_payout_interval_secs() -> u64 { 3600 }
+fn default_pplns_min_confirmations() -> u64 { 100 }
+
+fn default_banning_enabled() -> bool { true }
+fn default_banning_check_threshold() -> u64 { 50 }
+fn default_banning_invalid_percent() -> f64 { 50.0 }
+
+fn default_signing_mode() -> String { "internal".to_string() }
+
 impl Config {
     /// Load configuration from config.toml with environment variable overrides.
     pub fn load() -> Result<Self> {
@@ -247,6 +372,39 @@ impl Config {
                 payout_script_hex: None,
                 coinbase_identity: None,
             }).coinbase_identity = Some(identity);
+        }
+
+        // Pool fee env var overrides
+        if let Ok(val) = std::env::var("POOL_FEE_ENABLED") {
+            cfg.pool.fee.enabled = val == "true" || val == "1";
+        }
+        if let Ok(val) = std::env::var("POOL_FEE_BPS") {
+            if let Ok(bps) = val.parse::<u32>() {
+                cfg.pool.fee.fee_bps = bps;
+            }
+        }
+        if let Ok(addr) = std::env::var("POOL_FEE_ADDRESS") {
+            cfg.pool.fee.fee_address = Some(addr);
+        }
+
+        // PPLNS env var overrides
+        if let Ok(val) = std::env::var("POOL_PPLNS_N_MULTIPLIER") {
+            if let Ok(m) = val.parse::<f64>() {
+                cfg.pool.pplns.n_multiplier = m;
+            }
+        }
+        if let Ok(val) = std::env::var("POOL_PPLNS_MIN_PAYOUT_SAT") {
+            if let Ok(sat) = val.parse::<i64>() {
+                cfg.pool.pplns.min_payout_sat = sat;
+            }
+        }
+
+        // Signing env var overrides
+        if let Ok(mode) = std::env::var("POOL_SIGNING_MODE") {
+            cfg.pool.signing.mode = mode;
+        }
+        if let Ok(key) = std::env::var("POOL_SIGNING_PRIVATE_KEY") {
+            cfg.pool.signing.private_key = Some(key);
         }
         
         if let Ok(val) = std::env::var("DEBUG") {

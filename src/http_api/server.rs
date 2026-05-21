@@ -3,13 +3,22 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
     Router,
 };
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::accounting::{ShareRepository, WorkerRepository, RoundRepository, FoundBlockRepository};
+use axum::routing::{get, post};
+use crate::accounting::{AccountingService, ShareRepository, WorkerRepository, RoundRepository, FoundBlockRepository, PayoutRepository};
+
+/// Payout configuration needed by the trigger endpoint.
+#[derive(Clone, Debug)]
+pub struct PayoutConfig {
+    pub fee_bps: u32,
+    pub fee_address: Option<String>,
+    pub min_payout_sat: i64,
+    pub n_multiplier: f64,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,7 +27,10 @@ pub struct AppState {
     pub worker_repo: Option<WorkerRepository>,
     pub round_repo: Option<RoundRepository>,
     pub found_block_repo: Option<FoundBlockRepository>,
+    pub payout_repo: Option<PayoutRepository>,
     pub api_token: String,
+    pub accounting_service: Option<AccountingService>,
+    pub payout_config: Option<PayoutConfig>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -49,6 +61,41 @@ pub async fn auth_middleware(
     next.run(req).await
 }
 
+/// Errors that can be returned from API handlers.
+#[derive(Debug)]
+pub enum AppError {
+    NotFound(String),
+    BadRequest(String),
+    DbNotConfigured,
+    Internal(String),
+}
+
+impl axum::response::IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, body) = match self {
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            AppError::DbNotConfigured => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "database not configured".to_string())
+            }
+            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        };
+        (status, body).into_response()
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(e: anyhow::Error) -> Self {
+        AppError::Internal(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(e: rusqlite::Error) -> Self {
+        AppError::Internal(e.to_string())
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
     // Public routes (no auth required)
     let public = Router::new()
@@ -63,6 +110,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/rounds/{id}", get(crate::http_api::routes::get_round))
         .route("/api/v1/blocks", get(crate::http_api::routes::list_blocks))
         .route("/api/v1/blocks/{hash}", get(crate::http_api::routes::get_block))
+        .route("/api/v1/payouts", get(crate::http_api::routes::list_payouts))
+        .route("/api/v1/payouts/{id}", get(crate::http_api::routes::get_payout))
+        .route("/api/v1/admin/payouts/trigger/{block_hash}", post(crate::http_api::routes::trigger_payout))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -88,7 +138,10 @@ mod tests {
             worker_repo: None,
             round_repo: None,
             found_block_repo: None,
+            payout_repo: None,
             api_token: token.to_string(),
+            accounting_service: None,
+            payout_config: None,
         }
     }
 

@@ -98,6 +98,9 @@ mod tests {
             worker_repo: None,
             round_repo: None,
             found_block_repo: repo,
+            payout_repo: None,
+            accounting_service: None,
+            payout_config: None,
             api_token: "test".to_string(),
         }
     }
@@ -131,8 +134,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_blocks_with_data() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "block1", 100, None, None, None).unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None).unwrap();
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "").unwrap();
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "").unwrap();
 
         let state = test_state(Some(repo));
         let params = ListBlocksParams { status: None };
@@ -145,8 +148,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_blocks_by_status() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "block1", 100, None, None, None).unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None).unwrap();
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "").unwrap();
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "").unwrap();
         repo.mark_orphaned("block1", "reorg").unwrap();
 
         let state = test_state(Some(repo));
@@ -165,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_block_by_hash() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "blockhash123", 500, Some(42), Some(100), Some("json-rpc")).unwrap();
+        repo.record_found_block(1, "blockhash123", 500, Some(42), Some(100), Some("json-rpc"), 0, "").unwrap();
 
         let state = test_state(Some(repo));
         let response = get_block(State(state), Path("blockhash123".to_string())).await;

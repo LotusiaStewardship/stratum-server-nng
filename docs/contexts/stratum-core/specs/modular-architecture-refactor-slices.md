@@ -17,7 +17,7 @@
 | 4 | Per-Session VarDiff | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
 | 5 | Worker and Round Accounting | AFK | #3 | 1 day | ✅ Done (UBQ-aligned) |
 | 6 | Found Blocks and Reorg Handling (includes JSON-RPC submitblock) | AFK | #5 | 2 days | ✅ Done (UBQ-aligned)
-| 7 | PPLNS Payout Calculation | AFK | #6 | 2 days |
+| 7 | PPLNS Payout Calculation | AFK | #6 | 2 days | ✅ Done |
 | 8 | Complete HTTP API | AFK | #5 | 1 day |
 | 9 | Payout Signer Abstraction | HITL (needs key config) | #7 | 0.5 days |
 
@@ -780,40 +780,44 @@ CREATE TABLE found_blocks (
 
 ## Slice 7: PPLNS Payout Calculation
 
+**Status:** ✅ Completed 2026-05-20 (UBQ-aligned)
+
 ### What to build
 
 Implement PPLNS payout calculation. When a block matures, calculate miner payouts based on difficulty-weighted shares in trailing window. Support dust carry-forward.
 
 ### Acceptance criteria
 
-- [ ] PPLNS window calculation:
+- [x] PPLNS window calculation:
   - Window ends at found block's submission time (via share_outcomes.created_at)
   - Extends backward until cumulative work units = `n_multiplier × N_diff`
   - Work units = share.difficulty (P_diff at assignment time, immutable)
   - Aggregates by payout_address
   - Includes shares where `network_target_ok=false` (high-hash shares count as work)
   - Excludes orphaned shares (shares from orphaned rounds)
-- [ ] Payout plan construction:
-  - Gross reward = block subsidy (from config or node)
+- [x] Payout plan construction:
+  - Gross reward = coinbase_value from found_block record (populated from MiningJob at block-find time)
   - Fee = `gross_reward * fee_bps / 10000`
   - Net reward = gross - fee
   - Distribute net reward proportionally by work units
   - Handle remainder satoshis (distribute to largest fractional parts)
   - Dust = amounts < `min_payout_sat` (carried forward)
-- [ ] Dust tracking:
-  - Dust accumulated per address across rounds
-  - Added to next payout calculation
-- [ ] Payout batch repository:
-  - `create_payout_batch(round_id, plan) -> PayoutBatch`
-  - `record_payout(batch_id, address, amount) -> ()`
-- [ ] Payout share snapshot:
+- [x] Dust tracking:
+  - Dust accumulated per address across rounds in `dust_balances` table (balance-based, not FIFO-ledger)
+  - Added to next payout calculation as bonus work weight proportional to gross_reward
+- [x] Payout batch repository:
+  - `create_payout_batch(round_id, total_amount, pool_fee_amount, fee_address, miner_count, retry_key) -> PayoutBatch`
+  - `record_payout(batch_id, worker_id, address, amount, dust_carried_forward) -> Payout`
+- [x] Payout share snapshot:
   - Captures which shares were in the window when payout was calculated
   - Stored in `payout_share_snapshots` table
   - Created atomically with the payout batch
-- [ ] `GET /api/v1/payouts` — list payout batches
-- [ ] `GET /api/v1/payouts/{id}` — batch details with miner payouts
-- [ ] Unit tests for PPLNS calculation (deterministic, remainder distribution)
-- [ ] Integration test: full payout flow (found block → plan → batch)
+- [x] `GET /api/v1/payouts` — list payout batches
+- [x] `GET /api/v1/payouts/{id}` — batch details with miner payouts
+- [x] `POST /api/v1/admin/payouts/trigger/{block_hash}` — manual trigger endpoint
+- [x] Unit tests for PPLNS calculation (deterministic, remainder distribution)
+- [x] Integration test: full payout flow (found block → plan → batch)
+- [x] Payout scheduler shell in main.rs — interval loop polls confirmed blocks, creates pending payout batches
 
 ### Testing scope
 
@@ -833,21 +837,22 @@ Implement PPLNS payout calculation. When a block matures, calculate miner payout
 ```
 src/
 ├── payout/
-│   ├── mod.rs
-│   ├── scheme/
-│   │   ├── mod.rs          # PayoutScheme trait
-│   │   └── pplns.rs        # PPLNS implementation
-│   ├── plan.rs             # PayoutPlan struct (outputs, dust, fee)
-│   ├── window.rs           # PPLNS window calculation
-│   └── transaction.rs      # Coinbase tx construction (no signing yet)
+│   ├── mod.rs              # Re-exports pplns and plan
+│   ├── pplns.rs            # PPLNS window calculation (cumulative-difficulty, excludes orphaned rounds)
+│   └── plan.rs             # PayoutPlan struct, PayoutOutput, build_payout_plan()
 ├── accounting/
-│   ├── payout_repository.rs # Payout batch CRUD
-│   ├── payout_snapshot_repository.rs # Payout share snapshot
+│   ├── payout_repository.rs # Payout batch CRUD, individual payouts, dust balance, share snapshots
 │   └── schema.rs           # CREATE TABLE payout_batches, payouts, payout_share_snapshots, dust_balances
 └── http_api/
     └── routes/
-        └── payouts.rs      # GET /api/v1/payouts, /payouts/{id}
+        └── payouts.rs      # GET /api/v1/payouts, /payouts/{id}, POST /api/v1/admin/payouts/trigger/{block_hash}
 ```
+
+**Deviation from earlier spec:**
+- No `scheme/` subdirectory or `PayoutScheme` trait — PPLNS is the only scheme; trait extraction deferred until second scheme is added
+- Window calculation lives in `pplns.rs` (not a separate `window.rs`)
+- Payout snapshot logic is in `PayoutRepository::snapshot_shares()` (no separate `payout_snapshot_repository.rs`)
+- No `transaction.rs` — coinbase transaction construction deferred to Slice 9 (signer)
 
 ### Database schema additions
 
@@ -856,9 +861,10 @@ src/
 CREATE TABLE payout_batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     round_id INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'submitted', 'confirmed'
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'submitted', 'confirmed', 'failed'
     total_amount INTEGER NOT NULL,
-    fee_amount INTEGER NOT NULL,
+    pool_fee_amount INTEGER NOT NULL,       -- pool fee deducted from total (NOT tx fee)
+    pool_fee_address TEXT,                   -- where pool fee is sent (NULL if not configured)
     miner_count INTEGER NOT NULL,
     retry_key TEXT UNIQUE,       -- 'block_hash:num_outputs' for idempotent retry
     last_error TEXT,
@@ -911,13 +917,19 @@ CREATE TABLE dust_balances (
 
 ### Notes
 
-- **PayoutScheme trait:** Scaffold for future PPS/PROP implementations.
+- **No PayoutScheme trait yet:** PPLNS is the only payout scheme. Schema is scheme-agnostic (`payout_batches`, `payouts`, `payout_share_snapshots`, `dust_balances` are generic). A `PayoutScheme` trait can be extracted when PPS/PROP is added.
 - **No signing yet:** Payout plan constructed but not signed/submitted (Slice 9).
-- **Dust tracking:** Per-address dust accumulation for carry-forward.
-- **Payout batch retry:** `retry_key` prevents duplicate batches if scheduler retries.
+- **Dust tracking:** Per-address dust accumulation using a `dust_balances` table (balance-based). Dust is added as bonus work weight proportional to `gross_reward` in next payout calculation. Not a FIFO-ledger.
+- **Payout batch retry:** `retry_key = "{block_hash}:{num_outputs}"` with UNIQUE constraint prevents duplicate batches if scheduler retries.
 - **Payout share snapshot:** Created atomically with the payout batch. Enables post-hoc audit of which shares contributed.
 - **UBQ invariant:** Shares from orphaned rounds remain in PPLNS window (not excluded). The window is share-ID-based, not round-based.
-- **Shutdown handling:** Payout calculation must complete or rollback on shutdown (no partial payouts).
+- **Shutdown handling:** Payout calculation runs in a SQLite transaction (BEGIN/COMMIT/ROLLBACK) — completes fully or rolls back. No partial payouts.
+- **Gross reward source:** `coinbase_value` is stored on the `found_blocks` table (populated from `MiningJob.coinbase_value` at block-find time) and read by payout calculation. No hardcoded subsidy constants, no node queries at payout time. Lotus does NOT have a halving schedule — subsidy is difficulty-based (`R = a × log₂(D)`, `a = 260 LOTUS`).
+- **Payout scheduler:** Simple tokio interval loop (configurable via `pool.pplns.payout_interval_secs`, default 3600s). Not CRON-based. Creates batches with `status='pending'` — Slice 9 wires the signer to pick up pending batches.
+- **Manual trigger:** `POST /api/v1/admin/payouts/trigger/{block_hash}` kicks off payout calculation immediately for testing or operator use.
+- **Scheduler does not check maturation:** Creates payout batches for any `confirmed` block regardless of confirmation count. The `min_confirmations` config is reserved for Slice 9 when signing is added.
+- **found_block status not updated to `paid`:** After payout batch creation, found_block `status` remains `confirmed`. The `paid` transition is deferred to Slice 9.
+- **No 404/500 correlation IDs:** HTTP API returns basic 401/404/500 errors without correlation IDs (incomplete Slice 8 scope).
 
 ---
 
@@ -1121,6 +1133,11 @@ Key UBQ invariants that span multiple slices:
 | clean_jobs=true → ALL previous jobs stale | UBQ §Job | Slice 2, Slice 6 |
 | Accounting events are append-only | UBQ §Accounting Event | Slice 5 |
 | Payout share snapshot for audit | UBQ §Payout Share Snapshot | Slice 7 |
+| Dust carry-forward across rounds | UBQ §Dust | Slice 7 (dust_balances table) |
+| PPLNS window: cumulative difficulty threshold | UBQ §PPLNS Window | Slice 7 (window.rs) |
+| Payout batch retry via retry_key | UBQ §Payout Batch Retry | Slice 7 (retry_key UNIQUE constraint) |
+| Gross reward from coinbase_value | UBQ §Found Block | Slice 7 (found_blocks.coinbase_value) |
+| Lotus: difficulty-based subsidy, no halving | UBQ §Mining Template | Slice 7 (coinbase_value from template) |
 | Template epoch: monotonically increasing counter | UBQ §Template Epoch | Slice 2, Slice 6 |
 | Job ID format: `job-{template_id}-{epoch}` | UBQ §Job | Slice 2 |
 

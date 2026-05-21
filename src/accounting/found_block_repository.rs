@@ -16,6 +16,12 @@ pub struct FoundBlock {
     pub persist_source: Option<String>,
     pub orphan_reason: Option<String>,
     pub matured_at: Option<String>,
+    /// Total coinbase output value in satoshis (subsidy + tx fees).
+    /// Set from MiningJob.coinbase_value when the block is found.
+    pub coinbase_value: i64,
+    /// Network target hex string (e.g. "0000000009d01000...") at the time
+    /// the block was found. Used to compute network difficulty for PPLNS window.
+    pub network_target_hex: String,
 }
 
 #[derive(Clone)]
@@ -38,12 +44,15 @@ impl FoundBlockRepository {
         worker_id: Option<i64>,
         template_id: Option<i64>,
         persist_source: Option<&str>,
+        coinbase_value: i64,
+        network_target_hex: &str,
     ) -> Result<FoundBlock> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "INSERT INTO found_blocks
-             (round_id, block_hash, height, worker_id, template_id, persist_source, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'confirmed')"
+             (round_id, block_hash, height, worker_id, template_id, persist_source, status,
+              coinbase_value, network_target_hex)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'confirmed', ?7, ?8)"
         )?;
         stmt.execute(params![
             round_id,
@@ -52,6 +61,8 @@ impl FoundBlockRepository {
             worker_id,
             template_id,
             persist_source,
+            coinbase_value,
+            network_target_hex,
         ])?;
         let id = conn.last_insert_rowid();
         Ok(FoundBlock {
@@ -65,6 +76,8 @@ impl FoundBlockRepository {
             persist_source: persist_source.map(|s| s.to_string()),
             orphan_reason: None,
             matured_at: None,
+            coinbase_value,
+            network_target_hex: network_target_hex.to_string(),
         })
     }
 
@@ -83,7 +96,8 @@ impl FoundBlockRepository {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
-                    persist_source, orphan_reason, matured_at
+                    persist_source, orphan_reason, matured_at,
+                    coinbase_value, network_target_hex
              FROM found_blocks WHERE block_hash = ?1"
         )?;
         let block = stmt.query_row(params![block_hash], |row| {
@@ -98,6 +112,8 @@ impl FoundBlockRepository {
                 persist_source: row.get(7)?,
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
+                coinbase_value: row.get(10)?,
+                network_target_hex: row.get(11)?,
             })
         });
         match block {
@@ -114,14 +130,16 @@ impl FoundBlockRepository {
             if let Some(status) = status_filter {
                 (
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
-                            persist_source, orphan_reason, matured_at
+                            persist_source, orphan_reason, matured_at,
+                            coinbase_value, network_target_hex
                      FROM found_blocks WHERE status = ?1 ORDER BY id DESC".to_string(),
                     vec![Box::new(status.to_string())],
                 )
             } else {
                 (
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
-                            persist_source, orphan_reason, matured_at
+                            persist_source, orphan_reason, matured_at,
+                            coinbase_value, network_target_hex
                      FROM found_blocks ORDER BY id DESC".to_string(),
                     vec![],
                 )
@@ -142,6 +160,8 @@ impl FoundBlockRepository {
                 persist_source: row.get(7)?,
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
+                coinbase_value: row.get(10)?,
+                network_target_hex: row.get(11)?,
             })
         })?;
 
@@ -186,7 +206,7 @@ mod tests {
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
 
         let block = repo
-            .record_found_block(1, "0000abc", 1292529, Some(42), Some(100), Some("json-rpc"))
+            .record_found_block(1, "0000abc", 1292529, Some(42), Some(100), Some("json-rpc"), 5000000000, "0000000009d01000000000000000000000000000000000000000000000000000")
             .unwrap();
 
         assert_eq!(block.block_hash, "0000abc");
@@ -219,7 +239,7 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
 
-        repo.record_found_block(1, "0000abc", 1292529, None, None, None)
+        repo.record_found_block(1, "0000abc", 1292529, None, None, None, 0, "")
             .unwrap();
         repo.mark_orphaned("0000abc", "reorg_detected").unwrap();
 
@@ -238,9 +258,9 @@ mod tests {
 
         assert!(repo.list(None).unwrap().is_empty());
 
-        repo.record_found_block(1, "block1", 100, None, None, None)
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
             .unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None)
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "")
             .unwrap();
 
         assert_eq!(repo.list(None).unwrap().len(), 2);
@@ -254,9 +274,9 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
 
-        repo.record_found_block(1, "block1", 100, None, None, None)
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
             .unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None)
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "")
             .unwrap();
         repo.mark_orphaned("block1", "reorg").unwrap();
 
@@ -277,11 +297,11 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
 
-        repo.record_found_block(1, "samehash", 100, None, None, None)
+        repo.record_found_block(1, "samehash", 100, None, None, None, 0, "")
             .unwrap();
 
         let err = repo
-            .record_found_block(1, "samehash", 101, None, None, None)
+            .record_found_block(1, "samehash", 101, None, None, None, 0, "")
             .unwrap_err();
         assert!(
             err.to_string().contains("UNIQUE"),

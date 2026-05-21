@@ -138,6 +138,74 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_found_blocks_status ON found_blocks(status);
         CREATE INDEX IF NOT EXISTS idx_found_blocks_hash ON found_blocks(block_hash);
+
+        -- Add coinbase_value and network_target_hex to found_blocks (migration-safe)
+        -- These are populated when a block is found and used by PPLNS payout calculation.
+        ALTER TABLE found_blocks ADD COLUMN coinbase_value INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE found_blocks ADD COLUMN network_target_hex TEXT NOT NULL DEFAULT '';
+
+        -- payout_batches table (per UBQ §Payout Batch)
+        CREATE TABLE IF NOT EXISTS payout_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'submitted', 'confirmed', 'failed'
+            total_amount INTEGER NOT NULL,
+            pool_fee_amount INTEGER NOT NULL,
+            pool_fee_address TEXT,
+            miner_count INTEGER NOT NULL,
+            retry_key TEXT UNIQUE,
+            last_error TEXT,
+            next_retry_at DATETIME,
+            attempt_count INTEGER DEFAULT 0,
+            signed_payload_ref TEXT,
+            submitted_txid TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (round_id) REFERENCES rounds(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_payout_batches_round ON payout_batches(round_id);
+        CREATE INDEX IF NOT EXISTS idx_payout_batches_status ON payout_batches(status);
+
+        -- payouts table (individual miner payment within a batch)
+        CREATE TABLE IF NOT EXISTS payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
+            payout_address TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            dust_carried_forward INTEGER DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (batch_id) REFERENCES payout_batches(id),
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_payouts_batch ON payouts(batch_id);
+        CREATE INDEX IF NOT EXISTS idx_payouts_address ON payouts(payout_address);
+
+        -- payout_share_snapshots table (auditable record of which shares were paid)
+        CREATE TABLE IF NOT EXISTS payout_share_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            share_id INTEGER NOT NULL,
+            share_outcome_id INTEGER NOT NULL,
+            payout_address TEXT NOT NULL,
+            work_units REAL NOT NULL,
+            share_created_at DATETIME NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (batch_id) REFERENCES payout_batches(id),
+            FOREIGN KEY (share_id) REFERENCES shares(id),
+            FOREIGN KEY (share_outcome_id) REFERENCES share_outcomes(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshots_batch ON payout_share_snapshots(batch_id);
+
+        -- dust_balances table (per-address dust carry-forward tracking)
+        CREATE TABLE IF NOT EXISTS dust_balances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payout_address TEXT NOT NULL UNIQUE,
+            balance INTEGER NOT NULL DEFAULT 0,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         ",
     )?;
     Ok(())

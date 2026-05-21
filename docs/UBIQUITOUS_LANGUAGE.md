@@ -233,13 +233,13 @@ Sub-satoshi or sub-threshold amounts that cannot be paid out individually. Dust:
 - Is added to future payout calculations
 - Is never discarded (unless explicitly configured)
 
-**Dust Ledger:** Dust is tracked in a `payout_dust_ledger` table with per-address FIFO ordering. When dust is paid out (accumulated above min_payout), the oldest dust entries are consumed first via `reduce_dust_ledger(address, amount)`. This ensures fair and auditable dust accounting.
+**Dust Ledger (as implemented):** Dust is tracked in a `dust_balances` table with per-address balance. Accumulated dust is added as bonus work weight proportional to `gross_reward` in the next payout calculation. The current implementation uses a simple balance (not a FIFO-ledger) — a future improvement could add per-entry FIFO tracking for stronger auditability.
 
 ### Payout Share Snapshot
 An auditable record of which shares were in the PPLNS window when a payout was calculated. Stored in the `payout_share_snapshots` table, each entry captures:
-- share_id, payout_address, work_units, share_created_at
-- The ordering criterion used for window calculation (e.g., `share_id DESC`)
-- The truncation reason (if the window was truncated by the hard limit)
+- share_id, share_outcome_id, batch_id, payout_address, work_units, share_created_at
+- The ordering criterion used for window calculation: `share_outcomes.created_at DESC`
+- No truncation reason field (the cap is the cumulative work threshold, not a hard limit)
 
 **Key invariant:** The snapshot is created atomically with the payout batch. If the payout batch exists, its share snapshot is a complete record of what was paid.
 

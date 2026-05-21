@@ -136,7 +136,15 @@ async fn main() -> Result<()> {
         worker_repo: Some(accounting_service.worker_repo.clone()),
         round_repo: Some(accounting_service.round_repo.clone()),
         found_block_repo: Some(accounting_service.found_block_repo.clone()),
+        payout_repo: Some(accounting_service.payout_repo.clone()),
         api_token: config.api_token.clone(),
+        accounting_service: Some(accounting_service.clone()),
+        payout_config: Some(stratum_server_nng::http_api::PayoutConfig {
+            fee_bps: config.pool.fee.fee_bps,
+            fee_address: config.pool.fee.fee_address.clone(),
+            min_payout_sat: config.pool.pplns.min_payout_sat,
+            n_multiplier: config.pool.pplns.n_multiplier,
+        }),
     };
 
     // Start HTTP API server
@@ -194,8 +202,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Clone accounting service for the NNG event consumer (stratum server also needs it)
+    // Clone accounting service for NNG consumer, stratum server, and payout scheduler
     let nng_accounting = accounting_service.clone();
+    let payout_accounting = accounting_service.clone();
 
     let stratum_server = Arc::new(StratumServer::new(
         config.stratum_bind,
@@ -236,6 +245,71 @@ async fn main() -> Result<()> {
             );
         }
     }
+
+    // Payout scheduler — polls for confirmed found blocks and creates payout batches.
+    // This is the shell for Slice 7; Slice 9 will wire the signer to submit pending batches.
+    let payout_interval = std::time::Duration::from_secs(config.pool.pplns.payout_interval_secs);
+    let mut payout_shutdown_signal = shutdown.signal();
+    let payout_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(payout_interval);
+        interval.tick().await; // Skip the first immediate tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Query confirmed blocks that haven't been paid yet
+                    match payout_accounting.found_block_repo.list(Some("confirmed")) {
+                        Ok(blocks) => {
+                            for block in &blocks {
+                                // Check if a payout batch already exists for this block
+                                // by looking for the retry_key pattern
+                                let existing = payout_accounting.payout_repo.list_batches(None)
+                                    .unwrap_or_default();
+                                let already_paid = existing.iter().any(|b| {
+                                    b.retry_key.as_deref()
+                                        .map(|k| k.starts_with(&block.block_hash))
+                                        .unwrap_or(false)
+                                });
+                                if already_paid {
+                                    continue;
+                                }
+
+                                match payout_accounting.create_payout_for_found_block(
+                                    block,
+                                    config.pool.fee.fee_bps,
+                                    config.pool.fee.fee_address.as_deref(),
+                                    config.pool.pplns.min_payout_sat,
+                                    config.pool.pplns.n_multiplier,
+                                ) {
+                                    Ok(batch_id) => {
+                                        tracing::info!(
+                                            hash = %block.block_hash,
+                                            batch_id = batch_id,
+                                            "payout batch created by scheduler",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            hash = %block.block_hash,
+                                            error = %e,
+                                            "payout scheduler failed to create batch",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "payout scheduler query failed");
+                        }
+                    }
+                }
+                _ = payout_shutdown_signal.recv() => {
+                    info!("payout scheduler shutting down");
+                    break;
+                }
+            }
+        }
+    });
+    shutdown.register_task(payout_handle);
 
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {
