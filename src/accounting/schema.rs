@@ -131,6 +131,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             persist_source TEXT,
             orphan_reason TEXT,
             matured_at DATETIME,
+            coinbase_value INTEGER NOT NULL DEFAULT 0,
+            network_target_hex TEXT NOT NULL DEFAULT '',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (round_id) REFERENCES rounds(id),
             FOREIGN KEY (worker_id) REFERENCES workers(id)
@@ -138,11 +140,6 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_found_blocks_status ON found_blocks(status);
         CREATE INDEX IF NOT EXISTS idx_found_blocks_hash ON found_blocks(block_hash);
-
-        -- Add coinbase_value and network_target_hex to found_blocks (migration-safe)
-        -- These are populated when a block is found and used by PPLNS payout calculation.
-        ALTER TABLE found_blocks ADD COLUMN coinbase_value INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE found_blocks ADD COLUMN network_target_hex TEXT NOT NULL DEFAULT '';
 
         -- payout_batches table (per UBQ §Payout Batch)
         CREATE TABLE IF NOT EXISTS payout_batches (
@@ -210,3 +207,20 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Schema initialization must be safe to call multiple times on the same database.
+    /// This contract exists because the server may be restarted against an existing DB file.
+    #[test]
+    fn test_init_schema_idempotent() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+    }
+}
+
