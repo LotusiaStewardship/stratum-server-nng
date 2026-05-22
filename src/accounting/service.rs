@@ -505,6 +505,125 @@ impl AccountingService {
         }
     }
 
+    /// Process pending payout batches through the configured signer.
+    pub async fn process_pending_payouts(
+        &self,
+        signer: &dyn crate::payout::signer::Signer,
+        rpc_client: &crate::node_integration::JsonRpcClient,
+    ) -> Result<()> {
+        use crate::payout::plan::PayoutOutput;
+        use crate::payout::signer::SignedBatchData;
+
+        let pending = self.payout_repo.list_batches(Some("pending"))?;
+
+        for batch in &pending {
+            let Some(found_block) = self.found_block_repo.get_by_round_id(batch.round_id)?
+            else {
+                tracing::warn!(round_id = batch.round_id, "no found_block for pending batch");
+                continue;
+            };
+
+            // Resolve coinbase txid
+            let coinbase_txid = match &found_block.coinbase_txid {
+                Some(txid) => txid.clone(),
+                None => {
+                    match rpc_client.get_block(&found_block.block_hash).await {
+                        Ok(block_data) => {
+                            let tx_list = match block_data["tx"].as_array() {
+                                Some(txs) => txs,
+                                None => { tracing::warn!(hash = %found_block.block_hash, "getblock missing 'tx'"); continue; }
+                            };
+                            let cb_txid = match tx_list.first() {
+                                Some(tx_entry) => {
+                                    tx_entry.as_object()
+                                        .and_then(|o| o.get("txid").and_then(|v| v.as_str()))
+                                        .or_else(|| tx_entry.as_str())
+                                        .unwrap_or("")
+                                }
+                                None => { tracing::warn!(hash = %found_block.block_hash, "empty tx list"); continue; }
+                            };
+                            if cb_txid.is_empty() { continue; }
+                            let _ = self.found_block_repo.update_coinbase_txid(found_block.id, cb_txid);
+                            cb_txid.to_string()
+                        }
+                        Err(e) => { tracing::warn!(hash = %found_block.block_hash, error = %e, "getblock failed"); continue; }
+                    }
+                }
+            };
+
+            // Fetch coinbase output details. Lotus: vout[0] = OP_RETURN metadata,
+            // so find first non-OP_RETURN spendable output.
+            let (coinbase_amount, coinbase_vout, coinbase_script) = match rpc_client
+                .get_raw_transaction(&coinbase_txid).await
+            {
+                Ok(raw_tx) => {
+                    let vouts = match raw_tx["vout"].as_array() {
+                        Some(v) => v,
+                        None => { tracing::warn!(txid = %coinbase_txid, "no vout"); continue; }
+                    };
+                    let spendable = vouts.iter().enumerate().find(|(_idx, vout)| {
+                        let is_nulldata = vout["scriptPubKey"]["type"].as_str() == Some("nulldata");
+                        let value = vout["value"].as_f64().unwrap_or(0.0);
+                        !is_nulldata && value > 0.0
+                    });
+                    let (vout_idx, vout) = match spendable {
+                        Some(v) => v,
+                        None => { tracing::warn!(txid = %coinbase_txid, "no spendable vout"); continue; }
+                    };
+                    let value_btc = vout["value"].as_f64().unwrap_or(0.0);
+                    let script = vout["scriptPubKey"]["hex"].as_str().unwrap_or("").to_string();
+                    let amount_sat = (value_btc * 100_000_000.0) as i64;
+                    (amount_sat, vout_idx as u32, script)
+                }
+                Err(e) => { tracing::warn!(txid = %coinbase_txid, error = %e, "getrawtransaction failed"); continue; }
+            };
+
+            let payouts = match self.payout_repo.get_payouts_by_batch(batch.id) {
+                Ok(p) => p,
+                Err(e) => { tracing::warn!(batch_id = batch.id, error = %e, "load payouts failed"); continue; }
+            };
+
+            let plan = crate::payout::plan::PayoutPlan {
+                round_id: batch.round_id,
+                block_height: found_block.height,
+                block_hash: found_block.block_hash.clone(),
+                network_difficulty: 0.0,
+                total_work_units: 0.0,
+                gross_reward: batch.total_amount,
+                pool_fee_amount: batch.pool_fee_amount,
+                pool_fee_address: batch.pool_fee_address.clone(),
+                outputs: payouts.iter().map(|p| PayoutOutput {
+                    payout_address: p.payout_address.clone(),
+                    worker_id: p.worker_id,
+                    amount: p.amount,
+                    dust_carried_forward: p.dust_carried_forward,
+                }).collect(),
+                dust_carried_forward_total: 0,
+                retry_key: batch.retry_key.clone().unwrap_or_default(),
+            };
+
+            let signed_data = SignedBatchData {
+                plan,
+                coinbase_txid: coinbase_txid.clone(),
+                coinbase_vout,
+                coinbase_amount,
+                coinbase_script_pubkey_hex: coinbase_script,
+            };
+
+            match signer.sign_and_submit(&signed_data).await {
+                Ok(txid) => {
+                    let _ = self.payout_repo.mark_batch_submitted(batch.id, &txid);
+                    let _ = self.found_block_repo.update_status(found_block.id, "paid");
+                    tracing::info!(batch_id = batch.id, txid = %txid, "payout submitted");
+                }
+                Err(e) => {
+                    tracing::warn!(batch_id = batch.id, error = %e, "sign/submit failed (will retry)");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reconcile confirmed found_blocks against the current chain state at startup.
     ///
     /// For each confirmed block:

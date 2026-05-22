@@ -132,6 +132,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             orphan_reason TEXT,
             matured_at DATETIME,
             coinbase_value INTEGER NOT NULL DEFAULT 0,
+            coinbase_txid TEXT,
             network_target_hex TEXT NOT NULL DEFAULT '',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (round_id) REFERENCES rounds(id),

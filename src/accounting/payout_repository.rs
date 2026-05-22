@@ -190,6 +190,16 @@ impl PayoutRepository {
         Ok(())
     }
 
+    /// Mark a batch as submitted with the given txid.
+    pub fn mark_batch_submitted(&self, id: i64, txid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "UPDATE payout_batches SET status = 'submitted', submitted_txid = ?1 WHERE id = ?2"
+        )?;
+        stmt.execute(params![txid, id])?;
+        Ok(())
+    }
+
     /// Record an individual miner payout within a batch.
     pub fn record_payout(
         &self,

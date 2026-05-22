@@ -99,6 +99,62 @@ impl JsonRpcClient {
         }
     }
 
+    /// Get block data by hash, with transaction details (verbosity=2).
+    ///
+    /// Returns the full block JSON including the tx list. The first tx is the
+    /// coinbase transaction. Used by the payout signer to resolve coinbase txid.
+    pub async fn get_block(&self, block_hash: &str) -> Result<Value> {
+        self.call(
+            "getblock",
+            vec![
+                Value::String(block_hash.to_string()),
+                serde_json::json!(2),
+            ],
+        )
+        .await
+    }
+
+    /// Get a raw transaction by txid, with verbose details (verbosity=true).
+    ///
+    /// Returns the transaction JSON including `vout` array with `scriptPubKey`.
+    /// Used by the payout signer to get the coinbase output script and amount.
+    pub async fn get_raw_transaction(&self, txid: &str) -> Result<Value> {
+        self.call(
+            "getrawtransaction",
+            vec![
+                Value::String(txid.to_string()),
+                serde_json::json!(true),
+            ],
+        )
+        .await
+    }
+
+    /// Broadcast a signed raw transaction via `sendrawtransaction` JSON-RPC method.
+    ///
+    /// `signed_tx_hex` is the raw serialized transaction in hex encoding.
+    /// Returns the transaction ID (txid) on success.
+    pub async fn send_raw_transaction(&self, signed_tx_hex: &str) -> Result<String> {
+        let response = self
+            .call(
+                "sendrawtransaction",
+                vec![Value::String(signed_tx_hex.to_string())],
+            )
+            .await?;
+
+        match response {
+            Value::String(txid) => Ok(txid),
+            Value::Null => {
+                anyhow::bail!("sendrawtransaction returned null")
+            }
+            other => {
+                anyhow::bail!(
+                    "sendrawtransaction: unexpected response type: {}",
+                    other
+                )
+            }
+        }
+    }
+
     /// Make a generic JSON-RPC 2.0 call.
     ///
     /// Formats the request, sends it via HTTP POST with Basic Auth,

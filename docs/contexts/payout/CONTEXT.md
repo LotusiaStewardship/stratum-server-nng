@@ -1,7 +1,7 @@
 # Payout Context
 
 **Last updated:** 2026-05-22  
-**Related spec:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md)  
+**Related specs:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md), [Block Maturation Check](./specs/maturation-check.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
 ---
@@ -12,8 +12,8 @@ The **Payout** context owns PPLNS window calculation and payout plan constructio
 
 ### Boundary
 
-- **Inside:** PPLNS window computation (cumulative difficulty threshold), payout plan building (fee deduction, proportional distribution, remainder handling, dust carry-forward)
-- **Outside:** Transaction signing (Slice 9), payout batch persistence (Accounting), HTTP API triggers
+- **Inside:** PPLNS window computation (cumulative difficulty threshold), payout plan building (fee deduction, proportional distribution, remainder handling, dust carry-forward), payout transaction signing and broadcast
+- **Outside:** payout batch persistence (Accounting), HTTP API triggers
 
 ### Dependencies
 
@@ -28,7 +28,11 @@ The **Payout** context owns PPLNS window calculation and payout plan constructio
 src/payout/
 ├── mod.rs            # Re-exports
 ├── pplns.rs          # calculate_pplns_window() — cumulative difficulty threshold
-└── plan.rs           # build_payout_plan() — PayoutPlan, PayoutOutput, distribution
+├── plan.rs           # build_payout_plan() — PayoutPlan, PayoutOutput, distribution
+└── signer/
+    ├── mod.rs        # Signer trait (async), SignedBatchData
+    ├── internal.rs   # InternalSigner — builds tx with TxBuilder, signs with P2PKHSignatory, broadcasts via sendrawtransaction
+    └── external.rs   # ExternalSigner — POSTs payout plan to webhook URL, returns txid from response
 ```
 
 ### PPLNS Window Algorithm
@@ -60,8 +64,24 @@ src/payout/
 - Dust is additive-only per address (balance never decreases except on payout).
 - Payout share snapshots capture which shares were in the window at payout time for post-hoc audit.
 
-### Known Limitations (deferred to Slice 9)
+### Known Limitations
 
-- No transaction signing — payout batches are created with `status='pending'`.
-- No maturation check — schedules creates batches for any `confirmed` block regardless of confirmation count.
-- No `found_block → paid` status transition — blocks remain `confirmed` after payout batch creation.
+- **No maturation check (CRITICAL):** Blocks proceed immediately from `confirmed` to payout-eligible. Lotus requires 100 confirmations before the coinbase output is spendable. See the [maturation check spec](./specs/maturation-check.md).
+- External signer is a scaffold — no retry/poll logic for async signing workflows.
+- `pool.signing.webhook_url` config accepted but not yet exposed in all environments.
+- Signing uses `process_pending_payouts` which can be called from the scheduler loop or any trigger point.
+
+### Slice 9: Payout Signer (implemented)
+
+See the [Slice 9 spec](../stratum-core/specs/modular-architecture-refactor-slices.md#slice-9-payout-signer-abstraction) for details.
+
+The `process_pending_payouts` method on `AccountingService`:
+1. Queries `payout_batches` with `status='pending'`
+2. Loads the associated `FoundBlock` by round_id
+3. Resolves coinbase txid via `getblock` RPC (stores in `found_blocks.coinbase_txid` for reuse)
+4. Fetches coinbase output details via `getrawtransaction`
+5. Finds the first spendable (non-OP_RETURN) vout (Lotus: vout[0] is OP_RETURN metadata)
+6. Reconstructs `SignedBatchData` from DB data
+7. Calls the configured `Signer` impl
+8. On success: marks batch `submitted` with txid, transitions `found_block.status` to `paid`
+9. On failure: batch stays `pending` for retry (errors logged per-batch)

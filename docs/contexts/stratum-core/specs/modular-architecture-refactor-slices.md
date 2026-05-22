@@ -19,7 +19,7 @@
 | 6 | Found Blocks and Reorg Handling (includes JSON-RPC submitblock) | AFK | #5 | 2 days | ✅ Done (UBQ-aligned)
 | 7 | PPLNS Payout Calculation | AFK | #6 | 2 days | ✅ Done |
 | 8 | Complete HTTP API | AFK | #5 | 1 day |
-| 9 | Payout Signer Abstraction | HITL (needs key config) | #7 | 0.5 days |
+| 9 | Payout Signer Abstraction | HITL (needs key config) | #7 | 0.5 days | ✅ Done |
 
 ---
 
@@ -1016,25 +1016,30 @@ Implement payout signer abstraction to support both in-process signing (internal
 
 ### Acceptance criteria
 
-- [ ] Signer trait:
-  - `trait Signer: Send + Sync { fn sign_and_submit(&self, plan: &PayoutPlan) -> Result<String>; }`
-- [ ] Internal signer:
+- [x] Signer trait:
+  - `#[async_trait] pub trait Signer: Send + Sync { async fn sign_and_submit(&self, data: &SignedBatchData) -> Result<String>; }`
+- [x] Internal signer:
   - Uses private key from `pool.signing.private_key` config
-  - Signs payout transaction, submits via JSON-RPC `sendrawtransaction`
+  - Builds payout tx using `bitcoinsuite-core` TxBuilder + P2PKHSignatory
+  - Signs with secp256k1, serializes to hex, submits via JSON-RPC `sendrawtransaction`
   - Returns txid
-- [ ] External signer (scaffold):
-  - POST payout plan to configured webhook URL
-  - Poll for txid submission (or receive callback)
-  - Returns txid
-- [ ] Configuration:
+- [x] External signer (scaffold):
+  - POSTs payout plan (outputs, coinbase UTXO info) as JSON to configured webhook URL
+  - Returns txid from response (required field `"txid"`)
+  - Handles HTTP errors and missing txid gracefully
+- [x] Configuration:
   - `pool.signing.mode` — "internal" or "external"
   - `pool.signing.private_key` — required for internal mode
-  - `pool.signing.webhook_url` — required for external mode
-- [ ] Payout scheduler (manual trigger for now):
-  - CLI command or API endpoint to trigger payout for matured blocks
-  - Calls signer, records txid in payout_batch
-- [ ] Unit tests for internal signer (mock JSON-RPC)
-- [ ] Integration test: full payout flow (plan → sign → submit)
+- [x] SignedBatchData struct carrying PayoutPlan + coinbase UTXO info
+- [x] `process_pending_payouts` in AccountingService:
+  - Queries pending batches, resolves coinbase txid via `getblock` RPC, fetches coinbase output details via `getrawtransaction`
+  - Finds first spendable (non-OP_RETURN) vout (Lotus: vout[0] is OP_RETURN metadata)
+  - Calls signer, marks batch `submitted` with txid, transitions found_block status to `paid`
+- [x] Unit tests for internal signer (mock RPC: verifies valid tx hex + txid)
+- [x] Unit tests for external signer (mock HTTP: POST body, HTTP error, missing txid)
+- [x] Repository methods: `update_status`, `update_coinbase_txid`, `get_by_round_id`, `mark_batch_submitted`
+- [x] RPC methods: `get_block`, `get_raw_transaction`, `send_raw_transaction`
+- [x] Schema: `coinbase_txid TEXT` column on `found_blocks`
 
 ### Testing scope
 

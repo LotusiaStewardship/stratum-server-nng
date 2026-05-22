@@ -19,6 +19,9 @@ pub struct FoundBlock {
     /// Total coinbase output value in satoshis (subsidy + tx fees).
     /// Set from MiningJob.coinbase_value when the block is found.
     pub coinbase_value: i64,
+    /// Transaction ID of the coinbase transaction, set after block is confirmed.
+    /// Used by the payout signer to build the spending transaction.
+    pub coinbase_txid: Option<String>,
     /// Network target hex string (e.g. "0000000009d01000...") at the time
     /// the block was found. Used to compute network difficulty for PPLNS window.
     pub network_target_hex: String,
@@ -77,6 +80,7 @@ impl FoundBlockRepository {
             orphan_reason: None,
             matured_at: None,
             coinbase_value,
+            coinbase_txid: None,
             network_target_hex: network_target_hex.to_string(),
         })
     }
@@ -97,7 +101,7 @@ impl FoundBlockRepository {
         let mut stmt = conn.prepare(
             "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                     persist_source, orphan_reason, matured_at,
-                    coinbase_value, network_target_hex
+                    coinbase_value, coinbase_txid, network_target_hex
              FROM found_blocks WHERE block_hash = ?1"
         )?;
         let block = stmt.query_row(params![block_hash], |row| {
@@ -113,7 +117,8 @@ impl FoundBlockRepository {
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
                 coinbase_value: row.get(10)?,
-                network_target_hex: row.get(11)?,
+                coinbase_txid: row.get(11)?,
+                network_target_hex: row.get(12)?,
             })
         });
         match block {
@@ -121,6 +126,58 @@ impl FoundBlockRepository {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Find a found block by round_id.
+    /// Returns the most recent block for that round (if multiple exist).
+    pub fn get_by_round_id(&self, round_id: i64) -> Result<Option<FoundBlock>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
+                    persist_source, orphan_reason, matured_at,
+                    coinbase_value, coinbase_txid, network_target_hex
+             FROM found_blocks WHERE round_id = ?1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let block = stmt.query_row(params![round_id], |row| {
+            Ok(FoundBlock {
+                id: row.get(0)?,
+                round_id: row.get(1)?,
+                block_hash: row.get(2)?,
+                height: row.get(3)?,
+                status: row.get(4)?,
+                worker_id: row.get(5)?,
+                template_id: row.get(6)?,
+                persist_source: row.get(7)?,
+                orphan_reason: row.get(8)?,
+                matured_at: row.get(9)?,
+                coinbase_value: row.get(10)?,
+                coinbase_txid: row.get(11)?,
+                network_target_hex: row.get(12)?,
+            })
+        });
+        match block {
+            Ok(b) => Ok(Some(b)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update the status of a found block.
+    pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("UPDATE found_blocks SET status = ?1 WHERE id = ?2")?;
+        stmt.execute(params![status, id])?;
+        Ok(())
+    }
+
+    /// Set the coinbase transaction ID for a found block.
+    pub fn update_coinbase_txid(&self, id: i64, coinbase_txid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("UPDATE found_blocks SET coinbase_txid = ?1 WHERE id = ?2")?;
+        stmt.execute(params![coinbase_txid, id])?;
+        Ok(())
     }
 
     /// List found blocks, optionally filtered by status.
@@ -131,7 +188,7 @@ impl FoundBlockRepository {
                 (
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                             persist_source, orphan_reason, matured_at,
-                            coinbase_value, network_target_hex
+                            coinbase_value, coinbase_txid, network_target_hex
                      FROM found_blocks WHERE status = ?1 ORDER BY id DESC".to_string(),
                     vec![Box::new(status.to_string())],
                 )
@@ -139,7 +196,7 @@ impl FoundBlockRepository {
                 (
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                             persist_source, orphan_reason, matured_at,
-                            coinbase_value, network_target_hex
+                            coinbase_value, coinbase_txid, network_target_hex
                      FROM found_blocks ORDER BY id DESC".to_string(),
                     vec![],
                 )
@@ -161,7 +218,8 @@ impl FoundBlockRepository {
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
                 coinbase_value: row.get(10)?,
-                network_target_hex: row.get(11)?,
+                coinbase_txid: row.get(11)?,
+                network_target_hex: row.get(12)?,
             })
         })?;
 
@@ -307,6 +365,66 @@ mod tests {
             err.to_string().contains("UNIQUE"),
             "duplicate block_hash should fail with UNIQUE constraint, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_update_status_transitions() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 100);
+
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+        let block = repo
+            .record_found_block(1, "hash1", 100, None, None, None, 50000, "")
+            .unwrap();
+
+        assert_eq!(block.status, "confirmed");
+
+        repo.update_status(block.id, "paid").unwrap();
+        let updated = repo.get_by_hash("hash1").unwrap().unwrap();
+        assert_eq!(updated.status, "paid");
+    }
+
+    #[test]
+    fn test_update_coinbase_txid() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 100);
+
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+        let block = repo
+            .record_found_block(1, "hash1", 100, None, None, None, 50000, "")
+            .unwrap();
+
+        // coinbase_txid should start as None
+        assert!(block.coinbase_txid.is_none());
+
+        let expected_txid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
+        repo.update_coinbase_txid(block.id, expected_txid).unwrap();
+
+        let updated = repo.get_by_hash("hash1").unwrap().unwrap();
+        assert_eq!(updated.coinbase_txid.as_deref(), Some(expected_txid));
+    }
+
+    #[test]
+    fn test_new_block_coinbase_txid_defaults_to_null() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 100);
+
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+        let block = repo
+            .record_found_block(1, "hash1", 100, None, None, None, 50000, "")
+            .unwrap();
+
+        // New blocks should have coinbase_txid = None (NULL in DB)
+        assert!(
+            block.coinbase_txid.is_none(),
+            "coinbase_txid should be None for newly recorded blocks"
         );
     }
 }
