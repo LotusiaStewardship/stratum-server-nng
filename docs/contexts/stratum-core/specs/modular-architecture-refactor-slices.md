@@ -33,33 +33,33 @@ This slice validates the core architecture: TCP server → protocol parsing → 
 
 ### Acceptance criteria
 
-- [ ] TCP server listens on configured bind address (default `0.0.0.0:3334`)
-- [ ] Miner can connect and send `mining.subscribe`, receives proper response with session extranonce1
-- [ ] Miner can send `mining.authorize` with valid Lotus address, receives `true` response
-- [ ] Authorization events recorded to `authorization_events` table for every authorize attempt (success or failure)
-- [ ] After authorize, miner receives `mining.notify` with static job (hardcoded prevhash, coinbase, etc.)
-- [ ] Session maintains `assigned_jobs` map tracking `(job_id, P_diff, ntime)` for each dispatched `mining.notify`, capped at `MAX_ASSIGNED_JOBS_PER_SESSION` (default 128)
-- [ ] Miner can submit share via `mining.submit`, server responds with `true` (accepted) or `false` (rejected)
-- [ ] Share is persisted to SQLite `shares` table with `dedupe_key` for idempotent insertion
-- [ ] Share outcome is persisted to `share_outcomes` table with validation result
-- [ ] HTTP server listens on configured bind address (default `127.0.0.1:18080`)
-- [ ] `GET /api/v1/health` returns server status (uptime, connected miner count)
-- [ ] `GET /api/v1/stats` returns basic stats (total shares, accepted/rejected counts)
-- [ ] **Graceful shutdown on SIGINT/SIGTERM:**
-  - [ ] Server stops accepting new connections within 1s of signal
-  - [ ] Active sessions notified and closed gracefully
-  - [ ] In-flight share validations complete (max 5s timeout)
-  - [ ] All pending shares flushed to database
-  - [ ] SQLite connection closed cleanly (WAL checkpoint)
-  - [ ] Process exits within 30s total
-- [ ] **Emergency shutdown on SIGQUIT:**
-  - [ ] Immediate exit (no flush, for corrupted state recovery)
-- [ ] Unit tests for protocol parsing (valid/invalid requests)
-- [ ] Unit tests for session state machine (subscribe before authorize, assigned_jobs tracking)
-- [ ] Unit tests for authorization event recording
-- [ ] Integration test: full subscribe → authorize → submit flow
-- [ ] Integration test: deduplicate identical shares (verify dedupe_key enforcement)
-- [ ] Integration test: graceful shutdown with in-flight shares (verify persistence)
+- [x] TCP server listens on configured bind address (default `0.0.0.0:3334`)
+- [x] Miner can connect and send `mining.subscribe`, receives proper response with session extranonce1
+- [x] Miner can send `mining.authorize` with valid Lotus address, receives `true` response
+- [x] Authorization events recorded to `authorization_events` table for every authorize attempt (success or failure)
+- [x] After authorize, miner receives `mining.notify` with static job (hardcoded prevhash, coinbase, etc.)
+- [x] Session maintains `assigned_jobs` map tracking `(job_id, P_diff, ntime)` for each dispatched `mining.notify`, capped at `MAX_ASSIGNED_JOBS_PER_SESSION` (default 128)
+- [x] Miner can submit share via `mining.submit`, server responds with `true` (accepted) or `false` (rejected)
+- [x] Share is persisted to SQLite `shares` table with `dedupe_key` for idempotent insertion
+- [x] Share outcome is persisted to `share_outcomes` table with validation result
+- [x] HTTP server listens on configured bind address (default `127.0.0.1:18080`)
+- [x] `GET /api/v1/health` returns server status (uptime, connected miner count)
+- [x] `GET /api/v1/stats` returns basic stats (total shares, accepted/rejected counts)
+- [x] **Graceful shutdown on SIGINT/SIGTERM:**
+  - [x] Server stops accepting new connections within 1s of signal
+  - [x] Active sessions notified and closed gracefully
+  - [x] In-flight share validations complete (max 5s timeout)
+  - [x] All pending shares flushed to database
+  - [x] SQLite connection closed cleanly (WAL checkpoint)
+  - [x] Process exits within 30s total
+- [x] **Emergency shutdown on SIGQUIT:**
+  - [x] Immediate exit (no flush, for corrupted state recovery)
+- [x] Unit tests for protocol parsing (valid/invalid requests)
+- [x] Unit tests for session state machine (subscribe before authorize, assigned_jobs tracking)
+- [x] Unit tests for authorization event recording
+- [x] Integration test: full subscribe → authorize → submit flow
+- [x] Integration test: deduplicate identical shares (verify dedupe_key enforcement)
+- [x] Integration test: graceful shutdown with in-flight shares (verify persistence)
 
 ### Testing scope
 
@@ -329,7 +329,7 @@ Validate shares before accepting: check difficulty target, verify header hash, e
 
 ### Acceptance criteria
 
-- [ ] Share validator checks:
+- [x] Share validator checks:
   - Worker is authorized for this session
   - Job exists and is active in session's `assigned_jobs` map (not stale)
   - Submitted ntime matches frozen ntime from assigned job (ntime-mismatch check)
@@ -338,23 +338,23 @@ Validate shares before accepting: check difficulty target, verify header hash, e
   - nonce format (8 bytes, hex)
   - Share meets session P_diff target (header hash ≤ P_diff target)
   - Share meets N_diff target? (header hash ≤ N_diff target) — recorded as `network_target_ok` flag
-- [ ] Rejected shares recorded in `share_outcomes` with `reject_reason`:
+- [x] Rejected shares recorded in `share_outcomes` with `reject_reason`:
   - `unauthorized-worker` — worker not in session's authorized set
   - `stale-job` — job not in session's assigned_jobs (stale or unknown)
   - `ntime-mismatch` — submitted ntime != frozen ntime from assigned job
   - `invalid-submit-shape` — malformed extranonce2/ntime/nonce
   - `low-difficulty-share` — header hash doesn't meet P_diff target
-- [ ] Accepted shares recorded with:
+- [x] Accepted shares recorded with:
   - `status='accepted'`, `reject_reason=NULL`
   - `low_diff_ok=1` (always true for accepted)
   - `network_target_ok=0/1` (1 if hash meets N_diff — potential block found)
   - `block_hash` populated if `network_target_ok=1`
-- [ ] Share validation is synchronous (blocks response until complete)
-- [ ] Raw share (`shares` table) and outcome (`share_outcomes` table) are inserted atomically
-- [ ] Dedupe key prevents duplicate insertions (INSERT OR IGNORE)
-- [ ] `GET /api/v1/stats` includes rejection breakdown (by reason)
-- [ ] Unit tests for each validation rule
-- [ ] Integration test: submit valid/invalid shares, verify responses and persistence
+- [x] Share validation is synchronous (blocks response until complete)
+- [x] Raw share (`shares` table) and outcome (`share_outcomes` table) are inserted atomically
+- [x] Dedupe key prevents duplicate insertions (INSERT OR IGNORE)
+- [x] `GET /api/v1/stats` includes rejection breakdown (by reason)
+- [x] Unit tests for each validation rule
+- [x] Integration test: submit valid/invalid shares, verify responses and persistence
 
 ### Testing scope
 
@@ -440,24 +440,24 @@ Implement per-session VarDiff controller. Each TCP connection has independent di
 
 ### Acceptance criteria
 
-- [ ] Each session has independent `VarDiff` instance
-- [ ] VarDiff configuration from `config.toml`:
+- [x] Each session has independent `VarDiff` instance
+- [x] VarDiff configuration from `config.toml`:
   - `vardiff_min_floor` — absolute minimum (default 0.001)
   - `vardiff_initial_pct` — initial as % of network diff (default 0.01)
   - `vardiff_target_secs` — target time between shares (default 20s)
   - `vardiff_retarget_secs` — retarget interval (default 60s)
-- [ ] On session start, difficulty = `N_diff * vardiff_initial_pct`
-- [ ] P_diff is clamped to `[vardiff_min_floor, N_diff]` at all times
-- [ ] On each accepted share, record timestamp for rate calculation
-- [ ] Every `vardiff_retarget_secs`, compute new P_diff:
+- [x] On session start, difficulty = `N_diff * vardiff_initial_pct`
+- [x] P_diff is clamped to `[vardiff_min_floor, N_diff]` at all times
+- [x] On each accepted share, record timestamp for rate calculation
+- [x] Every `vardiff_retarget_secs`, compute new P_diff:
   - If share rate too fast → increase difficulty (max 1.5× per retarget)
   - If share rate too slow → decrease difficulty (min 0.67× per retarget)
   - Clamp to `[vardiff_min_floor, N_diff]`
-- [ ] Send `mining.set_difficulty` to session when P_diff changes
-- [ ] P_diff is captured in `assigned_jobs` at notify dispatch time (immutable on shares)
-- [ ] When N_diff changes (new template), VarDiff's ceiling (`N_diff`) updates immediately via `update_max()`
-- [ ] Unit tests for VarDiff retarget logic
-- [ ] Integration test: session with fast/slow shares, verify retargeting
+- [x] Send `mining.set_difficulty` to session when P_diff changes
+- [x] P_diff is captured in `assigned_jobs` at notify dispatch time (immutable on shares)
+- [x] When N_diff changes (new template), VarDiff's ceiling (`N_diff`) updates immediately via `update_max()`
+- [x] Unit tests for VarDiff retarget logic
+- [x] Integration test: session with fast/slow shares, verify retargeting
 
 ### Testing scope
 
@@ -1183,8 +1183,12 @@ All core Stratum V1 flows work. The miner connects, subscribes, authorizes, rece
 **Fix priority:** None — not needed unless extranonce rotation is added.
 
 #### `mining.set_difficulty` (server-to-client — P_diff clamp on N_diff drop)
-**Status:** 🔴 Gap — See Gap 4 in architecture review
-**Details:** When N_diff drops and a session's VarDiff ceiling contracts, P_diff is silently clamped down. The miner is NOT notified via `mining.set_difficulty`. See the architecture review for the fix.
+**Status:** ✅ Resolved (Slice 4 + remediation commits `de6581a`, `8f00e72`, `448aa82`)
+**Details:** When N_diff drops and a session's VarDiff ceiling contracts, P_diff is clamped and `mining.set_difficulty` is sent to the miner with the new value. This happens in three code paths:
+1. On each accepted share after VarDiff retarget (server.rs:299)
+2. On session start after authorization (server.rs:421)
+3. When a new job arrives and N_diff ceiling updates (server.rs:511)
+The notification is batched with the subsequent `mining.notify` into a single `write_all` to prevent TCP segment splitting.
 
 ### Future Work
 

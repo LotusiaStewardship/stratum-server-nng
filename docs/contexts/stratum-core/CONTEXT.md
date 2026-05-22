@@ -1,6 +1,6 @@
 # Stratum Core Context
 
-**Last updated:** 2026-05-19  
+**Last updated:** 2026-05-22  
 **Related spec:** [Modular Architecture Refactor](./specs/modular-architecture-refactor-slices.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -12,8 +12,8 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 
 ### Boundary
 
-- **Inside:** TCP server, protocol parsing, session state machine, share validation, VarDiff, share persistence, round accounting, HTTP API
-- **Outside:** Node integration (NNG RPC/pub-sub), payout calculation and signing, external monitoring
+- **Inside:** TCP server, protocol parsing, session state machine, share validation, VarDiff, share persistence, round accounting, PPLNS payout calculation, HTTP API
+- **Outside:** Node integration (NNG RPC/pub-sub), transaction signing (Slice 9), external monitoring
 
 ### Dependencies
 
@@ -53,7 +53,7 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 ### `http_api`
 - Axum-based REST API
 - Bearer token authentication (except `/health`)
-- Endpoints: health, stats, workers, rounds
+- Endpoints: health, stats, workers, rounds, blocks, payouts
 
 ### `node_integration`
 - NNG RPC client for lotusd communication

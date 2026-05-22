@@ -1,8 +1,13 @@
 # Modular Architecture Refactor
 
-**Status:** Draft  
+**Status:** Superseded by slices
 **Context(s):** Stratum Core, Accounting, Payout, Node Integration  
-**Date:** 2026-05-18
+**Date:** 2026-05-18  
+**Updated:** 2026-05-22  
+
+> This document is the original architecture proposal. The implementation followed the
+> [vertical slices spec](./modular-architecture-refactor-slices.md) derived from this document.
+> Implementation divergences are noted below.
 
 ## Problem
 
