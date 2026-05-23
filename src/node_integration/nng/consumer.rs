@@ -154,10 +154,10 @@ impl NngEventConsumer {
 
         // Per UBQ: ALL miningwrkchg events trigger clean_jobs=true because
         // Lotus header includes block_size, which changes with every mempool update.
-        // The reason code (NewTip/Reorg/MempoolRefresh/ManualInvalidation) is for
-        // logging and observability only — not for behavioral branching.
-        let job = match template_to_job(&template, true) {
-            Ok(job) => Arc::new(job),
+        // The reason code (NewTip/Reorg/MempoolRefresh/ManualInvalidation) is also
+        // forwarded to miners via MiningJob.reason for UX transparency.
+        let mut job = match template_to_job(&template, true) {
+            Ok(job) => job,
             Err(e) => {
                 error!(
                     error = %e,
@@ -168,6 +168,8 @@ impl NngEventConsumer {
                 return;
             }
         };
+        job.reason = miningwrkchg_reason_to_string(event.reason).to_string();
+        let job = Arc::new(job);
         self.job_cache.insert((*job).clone()).await;
 
         if self.debug {
@@ -197,6 +199,19 @@ impl NngEventConsumer {
         if self.job_tx.send(job).is_err() {
             warn!("no active session consumers for new job broadcast");
         }
+    }
+}
+
+// ---- Work change reason helpers ----
+
+/// Convert a MiningWorkChangedReason to the short string sent to miners.
+pub fn miningwrkchg_reason_to_string(reason: bitcoinsuite_bitcoind_nng::MiningWorkChangedReason) -> &'static str {
+    use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason::*;
+    match reason {
+        NewTip => "new-tip",
+        Reorg => "reorg",
+        MempoolRefresh => "mempool",
+        ManualInvalidation => "manual",
     }
 }
 
@@ -467,6 +482,30 @@ mod tests {
 
         let events = accounting.event_repo.list_by_type("found_block_orphaned", 10, 0).unwrap();
         assert!(events.is_empty(), "no orphan event should be recorded");
+    }
+
+    #[test]
+    fn test_miningwrkchg_reason_to_string_new_tip() {
+        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
+        assert_eq!(miningwrkchg_reason_to_string(MiningWorkChangedReason::NewTip), "new-tip");
+    }
+
+    #[test]
+    fn test_miningwrkchg_reason_to_string_reorg() {
+        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
+        assert_eq!(miningwrkchg_reason_to_string(MiningWorkChangedReason::Reorg), "reorg");
+    }
+
+    #[test]
+    fn test_miningwrkchg_reason_to_string_mempool() {
+        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
+        assert_eq!(miningwrkchg_reason_to_string(MiningWorkChangedReason::MempoolRefresh), "mempool");
+    }
+
+    #[test]
+    fn test_miningwrkchg_reason_to_string_manual() {
+        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
+        assert_eq!(miningwrkchg_reason_to_string(MiningWorkChangedReason::ManualInvalidation), "manual");
     }
 
     /// Stub: needs real-world NNG flatbuffer data to test the full miningwrkchg

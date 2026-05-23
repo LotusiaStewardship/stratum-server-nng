@@ -130,6 +130,7 @@ pub fn template_to_job(template: &MiningTemplate, clean_jobs: bool) -> anyhow::R
         block_size,
         block_bytes: template.block.clone(),
         coinbase_value: template.coinbase_value,
+        reason: String::new(),
     })
 }
 

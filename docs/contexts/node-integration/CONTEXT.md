@@ -48,7 +48,7 @@ src/node_integration/
 - **`template_to_job(template, clean_jobs) -> MiningJob`** — Converts a `MiningTemplate` from lotusd into a `MiningJob` ready for Stratum dispatch. Handles epoch assignment, coinbase extraction, merkle branch parsing, and block byte capture.
 - **`build_submit_block(job, extranonce1, extranonce2, ntime, nonce) -> Vec<u8>`** — Reconstructs the full serialized block for `submitblock` RPC. Replaces the template coinbase with the miner's reconstructed coinbase, builds the header via `build_stratum_header`, and updates the merkle root and size to match the validator's computation.
 - **`verify_coinbase_outputs(template)`** — Checks that the template coinbase has at least one non-OP_RETURN output. Warns at startup if all outputs are OP_RETURN (would burn block rewards).
-- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms) and `blkdisconctd` (immediate) events. Forwards new jobs via `broadcast::Sender` to all active sessions. Records orphaned found_blocks via AccountingService on `blkdisconctd`.
+- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms) and `blkdisconctd` (immediate) events. Forwards new jobs via `broadcast::Sender` to all active sessions. Injects the `MiningWorkChanged.reason` into `MiningJob.reason` before broadcast so miners receive a human-readable explanation for the work change. Records orphaned found_blocks via AccountingService on `blkdisconctd`.
 
 ### Reorg Detection
 

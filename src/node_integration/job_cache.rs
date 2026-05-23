@@ -112,6 +112,7 @@ mod tests {
             block_size: 0,
             block_bytes: vec![],
             coinbase_value: 0,
+            reason: String::new(),
         }
     }
 

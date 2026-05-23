@@ -38,11 +38,15 @@ pub struct MiningJob {
     /// Total coinbase output value (subsidy + tx fees) in satoshis.
     /// From the MiningTemplate's coinbase_value field.
     pub coinbase_value: u64,
+    /// Why the work changed (e.g., "new-tip", "reorg", "mempool", "manual").
+    /// Empty string for initial startup jobs. Always populated when triggered
+    /// by a MiningWorkChanged event (which always carries a reason).
+    pub reason: String,
 }
 
 impl MiningJob {
     pub fn notify_params(&self) -> serde_json::Value {
-        json!([
+        let mut params = json!([
             self.job_id,
             self.prevhash,
             self.coinbase1,
@@ -57,13 +61,77 @@ impl MiningJob {
             self.epoch_hash,
             self.extended_metadata_hash,
             self.block_size,
-        ])
+        ]);
+        // Params 13+: reason for work change (empty string = startup, omit from wire)
+        if !self.reason.is_empty() {
+            if let Some(arr) = params.as_array_mut() {
+                arr.push(json!(&self.reason));
+            }
+        }
+        params
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_notify_params_includes_reason_when_set() {
+        let job = MiningJob {
+            job_id: "job-890-100".to_string(),
+            template_id: 890,
+            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            coinbase1: "abc".to_string(),
+            coinbase2: "def".to_string(),
+            merkle_branches: vec!["hash1".to_string()],
+            version: "00000001".to_string(),
+            nbits: "10d0091c".to_string(),
+            ntime: "6adc0c6a0000".to_string(),
+            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
+            clean_jobs: true,
+            template_epoch: 100,
+            height: 1292529,
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
+            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            block_size: 2588,
+            block_bytes: vec![],
+            coinbase_value: 5000000000,
+            reason: "new-tip".to_string(),
+        };
+        let params = job.notify_params();
+        let arr = params.as_array().unwrap();
+        assert_eq!(arr.len(), 14);
+        assert_eq!(arr[13], "new-tip");
+    }
+
+    #[test]
+    fn test_notify_params_omits_reason_when_empty() {
+        let job = MiningJob {
+            job_id: "job-890-100".to_string(),
+            template_id: 890,
+            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            coinbase1: "abc".to_string(),
+            coinbase2: "def".to_string(),
+            merkle_branches: vec!["hash1".to_string()],
+            version: "00000001".to_string(),
+            nbits: "10d0091c".to_string(),
+            ntime: "6adc0c6a0000".to_string(),
+            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
+            clean_jobs: true,
+            template_epoch: 100,
+            height: 1292529,
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
+            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            block_size: 2588,
+            block_bytes: vec![],
+            coinbase_value: 5000000000,
+            reason: String::new(),
+        };
+        let params = job.notify_params();
+        let arr = params.as_array().unwrap();
+        assert_eq!(arr.len(), 13);
+    }
 
     #[test]
     fn test_parse_template_metadata_from_job_id_standard_format() {

@@ -429,7 +429,7 @@ Implements Stratum V1 protocol with the following methods:
 
 ### Server → Client
 
-- `mining.notify` - New mining job notification
+- `mining.notify` - New mining job notification (params[13] optionally carries work-change reason: `"new-tip"`, `"reorg"`, `"mempool"`, `"manual"`)
 - `mining.set_difficulty` - Adjust miner difficulty
 - `mining.set_extranonce` - Update extranonce range
 

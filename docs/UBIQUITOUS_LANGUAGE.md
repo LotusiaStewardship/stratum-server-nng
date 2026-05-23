@@ -283,7 +283,19 @@ An enum indicating why the mining template was invalidated. Received from lotusd
 - **MempoolRefresh:** The mempool changed (tx added/removed). Template invalid due to merkle root and block size change.
 - **ManualInvalidation:** An operator invoked an RPC to invalidate the template.
 
-**Key invariant:** Regardless of reason, ALL `miningwrkchg` events trigger `clean_jobs=true` because the Lotus header includes `block_size`, which changes with any mempool update. The reason code is for logging and observability only, not for behavioral branching.
+**Key invariant:** Regardless of reason, ALL `miningwrkchg` events trigger `clean_jobs=true` because the Lotus header includes `block_size`, which changes with any mempool update.
+
+### Work Change Reason String
+A short string included in `mining.notify` params[13] to explain why the miner received a new job. Originates from the `MiningWorkChangedReason` enum emitted by lotusd and serialized by `miningwrkchg_reason_to_string()`. Only present when a job is triggered by a `miningwrkchg` event (params array length 14); omitted for initial startup jobs (params array length 13).
+
+| Wire String | Meaning |
+|---|---|
+| `"new-tip"` | New block connected at chain tip |
+| `"reorg"` | Chain reorganization |
+| `"mempool"` | Mempool changed (tx added/removed) |
+| `"manual"` | Manual RPC invalidation |
+
+**Key invariant:** The reason string is informational only — never branch protocol behavior on it.
 
 ### Block Reconciliation
 A startup-time procedure that validates the pool's `found_blocks` against the current node state. For each found_block:
