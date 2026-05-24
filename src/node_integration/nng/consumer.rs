@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use bitcoinsuite_core::Hashed;
-use crate::accounting::{AccountingEvent, AccountingService};
+use crate::accounting::{AccountingEvent, AccountingService, ChainTip};
 use crate::node_integration::{NngRpcClient, JobCache, template_to_job};
 use crate::stratum_protocol::job::MiningJob;
 
@@ -24,6 +24,9 @@ pub struct NngEventConsumer {
     job_cache: Arc<JobCache>,
     accounting: Option<AccountingService>,
     job_tx: broadcast::Sender<Arc<MiningJob>>,
+    chain_tip: ChainTip,
+    maturation_tx: mpsc::UnboundedSender<String>,
+    min_confirmations: u64,
     debug: bool,
 }
 
@@ -35,6 +38,9 @@ impl NngEventConsumer {
         job_cache: Arc<JobCache>,
         accounting: Option<AccountingService>,
         job_tx: broadcast::Sender<Arc<MiningJob>>,
+        chain_tip: ChainTip,
+        maturation_tx: mpsc::UnboundedSender<String>,
+        min_confirmations: u64,
         debug: bool,
     ) -> Result<Self> {
         let interface = PubInterface::open(pub_url)
@@ -46,7 +52,7 @@ impl NngEventConsumer {
         interface.subscribe("blkdisconctd")
             .map_err(|e| anyhow::anyhow!("failed to subscribe to blkdisconctd: {}", e))?;
         info!(pub_url, "NNG pub/sub consumer subscribed to events");
-        Ok(Self { interface, nng_rpc, job_cache, accounting, job_tx, debug })
+        Ok(Self { interface, nng_rpc, job_cache, accounting, job_tx, chain_tip, maturation_tx, min_confirmations, debug })
     }
 
     /// Run the event loop until shutdown signal is received.
@@ -198,6 +204,43 @@ impl NngEventConsumer {
         debug!(job_id = %job.job_id, "broadcasting new job to all sessions");
         if self.job_tx.send(job).is_err() {
             warn!("no active session consumers for new job broadcast");
+        }
+
+        // Update chain tip and check maturation only on height-changing events.
+        // NewTip: tip advanced by one. Reorg: tip changed to a different height.
+        // MempoolRefresh and ManualInvalidation don't change the tip height.
+        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
+        match event.reason {
+            MiningWorkChangedReason::NewTip | MiningWorkChangedReason::Reorg => {
+                self.chain_tip.update_block_connected(event.height as u64);
+                let tip = self.chain_tip.get() as i64;
+                if let Some(ref acct) = self.accounting {
+                    match acct.check_maturation(tip, self.min_confirmations) {
+                        Ok(matured_blocks) => {
+                            for matured in &matured_blocks {
+                                debug!(
+                                    hash = %matured.block_hash,
+                                    height = matured.height,
+                                    "block matured, sending payout event",
+                                );
+                                let _ = self.maturation_tx.send(matured.block_hash.clone());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "maturation check failed after miningwrkchg",
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    reason = ?event.reason,
+                    "skipping maturation check — not a height-changing event",
+                );
+            }
         }
     }
 }
@@ -478,7 +521,7 @@ mod tests {
         handle_block_disconnected(event, &accounting).await;
 
         let found = accounting.found_block_repo.get_by_hash("000000000000000000000000000000000000000000000000000000000000000a").unwrap().unwrap();
-        assert_eq!(found.status, "confirmed", "known block should NOT be orphaned");
+        assert_eq!(found.status, "immature", "known block should NOT be orphaned");
 
         let events = accounting.event_repo.list_by_type("found_block_orphaned", 10, 0).unwrap();
         assert!(events.is_empty(), "no orphan event should be recorded");

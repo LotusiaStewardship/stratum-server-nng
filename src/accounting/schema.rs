@@ -124,7 +124,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             round_id INTEGER NOT NULL,
             block_hash TEXT NOT NULL UNIQUE,
             height INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'confirmed',
+            status TEXT NOT NULL DEFAULT 'immature',
             worker_id INTEGER,
             template_id INTEGER,
             extranonce1 TEXT,

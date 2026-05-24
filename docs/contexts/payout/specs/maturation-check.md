@@ -1,6 +1,6 @@
 # Block Maturation Check for Payout Eligibility
 
-**Status:** Draft
+**Status:** Final
 **Context(s):** Payout, Accounting, Node Integration
 **Date:** 2026-05-22
 
@@ -48,16 +48,31 @@ The consumer updates the shared height from two sources, both carrying `LotusHea
 
 This keeps the height accurate at all times, even during rapid reorgs where multiple disconnect/connect events interleave before a `miningwrkchg` fires.
 
-### Scheduler flow
+### Event-driven flow (implemented)
 
-Each scheduler tick:
+Payout automation is now event-driven, eliminating the timer-based scheduler:
 
-1. Read `latest_height` from the shared `AtomicU64` (populated by the NNG consumer)
-2. Query `found_blocks` with `status = 'immature'`
-3. For each, compute `confirmations = latest_height - block.height + 1`
-4. If `confirmations >= config.pool.pplns.min_confirmations`, call `mark_matured(id)`
-5. Query `found_blocks` with `status = 'matured'` and create payout batches (existing logic)
-6. Call `process_pending_payouts` to sign pending batches (existing Slice 9 logic)
+1. On each `MiningWorkChanged` event (fires for every new block, reason `NewTip`):
+   - Update the shared `ChainTip` with the event's `height` field
+   - Call `AccountingService::check_maturation(tip_height, min_confirmations)`
+2. `check_maturation`:
+   - Queries `found_blocks` with `status = 'immature'`
+   - For each, computes `confirmations = latest_height - block.height + 1`
+   - If `confirmations >= min_confirmations`, calls `mark_matured(id)`
+   - Returns the list of newly matured blocks
+3. For each newly matured block, send its hash through the maturation event channel
+4. The `PayoutHandler` task (gated by `pplns.payout_enabled`):
+   - Receives the block hash
+   - Creates a payout batch via `create_payout_for_found_block`
+   - Calls `process_pending_payouts` to sign and submit pending batches
+5. Startup reconciliation: after `getblockcount`, runs `check_maturation` for blocks that matured while offline
+
+When `payout_enabled = false`, blocks accumulate at `matured` status for manual processing.
+
+See also:
+- [`ChainTip`](../../../UBIQUITOUS_LANGUAGE.md#chaintip)
+- [`PayoutHandler`](../../../UBIQUITOUS_LANGUAGE.md#payouthandler)
+- [`check_maturation` on AccountingService](../../../../src/accounting/service.rs)
 
 ### Schema changes
 

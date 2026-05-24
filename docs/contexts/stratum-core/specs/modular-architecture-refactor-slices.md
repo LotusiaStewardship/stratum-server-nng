@@ -1041,33 +1041,54 @@ Implement payout signer abstraction to support both in-process signing (internal
 - [x] RPC methods: `get_block`, `get_raw_transaction`, `send_raw_transaction`
 - [x] Schema: `coinbase_txid TEXT` column on `found_blocks`
 
+### Additional acceptance criteria (Slice 9 completion)
+
+- [x] Block lifecyle migration: `confirmed` → `immature` as initial status, `mark_matured()` repository method
+- [x] `ChainTip` runtime type: `Arc<AtomicU64>` wrapper, updated on each `MiningWorkChanged` event
+- [x] `AccountingService::check_maturation`: queries `immature` blocks, computes confirmations, promotes to `matured`
+- [x] Event-driven payout: maturation events sent via `mpsc::UnboundedChannel` on each `MiningWorkChanged`
+- [x] `PayoutHandler`: replaces timer-based scheduler, creates batches + signs on maturation events
+- [x] Signer wiring: `InternalSigner`/`ExternalSigner` constructed in `main.rs` from config, passed to `PayoutHandler`
+- [x] Startup reconciliation: `check_maturation` runs at startup to catch blocks matured while offline
+- [x] Config: `pplns.payout_enabled` gates automatic payouts, `payout_interval_secs` removed
+- [x] Config: `pool.signing.webhook_url` for external signer mode
+- [x] NNG consumer wired: `ChainTip` + maturation check in `on_mining_work_changed` handler
+
 ### Testing scope
 
 **Test:**
 - Internal signer (transaction construction, signing)
 - JSON-RPC submission (mocked)
 - Configuration validation (mode, key presence)
+- ChainTip: BlockConnected advances, BlockDisconnected at tip decrements, below tip noop
+- `check_maturation`: below threshold stays immature, at/above threshold matures
+- FoundBlock repository: `mark_matured`, `immature` default status
 
 **Don't test:**
 - External signer webhook (scaffold only)
-- Payout scheduling automation (manual trigger only)
 
 ### Module structure
 
 ```
 src/
 └── payout/
-    └── signer/
-        ├── mod.rs          # Signer trait
-        ├── internal.rs     # Internal key signer
-        └── external.rs     # External webhook signer (scaffold)
+    ├── signer/
+    │   ├── mod.rs          # Signer trait, SignedBatchData
+    │   ├── internal.rs     # Internal key signer
+    │   └── external.rs     # External webhook signer (scaffold)
+    └── handler.rs          # PayoutHandler (event-driven batch creation + signing)
+src/
+└── accounting/
+    ├── chain_tip.rs        # ChainTip (shared tip tracker)
+    └── service.rs          # check_maturation()
 ```
 
 ### Notes
 
-- **HITL:** Requires human to configure private key or webhook URL.
-- **Manual trigger:** No automatic scheduling — operator triggers payout manually.
-- **External signer scaffold:** Basic structure, can be fleshed out later.
+- **Payouts are now event-driven** via `MiningWorkChanged` instead of timer-based polling.
+- **`payout_enabled` gates** automatic batch creation — disable for future payout schemes (PPS, etc.).
+- **External signer scaffold:** Basic structure, full retry/poll logic can be fleshed out later.
+- **Maturation tracking is always active** regardless of `payout_enabled` — blocks always progress through `immature → matured`.
 
 ---
 

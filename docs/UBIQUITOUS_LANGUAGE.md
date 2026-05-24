@@ -166,8 +166,9 @@ The work period between any two blocks (pool or external). Used for accounting g
 A block discovered by the pool via miner submission and accepted by the network. A found block has:
 - Block hash and height
 - Associated round ID (exactly one round per found block)
-- Status lifecycle: confirmed → matured → paid, or orphaned
+- Status lifecycle: immature → matured → paid, or orphaned
 - Template ID and worker who submitted the winning share
+- `coinbase_txid`: cached txid of the coinbase transaction, populated when the payout signer resolves it
 
 **Key invariant:** A found block's status can change due to blockchain reorgs. Orphaned blocks are logged but do NOT invalidate shares. Shares from orphaned rounds remain in the PPLNS window and contribute to the next found block's payout calculation. The pool's fee covers orphan risk over time (typical orphan rate: 0.5-1% of blocks).
 
@@ -298,12 +299,29 @@ A short string included in `mining.notify` params[13] to explain why the miner r
 **Key invariant:** The reason string is informational only — never branch protocol behavior on it.
 
 ### Block Reconciliation
-A startup-time procedure that validates the pool's `found_blocks` against the current node state. For each found_block:
+A startup-time procedure that validates the pool's `found_blocks` against the current node state. Queries `found_blocks` with `status='immature'` and checks each block's canonical hash via `getblockhash` RPC. For each found_block:
 1. Fetch the node's block at the same height
 2. Compare hashes — if mismatch, mark as orphaned with reason `reorg_detected`
 3. If node has no block at that height, mark as orphaned with reason `block_not_found`
 
 **Key invariant:** Reconciliation runs once at startup before accepting miner connections. It ensures the pool's found_blocks are consistent with the canonical chain.
+
+### ChainTip
+A runtime tracker of the latest known chain tip height, implemented as a newtype over `Arc<AtomicU64>`. Updated on each `MiningWorkChanged` event with `NewTip` or `Reorg` reason via `event.height`. Shared between the NNG event consumer (updater) and the `AccountingService::check_maturation` (reader). Initial value is 0, which is harmless since no blocks exist before the first template refresh.
+
+### PayoutHandler
+Event-driven task spawned in `main.rs` that receives maturation events (block hashes) via an `mpsc::UnboundedReceiver`. For each event:
+- Looks up the `FoundBlock` from the DB
+- Creates a PPLNS payout batch via `create_payout_for_found_block` (if one doesn't already exist)
+- Calls `process_pending_payouts` to sign and submit via the configured `Signer`
+
+Gated by `pplns.payout_enabled` — when disabled, the handler is not spawned and blocks accumulate at `matured` status.
+
+### MaturationEvent
+A message sent through an `mpsc::UnboundedSender<String>` channel when a block transitions from `immature` to `matured`. Carries the block hash. Produced by the NNG consumer's `MiningWorkChanged` handler, consumed by the `PayoutHandler`.
+
+### matured_at
+A `DATETIME` column on the `found_blocks` table, set to `CURRENT_TIMESTAMP` by `FoundBlockRepository::mark_matured` when a block reaches `min_confirmations` confirmations. Null until the block matures.
 
 ## Accounting Terms
 
@@ -322,11 +340,12 @@ Status applied to found blocks when they reach minimum confirmations (default: 1
 - Have coinbase locked per consensus rules
 - Can be safely paid without reorg risk (beyond configured tolerance)
 
-### Confirmed
-Status applied to found blocks that are on canonical chain but not yet matured. Confirmed blocks:
-- Have `confirmations = tip_height - block_height + 1`
-- Accumulate confirmations as chain extends
-- Transition to matured at confirmation threshold
+### Immature
+Initial status of a found block after successful lotusd submission. Immature blocks:
+- Have not yet reached `min_confirmations` confirmations (default: 100)
+- Have coinbase output locked by consensus rule — not yet spendable
+- Accumulate confirmations as the chain extends
+- Transition to `matured` once `confirmations >= min_confirmations`
 
 ### Scheduler Lease
 An exclusive lock stored in the database that prevents double-payouts in HA (high-availability) deployments. One pool instance holds the lease at a time:

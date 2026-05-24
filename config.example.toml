@@ -7,7 +7,8 @@
 # Safety notes:
 # - The pool payout script must be explicit.
 # - Do not leave it as OP_RETURN / nulldata.
-# - `pool.signing.private_key` is only for the in-process signer path.
+# - `pool.signing.private_key` is only for the internal signing mode.
+# - Use external signing mode when you want remote key management.
 # - Prefer keeping private keys out of the stratum process when you can.
 # -----------------------------------------------------------------------------
 
@@ -273,9 +274,9 @@ n_multiplier = 2.0
 # Outputs below this are filtered out rather than producing dust.
 min_payout_sat = 546
 
-# Scheduler interval, in seconds.
-# The scheduler checks for matured found blocks and produces payout batches on this cadence.
-payout_interval_secs = 3600
+# Automatically create and sign payout batches when blocks mature.
+# Set false for manual payout processing or future payout schemes (e.g. PPS).
+payout_enabled = true
 
 # Minimum confirmations required before a found block becomes payout-eligible.
 # The code also enforces a hard coinbase maturity baseline of 100 blocks.
@@ -292,10 +293,9 @@ invalid_percent = 50.0
 
 [pool.signing]
 # Signing mode for payout batches.
-# Currently supported first-draft mode:
+# Supported modes:
 # - internal: sign inside the pool process using `private_key`
-#
-# Other modes are reserved for future transport integrations.
+# - external: delegate signing to a remote webhook service
 mode = "internal"
 
 # Private key material for internal signing.
@@ -309,6 +309,12 @@ mode = "internal"
 # - testnet:  Testnet WIF (9/c prefix)
 # - regtest:  Regtest WIF (9/c prefix)
 private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+# Webhook URL for external signing mode.
+# Required when mode = "external". The external service receives the payout
+# plan as JSON and is responsible for building, signing, and broadcasting
+# the coinbase-spending transaction. It must return {"txid": "..."}.
+# webhook_url = "https://signer.example.com/api/sign"
 
 
 # lotusd JSON-RPC endpoint used for raw transaction broadcast.

@@ -120,9 +120,10 @@ pub struct PplnsSettings {
     /// Minimum miner payout threshold in satoshis.
     #[serde(default = "default_pplns_min_payout_sat")]
     pub min_payout_sat: i64,
-    /// Scheduler interval in seconds.
-    #[serde(default = "default_pplns_payout_interval_secs")]
-    pub payout_interval_secs: u64,
+    /// Automatically create and sign payout batches when blocks mature.
+    /// Set to false for manual processing or future payout schemes.
+    #[serde(default = "default_pplns_payout_enabled")]
+    pub payout_enabled: bool,
     /// Minimum confirmations before payout-eligible.
     #[serde(default = "default_pplns_min_confirmations")]
     pub min_confirmations: u64,
@@ -136,7 +137,7 @@ impl Default for PplnsSettings {
         Self {
             n_multiplier: default_pplns_n_multiplier(),
             min_payout_sat: default_pplns_min_payout_sat(),
-            payout_interval_secs: default_pplns_payout_interval_secs(),
+            payout_enabled: default_pplns_payout_enabled(),
             min_confirmations: default_pplns_min_confirmations(),
             banning: BanningSettings::default(),
         }
@@ -175,6 +176,9 @@ pub struct SigningSettings {
     pub mode: String,
     /// Private key material for internal signing (32-byte hex or WIF).
     pub private_key: Option<String>,
+    /// Webhook URL for external signing mode.
+    /// Required when mode = "external".
+    pub webhook_url: Option<String>,
 }
 
 impl Default for SigningSettings {
@@ -182,6 +186,7 @@ impl Default for SigningSettings {
         Self {
             mode: default_signing_mode(),
             private_key: None,
+            webhook_url: None,
         }
     }
 }
@@ -307,7 +312,7 @@ fn default_fee_bps() -> u32 { 100 }
 
 fn default_pplns_n_multiplier() -> f64 { 2.0 }
 fn default_pplns_min_payout_sat() -> i64 { 546 }
-fn default_pplns_payout_interval_secs() -> u64 { 3600 }
+fn default_pplns_payout_enabled() -> bool { true }
 fn default_pplns_min_confirmations() -> u64 { 100 }
 
 fn default_banning_enabled() -> bool { true }

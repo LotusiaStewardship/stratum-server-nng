@@ -12,7 +12,9 @@ use stratum_server_nng::http_api::{self, AppState, ServerStats};
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job, JsonRpcClient};
 use stratum_server_nng::stratum_protocol::server::StratumServer;
-use stratum_server_nng::accounting::{init_schema, AccountingService};
+use stratum_server_nng::accounting::{init_schema, AccountingService, ChainTip};
+use stratum_server_nng::payout::handler::PayoutHandler;
+use stratum_server_nng::payout::signer::{Signer, internal::InternalSigner, external::ExternalSigner};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -202,7 +204,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Clone accounting service for NNG consumer, stratum server, and payout scheduler
     let nng_accounting = accounting_service.clone();
     let payout_accounting = accounting_service.clone();
 
@@ -219,7 +220,11 @@ async fn main() -> Result<()> {
     // Validates the integration path for future template refreshes (Slice 6).
     stratum_server.notify_new_job(&job).await;
 
-    // Start NNG pub/sub event consumer (template refresh, reorg detection)
+    // Create shared chain tip tracker and maturation event channel
+    let chain_tip = ChainTip::new(0);
+    let (maturation_tx, maturation_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Start NNG pub/sub event consumer (template refresh, reorg detection, maturation)
     let consumer_shutdown_rx = shutdown_tx.subscribe();
     match stratum_server_nng::node_integration::NngEventConsumer::new(
         &config.nng_pub_url,
@@ -227,6 +232,9 @@ async fn main() -> Result<()> {
         job_cache.clone(),
         Some(nng_accounting),
         stratum_server.job_tx(),
+        chain_tip.clone(),
+        maturation_tx.clone(),
+        config.pool.pplns.min_confirmations,
         config.debug,
     ) {
         Ok(consumer) => {
@@ -246,70 +254,89 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Payout scheduler — polls for confirmed found blocks and creates payout batches.
-    // This is the shell for Slice 7; Slice 9 will wire the signer to submit pending batches.
-    let payout_interval = std::time::Duration::from_secs(config.pool.pplns.payout_interval_secs);
-    let mut payout_shutdown_signal = shutdown.signal();
-    let payout_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(payout_interval);
-        interval.tick().await; // Skip the first immediate tick
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Query confirmed blocks that haven't been paid yet
-                    match payout_accounting.found_block_repo.list(Some("confirmed")) {
-                        Ok(blocks) => {
-                            for block in &blocks {
-                                // Check if a payout batch already exists for this block
-                                // by looking for the retry_key pattern
-                                let existing = payout_accounting.payout_repo.list_batches(None)
-                                    .unwrap_or_default();
-                                let already_paid = existing.iter().any(|b| {
-                                    b.retry_key.as_deref()
-                                        .map(|k| k.starts_with(&block.block_hash))
-                                        .unwrap_or(false)
-                                });
-                                if already_paid {
-                                    continue;
-                                }
-
-                                match payout_accounting.create_payout_for_found_block(
-                                    block,
-                                    config.pool.fee.fee_bps,
-                                    config.pool.fee.fee_address.as_deref(),
-                                    config.pool.pplns.min_payout_sat,
-                                    config.pool.pplns.n_multiplier,
-                                ) {
-                                    Ok(batch_id) => {
-                                        tracing::info!(
-                                            hash = %block.block_hash,
-                                            batch_id = batch_id,
-                                            "payout batch created by scheduler",
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            hash = %block.block_hash,
-                                            error = %e,
-                                            "payout scheduler failed to create batch",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "payout scheduler query failed");
+    // Startup maturation reconciliation: check blocks that matured while offline
+    info!("checking for newly matured blocks at startup");
+    {
+        let rpc = json_rpc_client.clone();
+        match rpc.getblockcount().await {
+            Ok(tip_height) => {
+                let tip = tip_height as i64;
+                match payout_accounting.check_maturation(tip, config.pool.pplns.min_confirmations) {
+                    Ok(matured) => {
+                        for block in &matured {
+                            info!(
+                                hash = %block.block_hash,
+                                height = block.height,
+                                "block matured during startup reconciliation",
+                            );
+                            let _ = maturation_tx.send(block.block_hash.clone());
                         }
                     }
-                }
-                _ = payout_shutdown_signal.recv() => {
-                    info!("payout scheduler shutting down");
-                    break;
+                    Err(e) => {
+                        tracing::warn!(error = %e, "startup maturation check failed");
+                    }
                 }
             }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "startup maturation check skipped: could not get chain tip"
+                );
+            }
         }
-    });
-    shutdown.register_task(payout_handle);
+    }
+
+    // Construct signer and spawn payout handler (if enabled)
+    if config.pool.pplns.payout_enabled {
+        let signer: Arc<dyn Signer> = match config.pool.signing.mode.as_str() {
+            "internal" => {
+                let key = config.pool.signing.private_key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "pool.signing.private_key required for internal signing mode"
+                    ))?;
+                Arc::new(InternalSigner::new(key, json_rpc_client.clone())?)
+            }
+            "external" => {
+                let url = config.pool.signing.webhook_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "pool.signing.webhook_url required for external signing mode"
+                    ))?;
+                Arc::new(ExternalSigner::new(url.to_string()))
+            }
+            other => anyhow::bail!(
+                "unknown signing mode '{}' — expected 'internal' or 'external'",
+                other
+            ),
+        };
+
+        let mut handler = PayoutHandler::new(
+            maturation_rx,
+            payout_accounting,
+            signer,
+            json_rpc_client.clone(),
+            config.pool.fee.fee_bps,
+            config.pool.fee.fee_address.clone(),
+            config.pool.pplns.min_payout_sat,
+            config.pool.pplns.n_multiplier,
+        );
+        let mut payout_shutdown_signal = shutdown.signal();
+        let payout_handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = handler.run() => {}
+                _ = payout_shutdown_signal.recv() => {
+                    info!("payout handler shutting down");
+                }
+            }
+        });
+        shutdown.register_task(payout_handle);
+        info!("payout handler started (event-driven, {} mode)", config.pool.signing.mode);
+    } else {
+        info!("payout handler disabled by config.pool.pplns.payout_enabled");
+        // Drop the sender so the channel can close cleanly
+        drop(maturation_tx);
+    }
 
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {

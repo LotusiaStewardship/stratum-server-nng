@@ -162,10 +162,10 @@ mod tests {
 
         let state = test_state(Some(repo));
 
-        let params = ListBlocksParams { status: Some("confirmed".to_string()) };
-        let confirmed = list_blocks(State(state.clone()), Query(params)).await;
-        assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].block_hash, "block2");
+        let params = ListBlocksParams { status: Some("immature".to_string()) };
+        let immature = list_blocks(State(state.clone()), Query(params)).await;
+        assert_eq!(immature.len(), 1);
+        assert_eq!(immature[0].block_hash, "block2");
 
         let params = ListBlocksParams { status: Some("orphaned".to_string()) };
         let orphaned = list_blocks(State(state), Query(params)).await;
@@ -184,7 +184,7 @@ mod tests {
         let detail = response.0.expect("block should be found");
         assert_eq!(detail.block_hash, "blockhash123");
         assert_eq!(detail.height, 500);
-        assert_eq!(detail.status, "confirmed");
+        assert_eq!(detail.status, "immature");
         assert_eq!(detail.worker_id, Some(42));
         assert_eq!(detail.persist_source, Some("json-rpc".to_string()));
     }

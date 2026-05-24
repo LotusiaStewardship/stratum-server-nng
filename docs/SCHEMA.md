@@ -125,13 +125,14 @@ Blocks found by the pool and submitted to lotusd.
 | round_id | INTEGER | NOT NULL FK → rounds(id) | |
 | block_hash | TEXT | NOT NULL UNIQUE | |
 | height | INTEGER | NOT NULL | |
-| status | TEXT | NOT NULL | 'pending', 'confirmed', 'orphaned', 'paid' |
+| status | TEXT | NOT NULL | 'immature', 'matured', 'paid', 'orphaned' |
 | worker_id | INTEGER | FK → workers(id) | Finding worker |
 | template_id | INTEGER | | |
 | persist_source | TEXT | | 'json-rpc' or 'nng' |
 | orphan_reason | TEXT | | Populated when status='orphaned' |
 | matured_at | DATETIME | | When block reached maturity |
 | coinbase_value | INTEGER | | Total coinbase output value in satoshis |
+| coinbase_txid | TEXT | | Coinbase txid, set after block confirmed, used by payout signer |
 | network_target_hex | TEXT | | N_diff at find time |
 
 **Unique:** `block_hash`

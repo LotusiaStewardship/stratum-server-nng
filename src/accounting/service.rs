@@ -643,7 +643,7 @@ impl AccountingService {
         F: Fn(i64) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
     {
-        let confirmed = self.found_block_repo.list(Some("confirmed"))?;
+        let confirmed = self.found_block_repo.list(Some("immature"))?;
 
         for block in &confirmed {
             if block.height > tip_height {
@@ -703,6 +703,33 @@ impl AccountingService {
         Ok(())
     }
 
+    /// Check all immature found blocks for maturation.
+    ///
+    /// For each immature block, compute confirmations as
+    /// `tip_height - block.height + 1`. If confirmations >= `min_confirmations`,
+    /// promote the block to `matured` status.
+    ///
+    /// Returns the list of newly matured blocks so the caller can send
+    /// maturation events to the payout handler.
+    pub fn check_maturation(&self, tip_height: i64, min_confirmations: u64) -> Result<Vec<FoundBlock>> {
+        let immature = self.found_block_repo.list(Some("immature"))?;
+        let mut matured = Vec::new();
+        for block in &immature {
+            let confirms = tip_height - block.height + 1;
+            if confirms >= min_confirmations as i64 {
+                self.found_block_repo.mark_matured(block.id)?;
+                tracing::info!(
+                    hash = %block.block_hash,
+                    height = block.height,
+                    confirms = confirms,
+                    threshold = min_confirmations,
+                    "block matured",
+                );
+                matured.push(block.clone());
+            }
+        }
+        Ok(matured)
+    }
 }
 
 #[cfg(test)]
@@ -834,7 +861,7 @@ mod tests {
             "found_block.round_id should be the resolved round's id, not template_id"
         );
         assert_eq!(found.block_hash, "0000abc");
-        assert_eq!(found.status, "confirmed");
+        assert_eq!(found.status, "immature");
 
         // Verify accounting event was recorded
         let events = svc.event_repo.list_by_type("found_block_observed", 10, 0).unwrap();
@@ -907,6 +934,189 @@ mod tests {
         // Verify round was orphaned
         let round = svc.round_repo.get_by_id(1).unwrap().unwrap();
         assert_eq!(round.status, "orphaned");
+    }
+
+    #[test]
+    fn test_check_maturation_below_threshold() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        // Create a round
+        let (_, _, round_id, _) = svc
+            .record_share(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+                "sess-1",
+                "job-42-100",
+                42,
+                100,
+                "00000001",
+                "00112233",
+                "001122334455",
+                "0011223344556677",
+                1.0,
+                "accepted",
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        let round_id = round_id.unwrap();
+
+        // Record a block at height 950
+        let block = svc
+            .record_found_block(round_id, "blockhash1", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .unwrap();
+        assert_eq!(block.status, "immature");
+
+        // Tip = 999 → 50 confirmations, below threshold of 100
+        let matured = svc.check_maturation(999, 100).unwrap();
+        assert!(matured.is_empty(), "block should NOT mature below threshold");
+
+        let block = svc.found_block_repo.get_by_hash("blockhash1").unwrap().unwrap();
+        assert_eq!(block.status, "immature", "block should still be immature");
+    }
+
+    #[test]
+    fn test_check_maturation_at_threshold() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let (_, _, round_id, _) = svc
+            .record_share(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+                "sess-1",
+                "job-42-100",
+                42,
+                100,
+                "00000001",
+                "00112233",
+                "001122334455",
+                "0011223344556677",
+                1.0,
+                "accepted",
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        let round_id = round_id.unwrap();
+
+        // Block at height 950, tip = 1049 → 100 confirmations (at threshold)
+        let block = svc
+            .record_found_block(round_id, "blockhash2", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .unwrap();
+        assert_eq!(block.status, "immature");
+
+        let matured = svc.check_maturation(1049, 100).unwrap();
+        assert_eq!(matured.len(), 1, "block should mature at threshold");
+        assert_eq!(matured[0].block_hash, "blockhash2");
+
+        let block = svc.found_block_repo.get_by_hash("blockhash2").unwrap().unwrap();
+        assert_eq!(block.status, "matured");
+        assert!(block.matured_at.is_some(), "matured_at should be set");
+    }
+
+    #[test]
+    fn test_check_maturation_above_threshold() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let (_, _, round_id, _) = svc
+            .record_share(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+                "sess-1",
+                "job-42-100",
+                42,
+                100,
+                "00000001",
+                "00112233",
+                "001122334455",
+                "0011223344556677",
+                1.0,
+                "accepted",
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        let round_id = round_id.unwrap();
+
+        // Block at height 950, tip = 1100 → 151 confirmations (above threshold)
+        let block = svc
+            .record_found_block(round_id, "blockhash3", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .unwrap();
+        assert_eq!(block.status, "immature");
+
+        let matured = svc.check_maturation(1100, 100).unwrap();
+        assert_eq!(matured.len(), 1);
+        assert_eq!(matured[0].block_hash, "blockhash3");
+
+        // Verify DB was updated
+        let block = svc.found_block_repo.get_by_hash("blockhash3").unwrap().unwrap();
+        assert_eq!(block.status, "matured");
+    }
+
+    #[test]
+    fn test_check_maturation_no_immature_blocks() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        // No blocks at all
+        let matured = svc.check_maturation(999, 100).unwrap();
+        assert!(matured.is_empty());
+    }
+
+    #[test]
+    fn test_check_maturation_does_not_mature_orphaned() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let (_, _, round_id, _) = svc
+            .record_share(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+                "sess-1",
+                "job-42-100",
+                42,
+                100,
+                "00000001",
+                "00112233",
+                "001122334455",
+                "0011223344556677",
+                1.0,
+                "accepted",
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        let round_id = round_id.unwrap();
+
+        svc
+            .record_found_block(round_id, "orphanedblock", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .unwrap();
+        svc.found_block_repo.mark_orphaned("orphanedblock", "reorg").unwrap();
+
+        // Tip is 1100, which would mature if block were still immature
+        let matured = svc.check_maturation(1100, 100).unwrap();
+        assert!(matured.is_empty(), "orphaned blocks should not be matured");
     }
 
     #[test]

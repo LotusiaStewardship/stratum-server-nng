@@ -66,16 +66,24 @@ src/payout/
 
 ### Known Limitations
 
-- **No maturation check (CRITICAL):** Blocks proceed immediately from `confirmed` to payout-eligible. Lotus requires 100 confirmations before the coinbase output is spendable. See the [maturation check spec](./specs/maturation-check.md).
+- **Maturation check implemented:** Blocks transition `immature → matured → paid`. See the [maturation check spec](./specs/maturation-check.md).
 - External signer is a scaffold — no retry/poll logic for async signing workflows.
 - `pool.signing.webhook_url` config accepted but not yet exposed in all environments.
 - Signing uses `process_pending_payouts` which can be called from the scheduler loop or any trigger point.
 
-### Slice 9: Payout Signer (implemented)
+### Slice 9: Payout Automation (completed)
 
 See the [Slice 9 spec](../stratum-core/specs/modular-architecture-refactor-slices.md#slice-9-payout-signer-abstraction) for details.
 
-The `process_pending_payouts` method on `AccountingService`:
+Payout automation is event-driven, replacing the old timer-based scheduler:
+
+1. **Maturation check:** On each `MiningWorkChanged` event (fires on every new block), the NNG consumer updates the shared `ChainTip` and calls `AccountingService::check_maturation` to promote `immature` blocks to `matured` status
+2. **Maturation event:** Newly matured block hashes are sent through an `mpsc::UnboundedSender` channel to the `PayoutHandler`
+3. **PayoutHandler:** Receives block hashes, creates PPLNS payout batches via `create_payout_for_found_block`, then signs/submits pending batches via `process_pending_payouts`
+4. **Signer:** Constructed from config (`pool.signing.mode`), either internal (in-process secp256k1) or external (HTTP webhook)
+5. **Gating:** Controlled by `pplns.payout_enabled` — when disabled, blocks accumulate at `matured` status for manual processing
+
+`process_pending_payouts` on `AccountingService`:
 1. Queries `payout_batches` with `status='pending'`
 2. Loads the associated `FoundBlock` by round_id
 3. Resolves coinbase txid via `getblock` RPC (stores in `found_blocks.coinbase_txid` for reuse)

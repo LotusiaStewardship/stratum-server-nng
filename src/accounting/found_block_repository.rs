@@ -55,7 +55,7 @@ impl FoundBlockRepository {
             "INSERT INTO found_blocks
              (round_id, block_hash, height, worker_id, template_id, persist_source, status,
               coinbase_value, network_target_hex)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'confirmed', ?7, ?8)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'immature', ?7, ?8)"
         )?;
         stmt.execute(params![
             round_id,
@@ -73,7 +73,7 @@ impl FoundBlockRepository {
             round_id,
             block_hash: block_hash.to_string(),
             height,
-            status: "confirmed".to_string(),
+            status: "immature".to_string(),
             worker_id,
             template_id,
             persist_source: persist_source.map(|s| s.to_string()),
@@ -180,6 +180,19 @@ impl FoundBlockRepository {
         Ok(())
     }
 
+    /// Mark a found block as matured.
+    ///
+    /// Sets status to 'matured' and records the maturation timestamp.
+    /// Called when the block reaches `min_confirmations` confirmations.
+    pub fn mark_matured(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE found_blocks SET status = 'matured', matured_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// List found blocks, optionally filtered by status.
     pub fn list(&self, status_filter: Option<&str>) -> Result<Vec<FoundBlock>> {
         let conn = self.conn.lock();
@@ -270,7 +283,7 @@ mod tests {
         assert_eq!(block.block_hash, "0000abc");
         assert_eq!(block.round_id, 1);
         assert_eq!(block.height, 1292529);
-        assert_eq!(block.status, "confirmed");
+        assert_eq!(block.status, "immature");
         assert_eq!(block.persist_source, Some("json-rpc".to_string()));
 
         let fetched = repo.get_by_hash("0000abc").unwrap().unwrap();
@@ -338,9 +351,9 @@ mod tests {
             .unwrap();
         repo.mark_orphaned("block1", "reorg").unwrap();
 
-        let confirmed = repo.list(Some("confirmed")).unwrap();
-        assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].block_hash, "block2");
+        let immature = repo.list(Some("immature")).unwrap();
+        assert_eq!(immature.len(), 1);
+        assert_eq!(immature[0].block_hash, "block2");
 
         let orphaned = repo.list(Some("orphaned")).unwrap();
         assert_eq!(orphaned.len(), 1);
@@ -380,7 +393,7 @@ mod tests {
             .record_found_block(1, "hash1", 100, None, None, None, 50000, "")
             .unwrap();
 
-        assert_eq!(block.status, "confirmed");
+        assert_eq!(block.status, "immature");
 
         repo.update_status(block.id, "paid").unwrap();
         let updated = repo.get_by_hash("hash1").unwrap().unwrap();

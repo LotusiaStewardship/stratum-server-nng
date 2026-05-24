@@ -1,3 +1,4 @@
+pub mod chain_tip;
 pub mod schema;
 pub mod worker_repository;
 pub mod share_repository;
@@ -14,4 +15,5 @@ pub use round_repository::*;
 pub use accounting_event_repository::*;
 pub use found_block_repository::*;
 pub use payout_repository::*;
+pub use chain_tip::ChainTip;
 pub use service::AccountingService;
