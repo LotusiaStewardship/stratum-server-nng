@@ -113,6 +113,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/payouts", get(crate::http_api::routes::list_payouts))
         .route("/api/v1/payouts/{id}", get(crate::http_api::routes::get_payout))
         .route("/api/v1/admin/payouts/trigger/{block_hash}", post(crate::http_api::routes::trigger_payout))
+        .route("/api/v1/shares", get(crate::http_api::routes::list_shares))
+        .route("/api/v1/share-outcomes", get(crate::http_api::routes::list_share_outcomes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

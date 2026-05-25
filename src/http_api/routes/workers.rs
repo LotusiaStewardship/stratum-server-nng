@@ -1,8 +1,9 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Json,
 };
 use serde::Serialize;
+use crate::http_api::pagination::{PaginationParams, PaginatedResponse};
 use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
@@ -21,9 +22,13 @@ pub struct WorkerDetail {
     pub total_shares: i64,
 }
 
-pub async fn list_workers(State(state): State<AppState>) -> Json<Vec<WorkerSummary>> {
-    let workers = if let Some(ref worker_repo) = state.worker_repo {
-        worker_repo
+pub async fn list_workers(
+    State(state): State<AppState>,
+    Query(params): Query<PaginationParams>,
+) -> Json<PaginatedResponse<WorkerSummary>> {
+    if let Some(ref worker_repo) = state.worker_repo {
+        let total = worker_repo.count().unwrap_or(0);
+        let all: Vec<WorkerSummary> = worker_repo
             .list_all()
             .unwrap_or_default()
             .into_iter()
@@ -40,12 +45,11 @@ pub async fn list_workers(State(state): State<AppState>) -> Json<Vec<WorkerSumma
                     total_shares: count,
                 }
             })
-            .collect()
+            .collect();
+        Json(PaginatedResponse::new(all, total, &params))
     } else {
-        Vec::new()
-    };
-
-    Json(workers)
+        Json(PaginatedResponse::new(Vec::new(), 0, &params))
+    }
 }
 
 pub async fn get_worker(
@@ -82,6 +86,12 @@ mod tests {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::sync::RwLock;
+    use axum::extract::Query;
+    use crate::http_api::pagination::PaginationParams;
+
+    fn no_pagination() -> Query<PaginationParams> {
+        Query(PaginationParams { limit: None, offset: None })
+    }
 
     #[tokio::test]
     async fn test_list_workers_empty() {
@@ -96,10 +106,12 @@ mod tests {
             accounting_service: None,
             payout_config: None,
             api_token: "test".to_string(),
-        }))
+        }), no_pagination())
         .await;
 
-        assert!(response.is_empty());
+        assert!(response.data.is_empty());
+        assert_eq!(response.total, 0);
+        assert!(!response.has_more);
     }
 
     #[tokio::test]
@@ -126,12 +138,13 @@ mod tests {
             accounting_service: None,
             payout_config: None,
             api_token: "test".to_string(),
-        }))
+        }), no_pagination())
         .await;
 
-        assert_eq!(response.len(), 2);
-        assert_eq!(response[0].payout_address, "addr1");
-        assert_eq!(response[1].payout_address, "addr2");
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].payout_address, "addr1");
+        assert_eq!(response.data[1].payout_address, "addr2");
+        assert_eq!(response.total, 2);
     }
 
     #[tokio::test]

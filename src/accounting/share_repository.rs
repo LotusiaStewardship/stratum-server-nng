@@ -381,6 +381,303 @@ impl ShareRepository {
         let count: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(count)
     }
+
+    /// List shares with optional filters.
+    ///
+    /// - `worker_id`: filter by worker
+    /// - `status`: filter by share_outcomes.status (JOIN)
+    /// - `from` / `to`: ISO date range filter on shares.created_at
+    /// - `limit` / `offset`: pagination
+    pub fn list_shares(
+        &self,
+        worker_id: Option<i64>,
+        status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<Share>> {
+        let conn = self.conn.lock();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(wid) = worker_id {
+            conditions.push(format!("s.worker_id = ?{}", params.len() + 1));
+            params.push(Box::new(wid));
+        }
+
+        if let Some(st) = status {
+            conditions.push(format!("so.status = ?{}", params.len() + 1));
+            params.push(Box::new(st.to_string()));
+        }
+
+        if let Some(f) = from {
+            conditions.push(format!("s.created_at >= ?{}", params.len() + 1));
+            params.push(Box::new(f.to_string()));
+        }
+
+        if let Some(t) = to {
+            conditions.push(format!("s.created_at <= ?{}", params.len() + 1));
+            params.push(Box::new(t.to_string()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        // JOIN share_outcomes only when status filter is present
+        let join_clause = if status.is_some() {
+            "LEFT JOIN share_outcomes so ON so.dedupe_key = s.dedupe_key"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT s.id, s.worker_id, s.session_id, s.job_id, s.template_id,
+                    s.template_epoch, s.extranonce1, s.extranonce2,
+                    s.ntime_hex_6b, s.nonce_hex_8b, s.difficulty, s.dedupe_key
+             FROM shares s
+             {join_clause}
+             {where_clause}
+             ORDER BY s.id DESC"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        // Apply limit/offset after query
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(Share {
+                id: row.get(0)?,
+                worker_id: row.get(1)?,
+                session_id: row.get(2)?,
+                job_id: row.get(3)?,
+                template_id: row.get(4)?,
+                template_epoch: row.get(5)?,
+                extranonce1: row.get(6)?,
+                extranonce2: row.get(7)?,
+                ntime_hex_6b: row.get(8)?,
+                nonce_hex_8b: row.get(9)?,
+                difficulty: row.get(10)?,
+                dedupe_key: row.get(11)?,
+            })
+        })?;
+
+        let mut shares: Vec<Share> = Vec::new();
+        for row in rows {
+            shares.push(row?);
+        }
+
+        // Apply limit/offset in-memory for now
+        // (optimize to SQL-level pagination if needed)
+        if let Some(off) = offset {
+            if off as usize <= shares.len() {
+                shares = shares.split_off(off as usize);
+            } else {
+                shares.clear();
+            }
+        }
+        if let Some(lim) = limit {
+            shares.truncate(lim as usize);
+        }
+
+        Ok(shares)
+    }
+
+    /// List share outcomes with optional filters.
+    pub fn list_outcomes(
+        &self,
+        worker_id: Option<i64>,
+        status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<ShareOutcome>> {
+        let conn = self.conn.lock();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(wid) = worker_id {
+            conditions.push(format!("so.worker_id = ?{}", params.len() + 1));
+            params.push(Box::new(wid));
+        }
+
+        if let Some(st) = status {
+            conditions.push(format!("so.status = ?{}", params.len() + 1));
+            params.push(Box::new(st.to_string()));
+        }
+
+        if let Some(f) = from {
+            conditions.push(format!("so.created_at >= ?{}", params.len() + 1));
+            params.push(Box::new(f.to_string()));
+        }
+
+        if let Some(t) = to {
+            conditions.push(format!("so.created_at <= ?{}", params.len() + 1));
+            params.push(Box::new(t.to_string()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT so.id, so.share_id, so.session_id, so.worker_id, so.job_id,
+                    so.round_id, so.dedupe_key, so.status, so.reject_reason,
+                    so.node_result, so.low_diff_ok, so.network_target_ok, so.block_hash
+             FROM share_outcomes so
+             {where_clause}
+             ORDER BY so.id DESC"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(ShareOutcome {
+                id: row.get(0)?,
+                share_id: row.get(1)?,
+                session_id: row.get(2)?,
+                worker_id: row.get(3)?,
+                job_id: row.get(4)?,
+                round_id: row.get(5)?,
+                dedupe_key: row.get(6)?,
+                status: row.get(7)?,
+                reject_reason: row.get(8)?,
+                node_result: row.get(9)?,
+                low_diff_ok: row.get(10)?,
+                network_target_ok: row.get(11)?,
+                block_hash: row.get(12)?,
+            })
+        })?;
+
+        let mut outcomes: Vec<ShareOutcome> = Vec::new();
+        for row in rows {
+            outcomes.push(row?);
+        }
+
+        // Apply limit/offset in-memory
+        if let Some(off) = offset {
+            if off as usize <= outcomes.len() {
+                outcomes = outcomes.split_off(off as usize);
+            } else {
+                outcomes.clear();
+            }
+        }
+        if let Some(lim) = limit {
+            outcomes.truncate(lim as usize);
+        }
+
+        Ok(outcomes)
+    }
+
+    /// Count shares with matching filters (JOINs share_outcomes for status filter).
+    pub fn count_shares(
+        &self,
+        worker_id: Option<i64>,
+        status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(wid) = worker_id {
+            conditions.push(format!("s.worker_id = ?{}", params.len() + 1));
+            params.push(Box::new(wid));
+        }
+
+        if let Some(f) = from {
+            conditions.push(format!("s.created_at >= ?{}", params.len() + 1));
+            params.push(Box::new(f.to_string()));
+        }
+
+        if let Some(t) = to {
+            conditions.push(format!("s.created_at <= ?{}", params.len() + 1));
+            params.push(Box::new(t.to_string()));
+        }
+
+        let join_clause = if let Some(st) = status {
+            conditions.push(format!("so.status = ?{}", params.len() + 1));
+            params.push(Box::new(st.to_string()));
+            "LEFT JOIN share_outcomes so ON so.dedupe_key = s.dedupe_key"
+        } else {
+            ""
+        };
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM shares s {join_clause} {where_clause}"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Count share outcomes with matching filters.
+    pub fn count_outcomes(
+        &self,
+        worker_id: Option<i64>,
+        status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(wid) = worker_id {
+            conditions.push(format!("so.worker_id = ?{}", params.len() + 1));
+            params.push(Box::new(wid));
+        }
+
+        if let Some(st) = status {
+            conditions.push(format!("so.status = ?{}", params.len() + 1));
+            params.push(Box::new(st.to_string()));
+        }
+
+        if let Some(f) = from {
+            conditions.push(format!("so.created_at >= ?{}", params.len() + 1));
+            params.push(Box::new(f.to_string()));
+        }
+
+        if let Some(t) = to {
+            conditions.push(format!("so.created_at <= ?{}", params.len() + 1));
+            params.push(Box::new(t.to_string()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM share_outcomes so {where_clause}"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -634,5 +931,175 @@ mod tests {
     fn test_build_dedupe_key() {
         let key = ShareRepository::build_dedupe_key(1, 42, 12345, "00112233", "001122334455", "0011223344556677");
         assert_eq!(key, "1:42:12345:00112233:001122334455:0011223344556677");
+    }
+
+    #[test]
+    fn test_list_shares_empty_when_no_shares() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        let shares = repo.list_shares(None, None, None, None, None, None).unwrap();
+        assert!(shares.is_empty(), "expected no shares in empty database");
+    }
+
+    #[test]
+    fn test_list_shares_returns_all_shares() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+        setup_worker(&conn, 2, "addr2", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        let s1 = create_test_share(1, 10, 100, "key1");
+        let s2 = create_test_share(2, 20, 200, "key2");
+        repo.insert_share(&s1).unwrap();
+        repo.insert_share(&s2).unwrap();
+
+        let shares = repo.list_shares(None, None, None, None, None, None).unwrap();
+        assert_eq!(shares.len(), 2, "should return all inserted shares");
+    }
+
+    #[test]
+    fn test_list_shares_filter_by_worker_id() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+        setup_worker(&conn, 2, "addr2", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "key1")).unwrap();
+        repo.insert_share(&create_test_share(2, 20, 200, "key2")).unwrap();
+        repo.insert_share(&create_test_share(1, 30, 300, "key3")).unwrap();
+
+        let shares = repo.list_shares(Some(1), None, None, None, None, None).unwrap();
+        assert_eq!(shares.len(), 2, "worker 1 should have 2 shares");
+        assert!(shares.iter().all(|s| s.worker_id == 1));
+    }
+
+    #[test]
+    fn test_list_shares_with_limit_and_offset() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        for i in 0..5 {
+            let s = create_test_share(1, 10 + i, 100 + i, &format!("key{i}"));
+            repo.insert_share(&s).unwrap();
+        }
+
+        let limited = repo.list_shares(None, None, None, None, Some(2), None).unwrap();
+        assert_eq!(limited.len(), 2, "limit=2 should return 2 shares");
+
+        let offset = repo.list_shares(None, None, None, None, Some(2), Some(2)).unwrap();
+        assert_eq!(offset.len(), 2, "offset=2 limit=2 should return 2 shares");
+        // With offset=2, we skip the first 2, so results differ
+        assert_ne!(limited[0].id, offset[0].id, "offset should return different results");
+    }
+
+    #[test]
+    fn test_list_shares_filter_by_status() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "key_accept")).unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "key_reject")).unwrap();
+
+        // Insert matching share_outcomes (share IDs are 1 and 2 after inserts)
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "key_accept", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "key_reject", "rejected")).unwrap();
+
+        let accepted = repo.list_shares(None, Some("accepted"), None, None, None, None).unwrap();
+        assert_eq!(accepted.len(), 1, "should find 1 accepted share");
+        assert_eq!(accepted[0].dedupe_key, "key_accept");
+    }
+
+    #[test]
+    fn test_list_shares_filter_by_date_range() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "key1")).unwrap();
+
+        // Use a far-past and far-future date to ensure all shares are included
+        let shares = repo.list_shares(None, None, Some("2020-01-01"), Some("2030-01-01"), None, None).unwrap();
+        assert!(!shares.is_empty(), "should find shares in wide date range");
+    }
+
+    #[test]
+    fn test_list_outcomes_empty_when_no_outcomes() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        let outcomes = repo.list_outcomes(None, None, None, None, None, None).unwrap();
+        assert!(outcomes.is_empty(), "expected no outcomes in empty database");
+    }
+
+    #[test]
+    fn test_list_outcomes_returns_all_outcomes() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
+
+        let outcomes = repo.list_outcomes(None, None, None, None, None, None).unwrap();
+        assert_eq!(outcomes.len(), 2, "should return all outcomes");
+    }
+
+    #[test]
+    fn test_list_outcomes_filter_by_worker_id() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+        setup_worker(&conn, 2, "addr2", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
+        repo.insert_share(&create_test_share(2, 30, 300, "k3")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(3, 2, "k3", "accepted")).unwrap();
+
+        let outcomes = repo.list_outcomes(Some(1), None, None, None, None, None).unwrap();
+        assert_eq!(outcomes.len(), 2, "worker 1 should have 2 outcomes");
+    }
+
+    #[test]
+    fn test_list_outcomes_filter_by_status() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "addr1", None);
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
+
+        let outcomes = repo.list_outcomes(None, Some("accepted"), None, None, None, None).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, "accepted");
     }
 }

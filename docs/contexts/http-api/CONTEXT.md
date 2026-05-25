@@ -1,6 +1,6 @@
 # HTTP API Context
 
-**Last updated:** 2026-05-22  
+**Last updated:** 2026-05-25  
 **Related spec:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -8,7 +8,7 @@
 
 ## Bounded Context
 
-The **HTTP API** context owns the Axum-based REST API for pool operators. It provides health monitoring, data queries (workers, rounds, blocks, payouts), and administrative actions (payout triggering).
+The **HTTP API** context owns the Axum-based REST API for pool operators. It provides health monitoring, data queries (workers, rounds, blocks, shares, payouts), and administrative actions (payout triggering).
 
 ### Boundary
 
@@ -85,8 +85,7 @@ All repository fields are `Option` — individual route handlers return `AppErro
 
 ### Known Limitations (Slice 8 scope)
 
-- No pagination (`limit`/`offset`) on list endpoints
-- No `GET /api/v1/shares` endpoint
+- Pagination (`limit`/`offset`) implemented on `GET /api/v1/workers`, `GET /api/v1/shares`, and `GET /api/v1/share-outcomes`; remaining list endpoints return full results
 - No `GET /api/v1/rounds/{id}/shares` endpoint
 - No hashrate endpoint (5-min rolling window)
 - No error correlation IDs on 4xx/5xx responses

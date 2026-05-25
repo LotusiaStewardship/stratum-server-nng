@@ -88,6 +88,14 @@ impl WorkerRepository {
         }
         Ok(workers)
     }
+
+    /// Count all workers.
+    pub fn count(&self) -> Result<i64> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM workers")?;
+        let count: i64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
