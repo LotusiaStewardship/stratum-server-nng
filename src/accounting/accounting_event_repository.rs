@@ -15,11 +15,11 @@ pub struct AccountingEvent {
     pub worker_name: Option<String>,
     pub payout_address: Option<String>,
     pub round_id: Option<i64>,
-    pub template_id: Option<i64>,
-    pub template_epoch: Option<i64>,
+    pub template_id: Option<u64>,
+    pub template_epoch: Option<u64>,
     pub job_id: Option<String>,
     pub block_hash: Option<String>,
-    pub height: Option<i64>,
+    pub height: Option<i32>,
     pub payload_json: Option<String>,
 }
 
@@ -86,11 +86,23 @@ impl AccountingEventRepository {
                 worker_name: row.get(5)?,
                 payout_address: row.get(6)?,
                 round_id: row.get(7)?,
-                template_id: row.get(8)?,
-                template_epoch: row.get(9)?,
+                template_id: {
+                    let tid: Option<i64> = row.get(8)?;
+                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    tid.map(|v| v as u64)
+                },
+                template_epoch: {
+                    let ep: Option<i64> = row.get(9)?;
+                    debug_assert!(ep.map_or(true, |v| v >= 0), "template_epoch must be non-negative");
+                    ep.map(|v| v as u64)
+                },
                 job_id: row.get(10)?,
                 block_hash: row.get(11)?,
-                height: row.get(12)?,
+                height: {
+                    let h: Option<i64> = row.get(12)?;
+                    debug_assert!(h.map_or(true, |v| v >= 0), "height must be non-negative");
+                    h.map(|v| v as i32)
+                },
                 payload_json: row.get(13)?,
             })
         })?;

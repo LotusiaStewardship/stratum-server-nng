@@ -212,8 +212,8 @@ impl NngEventConsumer {
         use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
         match event.reason {
             MiningWorkChangedReason::NewTip | MiningWorkChangedReason::Reorg => {
-                self.chain_tip.update_block_connected(event.height as u64);
-                let tip = self.chain_tip.get() as i64;
+                self.chain_tip.update_block_connected(event.height);
+                let tip = self.chain_tip.get();
                 if let Some(ref acct) = self.accounting {
                     match acct.check_maturation(tip, self.min_confirmations) {
                         Ok(matured_blocks) => {

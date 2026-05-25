@@ -9,16 +9,16 @@ pub struct FoundBlock {
     pub id: i64,
     pub round_id: i64,
     pub block_hash: String,
-    pub height: i64,
+    pub height: i32,
     pub status: String,
     pub worker_id: Option<i64>,
-    pub template_id: Option<i64>,
+    pub template_id: Option<u64>,
     pub persist_source: Option<String>,
     pub orphan_reason: Option<String>,
     pub matured_at: Option<String>,
     /// Total coinbase output value in satoshis (subsidy + tx fees).
     /// Set from MiningJob.coinbase_value when the block is found.
-    pub coinbase_value: i64,
+    pub coinbase_value: u64,
     /// Transaction ID of the coinbase transaction, set after block is confirmed.
     /// Used by the payout signer to build the spending transaction.
     pub coinbase_txid: Option<String>,
@@ -43,11 +43,11 @@ impl FoundBlockRepository {
         &self,
         round_id: i64,
         block_hash: &str,
-        height: i64,
+        height: i32,
         worker_id: Option<i64>,
-        template_id: Option<i64>,
+        template_id: Option<u64>,
         persist_source: Option<&str>,
-        coinbase_value: i64,
+        coinbase_value: u64,
         network_target_hex: &str,
     ) -> Result<FoundBlock> {
         let conn = self.conn.lock();
@@ -112,11 +112,19 @@ impl FoundBlockRepository {
                 height: row.get(3)?,
                 status: row.get(4)?,
                 worker_id: row.get(5)?,
-                template_id: row.get(6)?,
+                template_id: {
+                    let tid: Option<i64> = row.get(6)?;
+                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    tid.map(|v| v as u64)
+                },
                 persist_source: row.get(7)?,
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
-                coinbase_value: row.get(10)?,
+                coinbase_value: {
+                    let cv: i64 = row.get(10)?;
+                    debug_assert!(cv >= 0, "coinbase_value must be non-negative");
+                    cv as u64
+                },
                 coinbase_txid: row.get(11)?,
                 network_target_hex: row.get(12)?,
             })
@@ -146,11 +154,19 @@ impl FoundBlockRepository {
                 height: row.get(3)?,
                 status: row.get(4)?,
                 worker_id: row.get(5)?,
-                template_id: row.get(6)?,
+                template_id: {
+                    let tid: Option<i64> = row.get(6)?;
+                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    tid.map(|v| v as u64)
+                },
                 persist_source: row.get(7)?,
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
-                coinbase_value: row.get(10)?,
+                coinbase_value: {
+                    let cv: i64 = row.get(10)?;
+                    debug_assert!(cv >= 0, "coinbase_value must be non-negative");
+                    cv as u64
+                },
                 coinbase_txid: row.get(11)?,
                 network_target_hex: row.get(12)?,
             })
@@ -226,11 +242,19 @@ impl FoundBlockRepository {
                 height: row.get(3)?,
                 status: row.get(4)?,
                 worker_id: row.get(5)?,
-                template_id: row.get(6)?,
+                template_id: {
+                    let tid: Option<i64> = row.get(6)?;
+                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    tid.map(|v| v as u64)
+                },
                 persist_source: row.get(7)?,
                 orphan_reason: row.get(8)?,
                 matured_at: row.get(9)?,
-                coinbase_value: row.get(10)?,
+                coinbase_value: {
+                    let cv: i64 = row.get(10)?;
+                    debug_assert!(cv >= 0, "coinbase_value must be non-negative");
+                    cv as u64
+                },
                 coinbase_txid: row.get(11)?,
                 network_target_hex: row.get(12)?,
             })

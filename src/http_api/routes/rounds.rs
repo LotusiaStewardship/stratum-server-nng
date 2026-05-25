@@ -8,8 +8,8 @@ use crate::http_api::server::AppState;
 #[derive(Serialize)]
 pub struct RoundSummary {
     pub id: i64,
-    pub start_template_id: i64,
-    pub end_template_id: Option<i64>,
+    pub start_template_id: String,
+    pub end_template_id: Option<String>,
     pub status: String,
     pub found_block_hash: Option<String>,
 }
@@ -34,8 +34,8 @@ pub struct WorkerShareBreakdown {
 #[derive(Debug, Clone, Serialize)]
 pub struct RoundDetail {
     pub id: i64,
-    pub start_template_id: i64,
-    pub end_template_id: Option<i64>,
+    pub start_template_id: String,
+    pub end_template_id: Option<String>,
     pub status: String,
     pub found_block_hash: Option<String>,
     pub share_breakdown: Vec<WorkerShareBreakdown>,
@@ -78,8 +78,8 @@ pub async fn get_round(
 
     Json(Some(RoundDetail {
         id: round.id,
-        start_template_id: round.start_template_id,
-        end_template_id: round.end_template_id,
+        start_template_id: round.start_template_id.to_string(),
+        end_template_id: round.end_template_id.map(|v| v.to_string()),
         status: round.status,
         found_block_hash: round.found_block_hash,
         share_breakdown,
@@ -98,8 +98,8 @@ pub async fn list_rounds(
             .into_iter()
             .map(|r| RoundSummary {
                 id: r.id,
-                start_template_id: r.start_template_id,
-                end_template_id: r.end_template_id,
+                start_template_id: r.start_template_id.to_string(),
+                end_template_id: r.end_template_id.map(|v| v.to_string()),
                 status: r.status,
                 found_block_hash: r.found_block_hash,
             })
@@ -300,7 +300,7 @@ mod tests {
         }), Query(params))
         .await;
         assert_eq!(open_rounds.len(), 1);
-        assert_eq!(open_rounds[0].start_template_id, 6);
+        assert_eq!(open_rounds[0].start_template_id, "6");
 
         // Filter by 'found'
         let params = ListRoundsParams { status: Some("found".to_string()) };
@@ -317,6 +317,6 @@ mod tests {
         }), Query(params))
         .await;
         assert_eq!(found_rounds.len(), 1);
-        assert_eq!(found_rounds[0].start_template_id, 1);
+        assert_eq!(found_rounds[0].start_template_id, "1");
     }
 }

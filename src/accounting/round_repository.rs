@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 #[derive(Debug, Clone)]
 pub struct Round {
     pub id: i64,
-    pub start_template_id: i64,
-    pub end_template_id: Option<i64>,
+    pub start_template_id: u64,
+    pub end_template_id: Option<u64>,
     pub status: String,
     pub found_block_hash: Option<String>,
 }
@@ -26,7 +26,7 @@ impl RoundRepository {
     /// Ensure one open round exists. If no open round is found, creates one with the
     /// given `start_template_id`. Returns the open round and a bool indicating
     /// whether a new round was created (true) or an existing one was returned (false).
-    pub fn get_or_create_current_round(&self, start_template_id: i64) -> Result<(Round, bool)> {
+    pub fn get_or_create_current_round(&self, start_template_id: u64) -> Result<(Round, bool)> {
         let conn = self.conn.lock();
 
         // Try to find an existing open round
@@ -68,7 +68,7 @@ impl RoundRepository {
 
     /// Close a round by setting its end_template_id and new status.
     /// After closing, the round is no longer returned by `get_or_create_current_round`.
-    pub fn close_round(&self, id: i64, end_template_id: i64, status: &str) -> Result<()> {
+    pub fn close_round(&self, id: i64, end_template_id: u64, status: &str) -> Result<()> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "UPDATE rounds SET end_template_id = ?1, status = ?2 WHERE id = ?3"
@@ -82,7 +82,7 @@ impl RoundRepository {
     /// If the template's ID falls within an existing round's range (between start_template_id
     /// and end_template_id, inclusive), returns that round. If no round covers this template,
     /// creates a new open round with this template_id as the start.
-    pub fn resolve_round_for_template(&self, template_id: i64) -> Result<(Round, bool)> {
+    pub fn resolve_round_for_template(&self, template_id: u64) -> Result<(Round, bool)> {
         let conn = self.conn.lock();
 
         // First try: template matches an open round's range (start <= template_id <= end or open)

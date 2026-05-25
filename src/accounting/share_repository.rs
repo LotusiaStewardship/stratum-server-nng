@@ -12,8 +12,8 @@ pub struct Share {
     pub worker_id: i64,
     pub session_id: String,
     pub job_id: String,
-    pub template_id: i64,
-    pub template_epoch: i64,
+    pub template_id: u64,
+    pub template_epoch: u64,
     pub extranonce1: String,
     pub extranonce2: String,
     pub ntime_hex_6b: String,
@@ -67,8 +67,8 @@ impl ShareRepository {
     /// Compute dedupe key per UBQ format: worker_id:template_id:template_epoch:extranonce2:ntime:nonce
     pub fn build_dedupe_key(
         worker_id: i64,
-        template_id: i64,
-        template_epoch: i64,
+        template_id: u64,
+        template_epoch: u64,
         extranonce2: &str,
         ntime: &str,
         nonce: &str,
@@ -686,7 +686,7 @@ mod tests {
     use crate::accounting::schema::init_schema;
     use tempfile::NamedTempFile;
 
-    fn create_test_share(worker_id: i64, template_id: i64, template_epoch: i64, dedupe_key: &str) -> Share {
+    fn create_test_share(worker_id: i64, template_id: u64, template_epoch: u64, dedupe_key: &str) -> Share {
         Share {
             id: 0,
             worker_id,

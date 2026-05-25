@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 /// Tracks the latest known chain tip height from NNG pub/sub events.
@@ -16,19 +16,19 @@ use std::sync::Arc;
 /// Initial value of 0 is harmless — before the first template refresh
 /// no blocks exist, so no immature blocks are queried.
 #[derive(Clone, Debug)]
-pub struct ChainTip(Arc<AtomicU64>);
+pub struct ChainTip(Arc<AtomicI32>);
 
 impl ChainTip {
     /// Create a new chain tip tracker starting at `initial`.
-    pub fn new(initial: u64) -> Self {
-        Self(Arc::new(AtomicU64::new(initial)))
+    pub fn new(initial: i32) -> Self {
+        Self(Arc::new(AtomicI32::new(initial)))
     }
 
     /// Update on a `BlockConnected` event.
     ///
     /// The tip can only advance — if `height` is lower than the current
     /// value (e.g. stale event), it is ignored.
-    pub fn update_block_connected(&self, height: u64) {
+    pub fn update_block_connected(&self, height: i32) {
         let prev = self.0.load(Ordering::Relaxed);
         if height > prev {
             self.0.store(height, Ordering::Relaxed);
@@ -41,7 +41,7 @@ impl ChainTip {
     /// current tip. Disconnections of older blocks (e.g. deep reorg) are
     /// ignored — those are handled by the orphaning logic in
     /// `handle_block_disconnected`.
-    pub fn update_block_disconnected(&self, height: u64) {
+    pub fn update_block_disconnected(&self, height: i32) {
         let prev = self.0.load(Ordering::Relaxed);
         if height == prev && prev > 0 {
             self.0.store(prev - 1, Ordering::Relaxed);
@@ -49,7 +49,7 @@ impl ChainTip {
     }
 
     /// Get the current chain tip height.
-    pub fn get(&self) -> u64 {
+    pub fn get(&self) -> i32 {
         self.0.load(Ordering::Relaxed)
     }
 }

@@ -13,7 +13,7 @@ pub struct PayoutOutput {
 #[derive(Debug, Clone)]
 pub struct PayoutPlan {
     pub round_id: i64,
-    pub block_height: i64,
+    pub block_height: i32,
     pub block_hash: String,
     pub network_difficulty: f64,
     pub total_work_units: f64,
@@ -54,7 +54,7 @@ pub struct PayoutPlan {
 /// Returns a PayoutPlan with deterministic outputs (same inputs => same outputs).
 pub fn build_payout_plan(
     round_id: i64,
-    block_height: i64,
+    block_height: i32,
     block_hash: &str,
     network_difficulty: f64,
     gross_reward: i64,

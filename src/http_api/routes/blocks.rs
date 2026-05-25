@@ -10,9 +10,9 @@ pub struct BlockSummary {
     pub id: i64,
     pub round_id: i64,
     pub block_hash: String,
-    pub height: i64,
+    pub height: i32,
     pub status: String,
-    pub coinbase_value: i64,
+    pub coinbase_value: String,
     pub network_target_hex: String,
 }
 
@@ -26,13 +26,13 @@ pub struct BlockDetail {
     pub id: i64,
     pub round_id: i64,
     pub block_hash: String,
-    pub height: i64,
+    pub height: i32,
     pub status: String,
     pub worker_id: Option<i64>,
-    pub template_id: Option<i64>,
+    pub template_id: Option<String>,
     pub persist_source: Option<String>,
     pub orphan_reason: Option<String>,
-    pub coinbase_value: i64,
+    pub coinbase_value: String,
     pub network_target_hex: String,
 }
 
@@ -50,7 +50,7 @@ pub async fn list_blocks(
                 block_hash: b.block_hash,
                 height: b.height,
                 status: b.status,
-                coinbase_value: b.coinbase_value,
+                coinbase_value: b.coinbase_value.to_string(),
                 network_target_hex: b.network_target_hex.clone(),
             })
             .collect()
@@ -74,10 +74,10 @@ pub async fn get_block(
                 height: b.height,
                 status: b.status,
                 worker_id: b.worker_id,
-                template_id: b.template_id,
+                template_id: b.template_id.map(|v| v.to_string()),
                 persist_source: b.persist_source,
                 orphan_reason: b.orphan_reason,
-                coinbase_value: b.coinbase_value,
+                coinbase_value: b.coinbase_value.to_string(),
                 network_target_hex: b.network_target_hex.clone(),
             }),
             _ => None,

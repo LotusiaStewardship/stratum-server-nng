@@ -2,11 +2,11 @@ use serde_json::json;
 
 /// Parse template_id and template_epoch from a `job-{template_id}-{epoch}` format job ID.
 /// Returns `None` if the format doesn't match.
-pub fn parse_template_metadata_from_job_id(job_id: &str) -> Option<(i64, i64)> {
+pub fn parse_template_metadata_from_job_id(job_id: &str) -> Option<(u64, u64)> {
     let stripped = job_id.strip_prefix("job-")?;
     let last_hyphen = stripped.rfind('-')?;
-    let template_id: i64 = stripped[..last_hyphen].parse().ok()?;
-    let template_epoch: i64 = stripped[last_hyphen + 1..].parse().ok()?;
+    let template_id: u64 = stripped[..last_hyphen].parse().ok()?;
+    let template_epoch: u64 = stripped[last_hyphen + 1..].parse().ok()?;
     Some((template_id, template_epoch))
 }
 

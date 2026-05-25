@@ -75,7 +75,7 @@ impl JsonRpcClient {
 
     /// Get the block hash at a given height via `getblockhash`.
     /// Returns `Ok(None)` if the height is above the chain tip (error code -8).
-    pub async fn getblockhash(&self, height: i64) -> Result<Option<String>> {
+    pub async fn getblockhash(&self, height: i32) -> Result<Option<String>> {
         let response = self.call("getblockhash", vec![serde_json::json!(height)]).await;
 
         match response {

@@ -187,8 +187,7 @@ async fn main() -> Result<()> {
         let rpc = json_rpc_client.clone();
         match rpc.getblockcount().await {
             Ok(tip_height) => {
-                let tip = tip_height as i64;
-                if let Err(e) = accounting_service.reconcile_found_blocks(tip, |height| {
+                if let Err(e) = accounting_service.reconcile_found_blocks(tip_height, |height| {
                     let rpc = rpc.clone();
                     async move { rpc.getblockhash(height).await }
                 }).await {
@@ -260,8 +259,7 @@ async fn main() -> Result<()> {
         let rpc = json_rpc_client.clone();
         match rpc.getblockcount().await {
             Ok(tip_height) => {
-                let tip = tip_height as i64;
-                match payout_accounting.check_maturation(tip, config.pool.pplns.min_confirmations) {
+                match payout_accounting.check_maturation(tip_height, config.pool.pplns.min_confirmations) {
                     Ok(matured) => {
                         for block in &matured {
                             info!(

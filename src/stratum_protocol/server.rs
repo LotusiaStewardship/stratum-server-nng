@@ -695,8 +695,8 @@ async fn handle_submit(
             );
             (
                 validation,
-                job.template_id as i64,
-                job.template_epoch as i64,
+                job.template_id,
+                job.template_epoch,
                 // Per UBQ: share difficulty = P_diff at assignment time, not submission time.
                 // Look up the specific assigned job's P_diff rather than using the latest.
                 session.get_assigned_job(job_id)
@@ -710,7 +710,7 @@ async fn handle_submit(
             // accurate dedupe-key construction in persistence.
             let (recovered_tid, recovered_epoch) =
                 crate::stratum_protocol::job::parse_template_metadata_from_job_id(job_id)
-                    .unwrap_or((0i64, 0i64));
+                    .unwrap_or((0u64, 0u64));
             (
                 validator::ValidationResult::rejected("stale-job"),
                 recovered_tid,
@@ -721,8 +721,8 @@ async fn handle_submit(
             // Job not in cache and not in assigned_jobs — truly stale/unknown.
             (
                 validator::ValidationResult::rejected("stale-job"),
-                0i64,
-                0i64,
+                0u64,
+                0u64,
                 session.current_difficulty(),
             )
         };
@@ -851,11 +851,11 @@ async fn handle_submit(
                                         let _ = acct.record_found_block(
                                             round.id,
                                             &built_block_hash,
-                                            job.height as i64,
+                                            job.height,
                                             None,
-                                            Some(job.template_id as i64),
+                                            Some(job.template_id),
                                             Some("json-rpc"),
-                                            job.coinbase_value as i64,
+                                            job.coinbase_value,
                                             &job.network_target_hex,
                                         );
                                         // Close the round: transition from 'open' to 'found'

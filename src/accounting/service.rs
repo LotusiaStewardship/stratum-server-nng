@@ -52,8 +52,8 @@ impl AccountingService {
         worker_suffix: Option<&str>,
         session_id: &str,
         job_id: &str,
-        template_id: i64,
-        template_epoch: i64,
+        template_id: u64,
+        template_epoch: u64,
         extranonce1: &str,
         extranonce2: &str,
         ntime_hex: &str,
@@ -151,7 +151,7 @@ impl AccountingService {
 
     /// Get the current open round, creating one if needed.
     /// Records a `round_opened` accounting event when a new round is created.
-    pub fn get_or_create_current_round(&self, start_template_id: i64) -> Result<Round> {
+    pub fn get_or_create_current_round(&self, start_template_id: u64) -> Result<Round> {
         let (round, is_new) = self.round_repo.get_or_create_current_round(start_template_id)?;
         if is_new {
             let event = AccountingEvent {
@@ -177,7 +177,7 @@ impl AccountingService {
 
     /// Resolve which round a template belongs to.
     /// Records a `round_opened` accounting event when a new round is created.
-    pub fn resolve_round_for_template(&self, template_id: i64) -> Result<Round> {
+    pub fn resolve_round_for_template(&self, template_id: u64) -> Result<Round> {
         let (round, is_new) = self.round_repo.resolve_round_for_template(template_id)?;
         if is_new {
             let event = AccountingEvent {
@@ -202,7 +202,7 @@ impl AccountingService {
     }
 
     /// Close a round. Records a `round_closed` accounting event.
-    pub fn close_round(&self, id: i64, end_template_id: i64, status: &str) -> Result<()> {
+    pub fn close_round(&self, id: i64, end_template_id: u64, status: &str) -> Result<()> {
         self.round_repo.close_round(id, end_template_id, status)?;
         let event = AccountingEvent {
             id: 0,
@@ -234,11 +234,11 @@ impl AccountingService {
         &self,
         round_id: i64,
         block_hash: &str,
-        height: i64,
+        height: i32,
         worker_id: Option<i64>,
-        template_id: Option<i64>,
+        template_id: Option<u64>,
         persist_source: Option<&str>,
-        coinbase_value: i64,
+        coinbase_value: u64,
         network_target_hex: &str,
     ) -> Result<FoundBlock> {
         let block = self.found_block_repo.record_found_block(
@@ -294,7 +294,9 @@ impl AccountingService {
         use crate::share_processing::network_target_hex_to_difficulty;
 
         // 1. Read the coinbase_value and network difficulty from the found_block
-        let gross_reward = found_block.coinbase_value;
+        // NNG raw coinbase_value (u64) → CAmount/i64 (lotusd monetary domain).
+        // Safety: Lotus coinbase values are < 10^12 satoshis, well below i64::MAX.
+        let gross_reward = found_block.coinbase_value as i64;
         let network_difficulty = network_target_hex_to_difficulty(&found_block.network_target_hex)
             .unwrap_or(1.0);
         if found_block.coinbase_value == 0 {
@@ -636,11 +638,11 @@ impl AccountingService {
     /// `Ok(None)` if the height is above tip, or `Err` if the query failed.
     pub async fn reconcile_found_blocks<F, Fut>(
         &self,
-        tip_height: i64,
+        tip_height: i32,
         get_block_hash: F,
     ) -> Result<()>
     where
-        F: Fn(i64) -> Fut,
+        F: Fn(i32) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
     {
         let confirmed = self.found_block_repo.list(Some("immature"))?;
@@ -711,12 +713,12 @@ impl AccountingService {
     ///
     /// Returns the list of newly matured blocks so the caller can send
     /// maturation events to the payout handler.
-    pub fn check_maturation(&self, tip_height: i64, min_confirmations: u64) -> Result<Vec<FoundBlock>> {
+    pub fn check_maturation(&self, tip_height: i32, min_confirmations: u64) -> Result<Vec<FoundBlock>> {
         let immature = self.found_block_repo.list(Some("immature"))?;
         let mut matured = Vec::new();
         for block in &immature {
             let confirms = tip_height - block.height + 1;
-            if confirms >= min_confirmations as i64 {
+            if confirms >= min_confirmations as i32 {
                 self.found_block_repo.mark_matured(block.id)?;
                 tracing::info!(
                     hash = %block.block_hash,
@@ -1154,7 +1156,7 @@ mod tests {
         assert_eq!(round_before.status, "open", "round should start as 'open'");
 
         // Record a found block and close the round (as handle_submit should)
-        let template_id: i64 = 42;
+        let template_id: u64 = 42;
         let round = svc.resolve_round_for_template(template_id).unwrap();
         let _found = svc
             .record_found_block(round.id, "foundblockhash", 1000, None, Some(template_id), Some("json-rpc"), 0, "")
