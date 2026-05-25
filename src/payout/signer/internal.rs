@@ -16,9 +16,9 @@ use super::{SignedBatchData, Signer};
 /// Signer that builds, signs, and broadcasts payout transactions using an
 /// in-process private key.
 ///
-/// The private key is provided as 64-char hex at construction time.
-/// Transaction building uses `bitcoinsuite-core` types. Broadcasting goes
-/// through the configured Lotus JSON-RPC node.
+/// The private key is provided as hex (64 chars) or WIF format at
+/// construction time. Transaction building uses `bitcoinsuite-core` types.
+/// Broadcasting goes through the configured Lotus JSON-RPC node.
 pub struct InternalSigner {
     seckey: SecKey,
     pubkey: PubKey,
@@ -28,19 +28,13 @@ pub struct InternalSigner {
 impl InternalSigner {
     /// Create a new internal signer.
     ///
-    /// `private_key_hex` — 64-character hex string (32 bytes).
+    /// `private_key` — 32-byte hex string (64 chars) or WIF-encoded secret key.
     /// `rpc_client` — shared JSON-RPC client for broadcasting.
-    pub fn new(private_key_hex: &str, rpc_client: Arc<JsonRpcClient>) -> Result<Self> {
-        let key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| anyhow::anyhow!("invalid private key hex: {}", e))?;
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "private key must be 32 bytes (64 hex chars), got {} bytes",
-                key_bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&key_bytes);
+    pub fn new(private_key: &str, rpc_client: Arc<JsonRpcClient>) -> Result<Self> {
+        let parsed = SecKey::from_hex_or_wif(private_key)
+            .map_err(|e| anyhow::anyhow!("invalid private key: {}", e))?;
+        let arr: [u8; 32] = parsed.as_slice().try_into()
+            .expect("SecKey::from_hex_or_wif always returns 32 bytes");
 
         let ecc = EccSecp256k1::default();
         let seckey = ecc
@@ -307,6 +301,87 @@ mod tests {
             "tx hex should be substantial (got {} chars)",
             tx_hex.len()
         );
+    }
+
+    /// InternalSigner can be constructed with a WIF-format private key.
+    /// The full sign_and_submit pipeline works identically to hex keys.
+    #[tokio::test]
+    async fn test_internal_signer_with_wif_key() {
+        let expected_txid = "b1b2b3b4b5b6b7b8b9c0c1c2c3c4c5c6c7c8c9d0d1d2d3d4d5d6d7d8d9e0e1e2";
+        let (url, captured) = spawn_mock_rpc(json!({
+            "result": expected_txid,
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let rpc_client = Arc::new(JsonRpcClient::new(
+            &url,
+            "lotus",
+            "lotus",
+        ));
+
+        // Testnet WIF private key (from bitcoinsuite-core test fixture)
+        let wif_key = "cPymiBZp9Ak8aVAmrnh8TL8E4yoibD61KE7weuhXNbaMsJt2murF";
+        let signer = InternalSigner::new(wif_key, rpc_client)
+            .expect("InternalSigner construction should succeed with WIF key");
+
+        let data = test_signed_batch_data();
+        let txid = signer.sign_and_submit(&data).await
+            .expect("sign_and_submit should succeed with WIF-derived key");
+
+        assert_eq!(txid, expected_txid, "should return txid from RPC response");
+
+        // Verify the mock RPC received a sendrawtransaction call
+        let captured_body = captured.lock().unwrap().take()
+            .expect("mock RPC should have received a request");
+        assert!(
+            captured_body.contains("sendrawtransaction"),
+            "RPC call should be sendrawtransaction"
+        );
+        assert!(
+            captured_body.contains("params"),
+            "should have params"
+        );
+
+        // Verify the tx hex is valid
+        let captured_json: serde_json::Value = serde_json::from_str(
+            extract_json_body(&captured_body).unwrap_or("{}")
+        ).unwrap_or_default();
+        let params = captured_json["params"].as_array()
+            .expect("params should be an array");
+        let tx_hex = params[0].as_str()
+            .expect("first param should be tx hex");
+        assert!(
+            tx_hex.starts_with("02000000"),
+            "tx hex should start with version=2 (02000000), got: {}...",
+            &tx_hex[..std::cmp::min(16, tx_hex.len())]
+        );
+        assert!(
+            tx_hex.len() > 200,
+            "tx hex should be substantial (got {} chars)",
+            tx_hex.len()
+        );
+    }
+
+    /// InternalSigner rejects invalid private key material with a clear error.
+    #[tokio::test]
+    async fn test_internal_signer_rejects_invalid_key() {
+        let (url, _captured) = spawn_mock_rpc(json!(null)).await;
+        let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
+
+        let result = InternalSigner::new("not-a-valid-key", rpc_client);
+        match result {
+            Ok(_) => panic!("InternalSigner should reject garbage input"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("invalid private key"),
+                    "error should mention 'invalid private key', got: {}",
+                    msg
+                );
+            }
+        }
     }
 
     /// Helper: extract JSON body from an HTTP request string.
