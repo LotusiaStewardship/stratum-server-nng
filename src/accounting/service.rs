@@ -311,9 +311,10 @@ impl AccountingService {
         use crate::share_processing::network_target_hex_to_difficulty;
 
         // 1. Read the coinbase_value and network difficulty from the found_block
-        // NNG raw coinbase_value (u64) → CAmount/i64 (lotusd monetary domain).
-        // Safety: Lotus coinbase values are < 10^12 satoshis, well below i64::MAX.
-        let gross_reward = found_block.coinbase_value as i64;
+        // The coinbase_value is the total block reward (subsidy + fees), but the
+        // miner only receives the portion remaining after minerfund deduction.
+        // See payout::reward_from_coinbase for the mirror of lotusd's split logic.
+        let gross_reward = crate::payout::reward_from_coinbase(found_block.coinbase_value);
         let network_difficulty =
             network_target_hex_to_difficulty(&found_block.network_target_hex).unwrap_or(1.0);
         if found_block.coinbase_value == 0 {
@@ -1727,11 +1728,11 @@ mod tests {
         );
         assert_eq!(batch.round_id, 1);
 
-        // Fee = 10000 * 200 / 10000 = 200 sat
-        assert_eq!(batch.pool_fee_amount, 200);
+        // Fee = 5000 * 200 / 10000 = 100 sat (after minerfund deduction)
+        assert_eq!(batch.pool_fee_amount, 100);
         assert_eq!(batch.pool_fee_address.as_deref(), Some("fee_pool"));
 
-        // Gross = 10000, Fee = 200, Net = 9800
+        // Gross = 5000, Fee = 100, Net = 4900
         // Alice: (300 + 50 dust_weight) / (400 + 50 dust_weight) ≈ 0.7778 of net
         // Bob: 100 / (400 + 50 dust_weight) ≈ 0.2222 of net
         // We don't check exact amounts (dust weight makes it fuzzy); verify sums instead.
@@ -1740,12 +1741,12 @@ mod tests {
         let total_dust: i64 = payouts.iter().map(|p| p.dust_carried_forward).sum();
         assert_eq!(
             total_payouts + batch.pool_fee_amount + total_dust,
-            10000,
+            5000,
             "gross reward should equal sum of payouts + fee + dust",
         );
 
         // Fee is tracked in payout_batches.pool_fee_amount, not in individual payouts.
-        assert_eq!(batch.pool_fee_amount, 200);
+        assert_eq!(batch.pool_fee_amount, 100);
         assert_eq!(batch.pool_fee_address.as_deref(), Some("fee_pool"));
 
         // Verify Alice (worker 1) and Bob (worker 2) each have a payout
