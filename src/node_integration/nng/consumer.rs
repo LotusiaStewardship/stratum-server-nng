@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::accounting::{AccountingEvent, AccountingService, ChainTip};
 use crate::node_integration::{template_to_job, JobCache, NngRpcClient};
 use crate::stratum_protocol::job::MiningJob;
-use bitcoinsuite_core::Hashed;
+use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 
 /// Debounce duration for miningwrkchg events: 100ms.
 const MINING_WORK_COALESCE_MS: u64 = 100;
@@ -112,7 +112,15 @@ impl NngEventConsumer {
                                 timestamp = event.block.header.timestamp,
                                 "block connected event payload",
                             );
-                            node_int_debug!(block_hash, "received blkconnected event");
+                            if let Some(ref acct) = self.accounting {
+                                handle_block_connected(
+                                    event,
+                                    acct,
+                                    &self.chain_tip,
+                                    &self.maturation_tx,
+                                    self.min_confirmations,
+                                ).await;
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -196,42 +204,7 @@ impl NngEventConsumer {
             node_int_warn!("no active session consumers for new job broadcast");
         }
 
-        // Update chain tip and check maturation only on height-changing events.
-        // NewTip: tip advanced by one. Reorg: tip changed to a different height.
-        // MempoolRefresh and ManualInvalidation don't change the tip height.
-        use bitcoinsuite_bitcoind_nng::MiningWorkChangedReason;
-        match event.reason {
-            MiningWorkChangedReason::NewTip | MiningWorkChangedReason::Reorg => {
-                self.chain_tip.update_block_connected(event.height);
-                let tip = self.chain_tip.get();
-                if let Some(ref acct) = self.accounting {
-                    match acct.check_maturation(tip, self.min_confirmations) {
-                        Ok(matured_blocks) => {
-                            for matured in &matured_blocks {
-                                node_int_debug!(
-                                    hash = %matured.block_hash,
-                                    height = matured.height,
-                                    "block matured, sending payout event",
-                                );
-                                let _ = self.maturation_tx.send(matured.block_hash.clone());
-                            }
-                        }
-                        Err(e) => {
-                            node_int_warn!(
-                                error = %e,
-                                "maturation check failed after miningwrkchg",
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {
-                node_int_debug!(
-                    reason = ?event.reason,
-                    "skipping maturation check — not a height-changing event",
-                );
-            }
-        }
+
     }
 }
 
@@ -316,6 +289,54 @@ pub(crate) async fn handle_block_disconnected(
     }
 }
 
+/// Handle a block connected event: update chain tip, check for block maturation,
+/// and send maturation events to the payout handler.
+///
+/// The block height is decoded from the serialized Lotus header bytes in
+/// `event.block.header.raw`.
+pub(crate) async fn handle_block_connected(
+    event: bitcoinsuite_bitcoind_nng::BlockConnected,
+    accounting: &AccountingService,
+    chain_tip: &ChainTip,
+    maturation_tx: &mpsc::UnboundedSender<String>,
+    min_confirmations: u64,
+) {
+    // Decode height from the serialized Lotus header
+    let height = match LotusHeader::deser(&mut Bytes::from_slice(&event.block.header.raw)) {
+        Ok(header) => header.height,
+        Err(e) => {
+            node_int_error!(
+                hash = %event.block.header.hash.to_hex_be(),
+                error = %e,
+                "failed to decode Lotus header from BlockConnected event"
+            );
+            return;
+        }
+    };
+
+    chain_tip.update_block_connected(height);
+    let tip = chain_tip.get();
+
+    match accounting.check_maturation(tip, min_confirmations) {
+        Ok(matured_blocks) => {
+            for matured in &matured_blocks {
+                node_int_debug!(
+                    hash = %matured.block_hash,
+                    height = matured.height,
+                    "block matured via blkconnected event",
+                );
+                let _ = maturation_tx.send(matured.block_hash.clone());
+            }
+        }
+        Err(e) => {
+            node_int_warn!(
+                error = %e,
+                "maturation check failed after blkconnected",
+            );
+        }
+    }
+}
+
 /// Coalesce rapid miningwrkchg events.
 ///
 /// Reads raw events from `input`. Each time an event arrives, waits up to 100ms
@@ -356,13 +377,52 @@ async fn coalesce_events(
 mod tests {
     use super::*;
     use bitcoinsuite_bitcoind_nng::{Block, BlockHeader};
-    use bitcoinsuite_core::{Hashed, Sha256d};
+    use bitcoinsuite_core::{BitcoinCode, Bytes, BytesMut, Hashed, LotusHeader, Sha256d};
     use parking_lot::Mutex;
     use rusqlite::Connection;
     use tempfile::NamedTempFile;
     use tokio::sync::broadcast;
 
     use crate::accounting::{init_schema, FoundBlockRepository};
+
+    fn make_header_bytes(height: i32) -> Vec<u8> {
+        let header = LotusHeader {
+            prev_block: Sha256d::new([0u8; 32]),
+            bits: 0x1d00ffff,
+            timestamp: 1_700_000_000,
+            reserved: 0,
+            nonce: 0,
+            version: 1,
+            size: 1000,
+            height,
+            epoch_hash: Sha256d::new([0u8; 32]),
+            merkle_root: Sha256d::new([0u8; 32]),
+            extended_metadata_hash: Sha256d::new([0u8; 32]),
+        };
+        let mut buf = BytesMut::new();
+        header.ser_to(&mut buf);
+        buf.freeze().to_vec()
+    }
+
+    fn make_block_connected(height: i32) -> bitcoinsuite_bitcoind_nng::BlockConnected {
+        let raw = make_header_bytes(height);
+        bitcoinsuite_bitcoind_nng::BlockConnected {
+            block: Block {
+                header: BlockHeader {
+                    raw,
+                    hash: Sha256d::new([0u8; 32]),
+                    prev_hash: Sha256d::new([0u8; 32]),
+                    n_bits: 0,
+                    timestamp: 0,
+                },
+                metadata: vec![],
+                txs: vec![],
+                file_num: 0,
+                data_pos: 0,
+                undo_pos: 0,
+            },
+        }
+    }
 
     fn make_block_disconnected(hash_hex: &str) -> BlockDisconnected {
         let hash = Sha256d::from_hex_be(hash_hex).unwrap_or_else(|_| Sha256d::new([0u8; 32]));
@@ -612,5 +672,88 @@ mod tests {
     #[tokio::test]
     async fn test_miningwrkchg_deserialization() {
         unimplemented!("test requires real-world NNG flatbuffer data");
+    }
+
+    // ---- BlockConnected handler tests ----
+
+    #[tokio::test]
+    async fn test_blkconnected_height_parsing() {
+        let event = make_block_connected(1000);
+        let height = LotusHeader::deser(&mut Bytes::from_slice(&event.block.header.raw))
+            .unwrap()
+            .height;
+        assert_eq!(height, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_updates_chain_tip() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<String>();
+
+        let event = make_block_connected(500);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        assert_eq!(chain_tip.get(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_triggers_maturation() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<String>();
+
+        // Record a found_block at height 100 (immature)
+        let round = accounting.resolve_round_for_template(42).unwrap();
+        accounting
+            .record_found_block(round.id, "block1", 100, None, Some(42), Some("json-rpc"), 50000, "00000000ffff0000000000000000000000000000000000000000000000000000")
+            .unwrap();
+
+        // BlockConnected at height 200 → confirmations = 200 - 100 + 1 = 101 >= 100
+        let event = make_block_connected(200);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        // The immature block should be matured
+        let found = accounting.found_block_repo.get_by_hash("block1").unwrap().unwrap();
+        assert_eq!(found.status, "matured");
+
+        // The hash should appear on the maturation channel
+        let received = tokio::time::timeout(Duration::from_millis(100), maturation_rx.recv())
+            .await
+            .expect("should receive maturation event")
+            .expect("channel should not be closed");
+        assert_eq!(received, "block1");
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_no_pool_blocks() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        // Set up a round (required for record_found_block to work if we add one)
+        let _ = conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'open')",
+            [],
+        );
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<String>();
+
+        // BlockConnected at a high height with no pool blocks in DB
+        let event = make_block_connected(99999);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        // Chain tip should still advance
+        assert_eq!(chain_tip.get(), 99999);
+
+        // No maturation events should be sent
+        let result = tokio::time::timeout(Duration::from_millis(50), maturation_rx.recv()).await;
+        assert!(result.is_err(), "no maturation event should be sent for non-pool blocks");
     }
 }

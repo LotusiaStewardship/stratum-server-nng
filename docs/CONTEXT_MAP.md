@@ -1,6 +1,6 @@
 # Context Map
 
-**Last updated:** 2026-05-22
+**Last updated:** 2026-05-27
 
 Bounded contexts within the `stratum-server-nng` binary. All contexts live in a single process but have clear module boundaries and ownership.
 
@@ -12,14 +12,15 @@ Bounded contexts within the `stratum-server-nng` binary. All contexts live in a 
                     └────────┬────────┘
                              │ NNG pub/sub + RPC
                              ▼
-┌─────────────────────────────────────────────┐
-│           Node Integration                  │
-│  (template fetch, event consumer, job cache)│
-└───────────┬──────────────────────┬──────────┘
-            │ MiningJob            │ events
-            ▼                      ▼
-┌──────────────────────┐  ┌──────────────────┐
-│    Stratum Core      │  │   HTTP API       │
+┌─────────────────────────────────────────────────┐
+│              Node Integration                   │
+│  (template fetch, event consumer, job cache,    │
+│   chain state, payout maturation triggers)      │
+└───────┬──────────────────────┬──────────────────┘
+        │ MiningJob            │ matured block hashes
+        ▼                      ▼
+┌──────────────────┐  ┌──────────────────┐
+│   Stratum Core   │  │   HTTP API       │
 │ (TCP server, protocol│  │ (operator routes) │
 │  sessions, VarDiff,  │  └────────┬─────────┘
 │  share validation)    │           │

@@ -1,6 +1,6 @@
 # Node Integration Context
 
-**Last updated:** 2026-05-22  
+**Last updated:** 2026-05-27  
 **Related spec:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -12,7 +12,7 @@ The **Node Integration** context owns all communication with the lotusd node —
 
 ### Boundary
 
-- **Inside:** NNG RPC client (template fetch, connect/disconnect lifecycle), NNG pub/sub consumer (miningwrkchg, blkdisconctd), JSON-RPC HTTP client (submitblock, getblockcount, getblockhash), template → MiningJob conversion, block building from template bytes, job caching
+- **Inside:** NNG RPC client (template fetch, connect/disconnect lifecycle), NNG pub/sub consumer (miningwrkchg, blkconnected, blkdisconctd), JSON-RPC HTTP client (submitblock, getblockcount, getblockhash), template → MiningJob conversion, block building from template bytes, job caching
 - **Outside:** Stratum protocol, share validation, HTTP API
 
 ### Dependencies
@@ -20,7 +20,7 @@ The **Node Integration** context owns all communication with the lotusd node —
 | Module | Depends On | Purpose |
 |--------|-----------|---------|
 | `nng/rpc_client` | `bitcoinsuite-bitcoind-nng` | NNG IPC connection, get_mining_template |
-| `nng/consumer` | `nng/rpc_client`, Accounting | Pub/sub event handling, template change broadcasts |
+| `nng/consumer` | `nng/rpc_client`, Accounting | Pub/sub event handling, template change broadcasts, chain state tracking, payout maturation triggers |
 | `json_rpc/client` | `reqwest` | HTTP JSON-RPC for submitblock and chain queries |
 | `template` | `bitcoinsuite-bitcoind-nng`, `stratum_protocol::job` | MiningTemplate → MiningJob conversion |
 | `block_builder` | `bitcoinsuite`, `stratum_protocol::job` | Full block reconstruction for submitblock |
@@ -48,7 +48,10 @@ src/node_integration/
 - **`template_to_job(template, clean_jobs) -> MiningJob`** — Converts a `MiningTemplate` from lotusd into a `MiningJob` ready for Stratum dispatch. Handles epoch assignment, coinbase extraction, merkle branch parsing, and block byte capture.
 - **`build_submit_block(job, extranonce1, extranonce2, ntime, nonce) -> Vec<u8>`** — Reconstructs the full serialized block for `submitblock` RPC. Replaces the template coinbase with the miner's reconstructed coinbase, builds the header via `build_stratum_header`, and updates the merkle root and size to match the validator's computation.
 - **`verify_coinbase_outputs(template)`** — Checks that the template coinbase has at least one non-OP_RETURN output. Warns at startup if all outputs are OP_RETURN (would burn block rewards).
-- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms) and `blkdisconctd` (immediate) events. Forwards new jobs via `broadcast::Sender` to all active sessions. Injects the `MiningWorkChanged.reason` into `MiningJob.reason` before broadcast so miners receive a human-readable explanation for the work change. Records orphaned found_blocks via AccountingService on `blkdisconctd`.
+- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms), `blkconnected` (immediate), and `blkdisconctd` (immediate) events.
+  - `miningwrkchg` → template fetch, job conversion, broadcast via `broadcast::Sender` to all sessions. Injects the reason code into `MiningJob.reason` for miner-facing explanations. **No chain state or payout logic.**
+  - `blkconnected` → decodes block height from Lotus header bytes via `LotusHeader::deser()`, updates `ChainTip`, calls `check_maturation()`, and sends matured block hashes through the payout maturation channel. **Sole driver of runtime chain-state tracking and payout triggers.**
+  - `blkdisconctd` → records orphaned found_blocks via AccountingService on matched block hash.
 
 ### Reorg Detection
 
