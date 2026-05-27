@@ -1,520 +1,217 @@
-# Stratum Mining Pool — Frequently Asked Questions
+# Frequently Asked Questions
 
-Welcome! This FAQ answers common questions about mining with the Lotus pool, the Stratum V1 protocol, payout methods, and how the pool works under the hood.
-
----
-
-## Table of Contents
-
-- [General](#general)
-  - [What is this pool?](#what-is-this-pool)
-  - [What is Lotus?](#what-is-lotus)
-  - [Do I need to run a Lotus node to mine?](#do-i-need-to-run-a-lotus-node-to-mine)
-- [Stratum V1 Protocol](#stratum-v1-protocol)
-  - [What is Stratum V1?](#what-is-stratum-v1)
-  - [How does a miner connect to the pool?](#how-does-a-miner-connect-to-the-pool)
-  - [What is extranonce?](#what-is-extranonce)
-  - [What does a mining.notify message contain?](#what-does-a-miningnotify-message-contain)
-  - [What is a "share"?](#what-is-a-share)
-- [Difficulty & VarDiff](#difficulty--vardiff)
-  - [What is mining difficulty?](#what-is-mining-difficulty)
-  - [What is VarDiff?](#what-is-vardiff)
-  - [How does VarDiff adjust my difficulty?](#how-does-vardiff-adjust-my-difficulty)
-  - [What difficulty should I start with?](#what-difficulty-should-i-start-with)
-  - [Can I suggest a difficulty?](#can-i-suggest-a-difficulty)
-- [Payout Methods](#payout-methods)
-  - [What is PPLNS?](#what-is-pplns)
-  - [How does PPLNS reward me?](#how-does-pplns-reward-me)
-  - [What does "N" mean in PPLNS?](#what-does-n-mean-in-pplns)
-  - [How does PPLNS compare to PPS?](#how-does-pplns-compare-to-pps)
-  - [How does PPLNS compare to proportional payouts?](#how-does-pplns-compare-to-proportional-payouts)
-  - [Does the pool charge a fee?](#does-the-pool-charge-a-fee)
-  - [What is dust, and how does the pool handle it?](#what-is-dust-and-how-does-the-pool-handle-it)
-- [Payouts](#payouts)
-  - [When do I get paid?](#when-do-i-get-paid)
-  - [Why is there a minimum payout threshold?](#why-is-there-a-minimum-payout-threshold)
-  - [What does "matured" mean?](#what-does-matured-mean)
-  - [How are payouts distributed?](#how-are-payouts-distributed)
-- [Mining Setup](#mining-setup)
-  - [What mining software should I use?](#what-mining-software-should-i-use)
-  - [How do I configure my miner?](#how-do-i-configure-my-miner)
-  - [What worker name format should I use?](#what-worker-name-format-should-i-use)
-  - [What port should I connect to?](#what-port-should-i-connect-to)
-- [Shares & Validation](#shares--validation)
-  - [What is a stale share?](#what-is-a-stale-share)
-  - [What is a duplicate share?](#what-is-a-duplicate-share)
-  - [What is a low-difficulty share?](#what-is-a-low-difficulty-share)
-  - [What is an orphaned block?](#what-is-an-orphaned-block)
-  - [What causes rejected shares?](#what-causes-rejected-shares)
-- [Advanced / Technical](#advanced--technical)
-  - [How does the pool communicate with Lotus?](#how-does-the-pool-communicate-with-lotus)
-  - [Does the pool support high availability (HA)?](#does-the-pool-support-high-availability-ha)
-  - [What networks are supported?](#what-networks-are-supported)
-  - [Where is accounting data stored?](#where-is-accounting-data-stored)
-  - [Is there an API for monitoring?](#is-there-an-api-for-monitoring)
+Common questions about mining with a Lotus pool running `stratum-server-nng`.
 
 ---
 
 ## General
 
-### What is this pool?
+### What is stratum-server-nng?
 
-This is a **production-grade Stratum V1 mining pool server** for the Lotus blockchain. It implements the PPLNS (Pay Per Last N Shares) reward system, variable difficulty (VarDiff) for miners, and automated payout processing via a built-in scheduler.
-
-The pool connects to a Lotus daemon (`lotusd`) via **NNG (nanomsg-next-generation)** for mining template retrieval and block submission, and uses **SQLite** for accounting (tracking shares, workers, rounds, and payouts).
+It is the mining pool server software that connects Stratum V1 miners to the Lotus network. It communicates with a `lotusd` node via NNG (Nanomsg Next Generation) to fetch mining templates, receive blockchain events, and submit blocks. It handles share validation, difficulty adjustment, accounting, and PPLNS-based payouts in a single process.
 
 ### What is Lotus?
 
-Lotus is a blockchain based on the Bitcoin codebase with modifications. It uses the same proof-of-work mining fundamentals — miners compete to find valid blocks by performing hash computations. The pool described here is specifically designed for Lotus's consensus rules, including its block structure, coinbase transaction format, and address encoding.
+Lotus is a UTXO-based blockchain (a Bitcoin fork) designed for high-throughput applications. It uses a proof-of-work consensus mechanism compatible with Bitcoin-style ASIC and GPU mining hardware.
 
 ### Do I need to run a Lotus node to mine?
 
-**No.** You only need mining hardware (ASIC or CPU/GPU miner) and mining software that supports Stratum V1. The pool operator runs the Lotus node (`lotusd`) and this pool server. You simply point your miner to the pool's Stratum endpoint.
-
-For GPU mining, the recommended software is **lotus-gpu-miner** (see [What mining software should I use?](#what-mining-software-should-i-use)).
+You do not need a node yourself — you connect your miner to the pool's stratum address. The pool operator runs one or more `lotusd` nodes that the server communicates with.
 
 ---
 
-## Stratum V1 Protocol
+## Mining & Protocol
 
 ### What is Stratum V1?
 
-**Stratum V1** is the dominant mining pool protocol, introduced in late 2012 as a replacement for the older `getwork` protocol. It uses **plain-text JSON messages over a persistent TCP connection** and is supported by virtually all mining software and hardware.
-
-Key characteristics:
-- **Persistent connection** — the miner maintains one open TCP socket to the pool.
-- **JSON-RPC style** — messages are JSON objects with an `id`, `method`, and `params`.
-- **Server-driven** — the pool pushes new work (`mining.notify`) to miners as blocks are found or mempool changes.
-- **No formal BIP** — the protocol evolved through implementation rather than a formal standard, so minor variations exist between pools.
+Stratum V1 is the most widely supported mining protocol. It works in a push model: the pool sends `mining.notify` messages with new block templates, and miners respond with `mining.submit` messages containing their share solutions. The pool never asks for work — it tells miners what to work on.
 
 ### How does a miner connect to the pool?
 
-The connection follows a standard Stratum V1 handshake:
+Miners connect via TCP to the pool's stratum port (default `0.0.0.0:3334` for mainnet). The flow is:
 
-1. **Subscribe** — The miner sends `mining.subscribe` to register with the pool. The pool responds with a unique `extranonce1`, subscription IDs, and the expected `extranonce2` size. The pool then sends `mining.set_extranonce` with `[extranonce1, extranonce2_size]` as a notification per Stratum V1 standard.
-2. **Authorize** — The miner sends `mining.authorize` with its worker name (e.g., `lotus_YourAddress.rig0`). The pool validates the worker name and begins tracking shares for that worker.
-3. **Receive work** — The pool sends `mining.notify` with a new mining job (block header template, merkle branches, etc.).
-4. **Submit shares** — The miner sends `mining.submit` with a candidate share (nonce, timestamp, etc.). The pool validates it and responds with accepted/rejected.
-5. **Difficulty adjustment** — The pool may send `mining.set_difficulty` at any time to adjust the miner's required share difficulty.
+1. **Connect** — open TCP connection to the stratum address
+2. **`mining.subscribe`** — miner subscribes, receives `extranonce1` and `extranonce2_size`
+3. **`mining.authorize`** — miner authenticates with `address[.suffix]` as worker name and an arbitrary password
+4. **`mining.set_difficulty`** — pool sends initial per-session difficulty
+5. **`mining.notify`** — pool pushes new mining jobs as they arrive from lotusd
+6. **`mining.submit`** — miner submits solved shares
 
 ### What is extranonce?
 
-The **extranonce** is a pool-assigned unique value that ensures each miner searches a different portion of the nonce space, preventing miners from duplicating each other's work.
+Extranonce is a Stratum V1 mechanism that lets the pool assign part of the nonce space to each connected miner, preventing duplicate work. This server uses a 4-byte `extranonce1` (assigned per-session, derived from a counter) and a 4-byte `extranonce2` (chosen by the miner per-share).
 
-- **extranonce1** — A per-connection unique hex string assigned by the pool during subscription.
-- **extranonce2** — A value chosen and incremented by the miner itself (typically 4 bytes).
+| Field | Size | Who assigns | Purpose |
+|---|---|---|---|
+| `extranonce1` | 4 bytes (8 hex) | Pool | Unique per connection; ensures each miner searches a distinct nonce space |
+| `extranonce2` | 4 bytes (8 hex) | Miner | Incremented per share; combined with nonce and ntime for the full header |
 
-Together with the standard nonce, these values create a unique search space for each miner. The pool combines `extranonce1 + extranonce2` into the coinbase transaction, which affects the merkle root and therefore the block header hash.
+### How does difficulty work?
 
-### What does a `mining.notify` message contain?
+Difficulty is managed at two levels:
 
-A `mining.notify` is the pool's way of sending new work to miners. It includes:
+**Network difficulty (N_diff)** — derived from the `network_target_hex` in each `MiningTemplate` published by lotusd. This reflects the current network-wide mining difficulty. It is the ceiling for per-session difficulty.
 
-| Field | Description |
-|-------|-------------|
-| **Job ID** | Unique identifier; miners include this when submitting shares |
-| **Previous block hash** | Used to construct the block header |
-| **Coinbase part 1** | First portion of the coinbase transaction (before extranonce) |
-| **Coinbase part 2** | Second portion of the coinbase transaction (after extranonce) |
-| **Merkle branches** | Hashes used to build the merkle root |
-| **Block version** | Version number for the block header |
-| **nBits** | Encoded network difficulty target |
-| **nTime** | Current time (miners may use time rolling) |
-| **Clean jobs** | If `true`, miners should drop current work and start the new job immediately |
+**Per-session variable difficulty (VarDiff)** — each TCP connection gets an independent `VarDiff` instance that starts at a configurable fraction of network difficulty (default 1%) and adjusts dynamically based on the miner's share submission rate. The goal is to keep each miner submitting shares at a steady cadence (default target: one share every 15 seconds). The difficulty is clamped between a configurable floor (`min_floor`, default 0.001) and the current network difficulty.
 
-New `mining.notify` messages are sent whenever the network finds a new block, the mempool changes significantly, or the pool needs to update the difficulty.
+### What does a mining.notify message contain?
 
-### What is a "share"?
+Each `mining.notify` message includes:
 
-A **share** is a valid block header hash that meets the **pool's difficulty target** (which is lower than the network's difficulty target). It proves the miner performed work, even though the share itself may not meet the full network difficulty required to find a block.
+- **`job_id`** — unique identifier for this job
+- **`prevhash`** — previous block hash (little-endian hex)
+- **`coinbase1`** — first part of coinbase transaction (before extranonce)
+- **`coinbase2`** — second part of coinbase transaction (after extranonce)
+- **`merkle_branch`** — merkle tree branches for the header
+- **`version`** — block version
+- **`nbits`** — network target (compact bits)
+- **`ntime`** — current timestamp
+- **`clean_jobs`** — if true, all previous jobs are stale
 
-- Shares are the **proof of work** miners submit to the pool.
-- The pool uses shares to measure each miner's contribution and determine payout proportions.
-- Shares are classified as **accepted**, **stale**, **duplicate**, **invalid**, or **low-difficulty** (see [Shares & Validation](#shares--validation)).
+### What happens when I submit a share?
 
----
+The server validates your submission through a pipeline:
 
-## Difficulty & VarDiff
+1. **Format check** — `extranonce2`, `ntime`, and `nonce` must be valid hex strings of the correct length
+2. **Session check** — the worker must be subscribed and authorized
+3. **Job staleness check** — the referenced `job_id` must be in the session's active job list
+4. **ntime range check** — `ntime` must be within the job's valid window (job time ± 20 minutes)
+5. **Duplicate check** — identical submissions (by dedupe key) are rejected
+6. **Proof-of-work check** — the block header hash must meet the session's current difficulty target
+7. **Low-difficulty check** — if the hash meets the session target but not network target, it is accepted as a share (no block found)
 
-### What is mining difficulty?
-
-**Difficulty** is a measure of how hard it is to find a valid block hash. It's a number — higher means harder. The network adjusts difficulty periodically to maintain a consistent block time.
-
-For mining pools, there are **two difficulty levels**:
-- **Network difficulty** — The target set by the blockchain. A block must meet this to be valid on the network.
-- **Share difficulty** — The (lower) target set by the pool. Shares meeting this difficulty are accepted as proof of work.
-
-For example, if the network difficulty is 100,000, the pool might set a share difficulty of 1.0, meaning miners submit ~100,000 shares for every block found.
-
-### What is VarDiff?
-
-**VarDiff (Variable Difficulty)** is an automatic per-miner difficulty adjustment system. Instead of using a single fixed difficulty for all miners, VarDiff dynamically adjusts each miner's difficulty based on their observed **share submission rate**.
-
-This pool uses **network-aware dynamic difficulty**:
-1. The pool's baseline difficulty **automatically tracks the network difficulty** from `lotusd`.
-2. VarDiff then **fine-tunes per-miner** from that baseline based on how fast shares arrive.
-
-### How does VarDiff adjust my difficulty?
-
-VarDiff works on a simple principle: **target a specific time between accepted shares**.
-
-- The pool has a **target share interval** (default: 15 seconds).
-- If your shares arrive **faster** than the target, VarDiff **increases** your difficulty (you're too fast).
-- If your shares arrive **slower** than the target, VarDiff **decreases** your difficulty (you're too slow).
-- Adjustments are **clamped** to ±50% per retarget to prevent wild swings.
-- Retargeting happens every 90 seconds (configurable), giving the system enough data for stable decisions.
-
-Your difficulty is also **capped** at the current network difficulty — it can never exceed that.
-
-### What difficulty should I start with?
-
-You don't need to choose! New miners start at **1% of the current network difficulty** and VarDiff ramps up based on your actual hashrate. This means:
-- Small miners (CPU/mobile) get easy initial shares and ramp up quickly.
-- Large miners (ASICs) get their difficulty increased rapidly to match their hashrate.
-
-You can optionally suggest a difficulty using `mining.suggest_difficulty`, but the pool's VarDiff system will still make the final decision.
-
-### Can I suggest a difficulty?
-
-Yes. Stratum V1 supports `mining.suggest_difficulty`, where a miner can request a preferred share difficulty. However, this pool treats suggestions as **advisory only** — VarDiff makes the final call based on observed share rates.
-
----
-
-## Payout Methods
-
-### What is PPLNS?
-
-**PPLNS** stands for **"Pay Per Last N Shares"**. It is the payout method used by this pool.
-
-Under PPLNS, when the pool finds a block, the reward is distributed among miners who contributed shares within a **rolling window of work** (the "last N shares"). The window size is measured in **work units** (share difficulty × number of shares), not a fixed count.
-
-Key properties:
-- **No rounds** — PPLNS doesn't have discrete "rounds" like proportional pools. The window continuously rolls forward.
-- **Pool-friendly** — Miners who stay connected long-term benefit more, as they always have shares in the window.
-- **Anti-pool-hopping** — Unlike proportional systems, PPLNS discourages pool-hopping (jumping between pools based on luck).
-
-### How does PPLNS reward me?
-
-When the pool finds a block:
-1. The pool looks back at the **PPLNS window** (configured as `N × the expected work for one block`).
-2. All **accepted shares** within that window are collected, weighted by their difficulty.
-3. Each miner receives a **proportional share** of the block reward based on their work units.
-
-For example, if the window contains 10,000 work units total and you contributed 500, you receive **5%** of the net reward.
-
-### What does "N" mean in PPLNS?
-
-**N** is a multiplier that defines the size of the PPLNS window:
-
-- **N = 1.0** → The window covers roughly the expected amount of work needed to find **one block**.
-- **N > 1.0** → Larger window, more smoothing, slower responsiveness.
-- **N < 1.0** → Smaller window, less smoothing, faster responsiveness.
-
-This pool defaults to **N = 2.0** (industry standard), meaning the window spans approximately two blocks' worth of work. This provides better variance smoothing while remaining responsive to miner contributions.
-
-### How does PPLNS compare to PPS?
-
-| Feature | PPLNS | PPS (Pay Per Share) |
-|---------|-------|---------------------|
-| **Payout timing** | When pool finds a block | Immediately per share |
-| **Pool risk** | Shared with miners | Borne by pool operator |
-| **Fees** | Lower (1–3%) | Higher (2–5%+) |
-| **Pool-hopping** | Discouraged | Encouraged |
-| **Variance** | Higher for miners | None for miners |
-| **Simplicity** | Moderate | Simple for miners |
-
-**PPS** pays miners a fixed rate per accepted share regardless of whether the pool finds blocks. The pool operator absorbs the variance risk (and charges higher fees for it). **PPLNS** ties payouts to actual blocks found, meaning miners share in the pool's luck.
-
-### How does PPLNS compare to proportional payouts?
-
-**Proportional (Prop)** divides each block's reward among miners who submitted shares **during that round only** (from the previous block to the current one).
-
-| Feature | PPLNS | Proportional |
-|---------|-------|-------------|
-| **Window** | Rolling (N blocks of work) | Discrete rounds |
-| **Pool-hopping** | Discouraged | Exploitable |
-| **Long-term miner bonus** | Yes — always in window | No — only active rounds |
-| **Round orphaning** | Partially protected | Full loss if round is orphaned |
-
-PPLNS is generally preferred by long-term miners because it provides more consistent income and protects against pool-hoppers.
-
-### Does the pool charge a fee?
-
-Yes. The pool charges a configurable fee in **basis points (bps)**. The default is **100 bps (1.00%)**.
-
-- The fee is deducted from the **gross block reward** before miner payouts.
-- If the fee is 1% and the block reward is 1,000,000 satoshis, the pool takes 10,000 satoshis and distributes 990,000 among miners.
-- Fee collection can be **disabled** in the configuration.
-
-### What is dust, and how does the pool handle it?
-
-**Dust** refers to tiny payout amounts below the minimum payout threshold (default: **546 satoshis**, the standard Bitcoin/Lotus dust limit).
-
-Instead of creating unspendable dust outputs on-chain, the pool:
-1. **Tracks dust** per-address in a separate ledger.
-2. **Carries forward** dust to the next payout — it accumulates until it reaches the minimum threshold.
-3. When accumulated dust + new payout ≥ minimum, the combined amount is paid out.
-
-This ensures no value is lost to dust while avoiding bloated transactions with tiny outputs.
+Accepted shares are persisted to the accounting database and contribute to the PPLNS payout window.
 
 ---
 
 ## Payouts
 
-### When do I get paid?
+### How does PPLNS work?
 
-Payouts are processed on a **scheduled interval** (default: every **3,600 seconds / 1 hour**). The payout scheduler:
-1. Checks for **matured blocks** (blocks old enough that their coinbase reward can be spent).
-2. Calculates each miner's share of the reward using PPLNS.
-3. Builds and broadcasts a payout transaction to the network.
+PPLNS (Pay Per Last N Shares) rewards miners based on their contribution to the most recent shares, weighted by difficulty. When a block is found, the payout algorithm:
 
-If multiple mature blocks are waiting, the scheduler processes them one at a time (up to 10 per interval) to avoid overwhelming the node.
+1. Determines the PPLNS window: `N = n_multiplier × network_difficulty` (in cumulative difficulty units)
+2. Selects all shares within that window, ordered by submission time
+3. Computes each miner's weight as their share difficulty divided by total window difficulty
+4. Deducts the pool fee (configurable in basis points)
+5. Distributes the net block reward proportionally to each miner
+6. Addresses below `min_payout_sat` (default 546) are held as dust balances instead of creating zero-value outputs
 
-### Why is there a minimum payout threshold?
+### When are payouts processed?
 
-The minimum payout threshold (default: **546 satoshis**) prevents the creation of **dust outputs** — tiny transaction outputs that cost more in fees than they're worth to spend.
+Payouts are processed automatically when a found block reaches maturity (default 100 confirmations). The server monitors the chain tip — when a `BlockConnected` event shows a previously immature block now meets the maturity threshold, a payout batch is created, signed, and broadcast.
 
-If your share of a block reward is below this threshold, the amount is stored as **dust** and carried forward to future payouts (see [What is dust?](#what-is-dust-and-how-does-the-pool-handle-it)).
-
-### What does "matured" mean?
-
-Per Bitcoin/Lotus consensus rules, **coinbase rewards cannot be spent until 100 blocks** have been mined after the block containing them. This is called **coinbase maturity**.
-
-A block goes through this lifecycle:
-1. **Found** — The pool submits a valid block to the network.
-2. **Confirmed** — The block has at least one confirmation (another block built on top).
-3. **Matured** — The block has ≥100 confirmations (configurable minimum, floored at 100). The coinbase reward can now be spent.
-4. **Paid** — The payout scheduler has distributed the reward to miners.
-
-If the block is **orphaned** (replaced by a competing chain), it is marked as orphaned and no payouts are made for it.
-
-### How are payouts distributed?
-
-Payouts are distributed via a **single transaction** that spends the block's coinbase output:
-- **Input:** The coinbase transaction's payout output (vout[1] of the found block).
-- **Outputs:** One output per eligible miner + one pool fee output.
-- **Fee:** The transaction pays a network fee of ~2 sat/byte; this is deducted from the pool fee output.
-
-Each miner's payout amount is calculated proportionally from their PPLNS weighted shares, with remainder satoshis distributed deterministically (largest fractional parts first).
-
----
-
-## Mining Setup
-
-### What mining software should I use?
-
-The canonical mining software for the Lotus pool is **lotus-gpu-miner**, a GPU-optimized miner specifically designed for Lotus's proof-of-work algorithm.
-
-- **Repository:** [`lotus-gpu-miner`](https://github.com/LotusiaStewardship/lotus-gpu-miner)
-- **Features:**
-  - GPU-accelerated mining (OpenCL for AMD/NVIDIA, Metal for Apple Silicon)
-  - Native Stratum V1 support
-  - Automatic difficulty adjustment
-  - Cross-platform (Windows, macOS, Linux)
-  - CLI and GUI interfaces
-
-### How do I configure my miner?
-
-#### For lotus-gpu-miner
-
-**Configuration file** (`~/.lotus-miner/config.toml`):
-
-```toml
-mine_to_address = "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
-stratum_url = "pool.lotusia.org:3334"
-stratum_worker_name = "rig01"
-stratum_password = "x"
-```
-
-**Command-line**:
+Payouts can also be triggered manually via the operator API:
 
 ```bash
-./lotus-miner-cli --stratum-url pool.lotusia.org:3334 --mine-to-address lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi --stratum-worker-name rig01 --stratum-password x
+curl -X POST /api/v1/admin/payouts/trigger/{block_hash} \
+  -H "Authorization: Bearer <token>"
 ```
 
-Note: The miner combines `mine_to_address` and `stratum_worker_name` automatically as `<address>.<worker_name>`.
+### What is the maturation period?
 
-#### For other Stratum V1 miners
+A found block must reach 100 confirmations before its coinbase outputs are spendable (this is a Bitcoin-derived consensus rule). The pool's `min_confirmations` setting defaults to 100 — you can raise it for additional safety, but never lower it below 100.
 
-Point your miner to the pool's endpoint:
+### How are fees calculated?
 
-```
-URL:      <pool-ip>:<port>  (or stratum+tcp://<pool-ip>:<port>)
-Username: <your-lotus-address>.<worker-name>
-Password: x  (or leave blank)
-```
+Pool fees are configured in basis points (100 bps = 1%). The fee is deducted from the gross block reward before miner payouts. When a `fee_address` is configured, the fee output is sent to that address separately. When no fee address is set, the fee is included in the payout distribution as additional reward.
 
-For example:
-```
-URL:       pool.example.com:3334
-Username:  lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01
-Password:  x
-```
+### What happens to dust?
 
-### What worker name format should I use?
-
-The pool expects worker names in the format:
-
-```
-<lotus-address>.<worker-suffix>
-```
-
-- **Lotus address** — Your payout address (e.g., `lotus_16PSJN...`).
-- **Worker suffix** — A label for your miner (e.g., `rig01`, `asic-03`, `cpu`).
-
-The dot separator is required. If no suffix is provided, the address alone is accepted.
-
-### What port should I connect to?
-
-Ports are network-specific:
-
-| Network | Stratum Port | API Port |
-|---------|-------------|----------|
-| **Mainnet** | 3334 | 18080 |
-| **Testnet** | 13334 | 18081 |
-| **Regtest** | 23334 | 18082 |
-
-These are the defaults — the pool operator may configure different ports.
+Dust (payout amounts below `min_payout_sat`) is tracked per-address as a running balance in a `dust_balances` table. Each payout round, the dust balance is included in the miner's weight calculation, so accumulated dust is paid out once it crosses the minimum threshold in combination with new rewards.
 
 ---
 
-## Shares & Validation
+## Security & Signing
 
-### What is a stale share?
+### What signing modes are available?
 
-A **stale share** is a share submitted for a mining job that is no longer active — typically because a new block was found (by the pool or another pool) and the pool has already moved on to a new job.
+Two modes, configured under `[pool.signing]`:
 
-Stale shares are **not rewarded** because the work they represent is no longer relevant to the current chain. High stale rates can indicate:
-- High network latency between your miner and the pool.
-- The pool finding blocks frequently (a good problem!).
+**Internal signing** (`mode = "internal"`) — the pool process signs coinbase-spending transactions directly using the private key provided in the configuration file. This is simpler to set up but keeps the signing key inside the stratum process.
 
-### What is a duplicate share?
+**External signing** (`mode = "external"`) — the pool sends the payout plan as JSON to a remote webhook service. The external service is responsible for building, signing, and broadcasting the transaction. The webhook must return `{"txid": "..."}` on success.
 
-A **duplicate share** is a share that has already been submitted and recorded. This can happen if:
-- Your miner resends a share due to a connection hiccup.
-- Two miners are misconfigured with the same credentials and submit the same work.
+### Which signing mode should I use?
 
-Duplicates are rejected to prevent double-counting.
+External signing is recommended for production deployments because it keeps private keys out of the stratum process entirely. The signing service can run in a separate, locked-down environment with hardware security module (HSM) support, dedicated audit logging, and independent access controls.
 
-### What is a low-difficulty share?
+### How is the operator API secured?
 
-A **low-difficulty share** is a share whose hash does not meet the current difficulty assigned to your miner. The pool's VarDiff system sets your minimum difficulty, and shares below that threshold are rejected.
-
-This usually means your miner is misconfigured or your difficulty setting hasn't been updated after a VarDiff adjustment.
-
-### What is an orphaned block?
-
-An **orphaned block** (more accurately, a **stale block**) is a valid block that was found but **did not become part of the longest chain**. This happens when another miner finds a block at nearly the same time, and the network adopts the competing block.
-
-If the pool finds a block that later becomes orphaned:
-- The block is marked as **orphaned** in the accounting database.
-- No payouts are distributed for that block.
-- Any work miners contributed toward that block was not rewarded (this risk is inherent in mining).
-
-### What causes rejected shares?
-
-Shares can be rejected for several reasons:
-
-| Reason | Description |
-|--------|-------------|
-| **Stale** | The job was replaced by a newer block |
-| **Duplicate** | The share was already submitted |
-| **Invalid** | The share has structural errors (bad nonce, extranonce, etc.) |
-| **Low-difficulty** | The share doesn't meet your assigned difficulty |
-| **Not subscribed** | Miner didn't complete the subscribe handshake |
-| **Unauthorized** | Miner didn't complete the authorize handshake |
-| **Unauthorized worker** | The worker name format is invalid |
+All operator API endpoints (except `/health`) require a Bearer token in the `Authorization` header. The token is configured via the `api_token` field in `config.toml` or the `STRATUM_API_TOKEN` environment variable. Use a strong, random token and rotate it periodically.
 
 ---
 
-## Advanced / Technical
+## Operator API Reference
 
-### How does the pool communicate with Lotus?
+Base path: `/api/v1`
 
-The pool uses **two independent channels** to communicate with `lotusd`, each serving distinct purposes:
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Liveness check — no auth required |
+| GET | `/stats` | Pool statistics (uptime, connected miners, network difficulty) |
+| GET | `/workers` | Paginated worker list |
+| GET | `/workers/{id}` | Worker detail with statistics |
+| GET | `/rounds` | Paginated round list, filterable by status |
+| GET | `/rounds/{id}` | Round detail with per-worker share breakdown |
+| GET | `/blocks` | Paginated found-block list, filterable by status |
+| GET | `/blocks/{hash}` | Block detail |
+| GET | `/payouts` | Paginated payout batch list |
+| GET | `/payouts/{id}` | Payout batch detail with individual miner payouts |
+| POST | `/admin/payouts/trigger/{block_hash}` | Manually trigger payout for a matured block |
+| GET | `/shares` | Paginated raw share submissions |
+| GET | `/share-outcomes` | Paginated validated share outcomes |
 
-#### NNG (nanomsg-next-generation) — Mining Templates & Real-Time Events
+All authenticated endpoints use `Bearer <token>` in the `Authorization` header.
 
-NNG handles the high-performance, low-latency mining path:
-
-- **NNG RPC** (`nng_rpc_url`, e.g. `ipc://datadir/nngrpc.pipe`) — Used for:
-  - **Fetching mining templates** (`get_mining_template`) — the pool requests block header templates, coinbase parts, merkle branches, and difficulty targets. This is the primary source of mining work.
-  - **Fetching full blocks** (`get_block`) — used during payout processing to retrieve matured found blocks and extract the coinbase reward.
-
-- **NNG Pub/Sub** (`nng_pub_url`, e.g. `ipc://datadir/nngpub.pipe`) — The pool subscribes to three topics from `lotusd`:
-  - **`miningwrkchg`** (primary) — A purpose-built signal emitted when mining work is invalidated. Covers new block tips, chain reorgs, mempool changes, and manual invalidations. Each message includes a monotonically increasing `template_epoch` counter so the pool can detect missed events. On receiving this, the pool fetches a fresh mining template and broadcasts `mining.notify` to all connected miners.
-  - **`blkconnected`** (accounting only) — Emitted when a new block is connected to the chain. Used to mark found blocks as matured and update the chain tip height.
-  - **`blkdisconctd`** (accounting only) — Emitted when a block is disconnected (reorg). Used to mark found blocks as orphaned and adjust maturity tracking.
-  
-  NNG pub/sub messages use **FlatBuffers** serialization for efficiency. The pool intentionally does *not* subscribe to per-transaction mempool topics (`mempooltxadd`, `mempooltxrem`) because those are too granular — `miningwrkchg` already consolidates mempool changes into a single efficient signal.
-
-#### JSON-RPC (HTTP) — Block Submission & Transaction Operations
-
-JSON-RPC handles standard Bitcoin-style RPC operations over HTTP:
-
-- **`submitblock`** — When a miner finds a valid block, the pool submits the full serialized block to `lotusd` via JSON-RPC `submitblock`. This uses BIP22-style responses (null = accepted, string = rejection reason).
-- **`sendrawtransaction`** — Used by the payout scheduler to broadcast signed payout transactions to the network.
-- **`getrawtransaction`** — Used to check transaction confirmation counts (to verify payout transactions have been confirmed).
-- **`getblockcount`** — Used at startup to fetch the current chain tip height and during reconciliation to validate found blocks.
-
-#### Why Two Channels?
-
-NNG provides **low-latency, event-driven** mining template delivery with FlatBuffers serialization — critical for keeping miners fed with fresh work. JSON-RPC provides **standard RPC operations** that are simpler to implement for transaction-level tasks like block submission and payout broadcasting. Together they form a `BitcoindMiningAdapter` that composes NNG (templates, blocks, pub/sub) with JSON-RPC (submit, broadcast, confirmations).
-
-### Does the pool support high availability (HA)?
-
-Yes. The payout scheduler implements a **lease-based coordination mechanism** using SQLite:
-
-- Only one instance can hold the **scheduler lease** at a time.
-- If multiple instances are running, the one with the lease processes payouts.
-- Leases are automatically renewed and expire if the holder goes offline.
-- This prevents **double-spending** in multi-instance deployments.
-
-The Stratum server itself can also run in multiple instances, though each would maintain its own set of connected miners.
-
-### What networks are supported?
-
-Three networks are supported, **auto-detected** from the `bitcoind_rpc.url` JSON-RPC port:
-
-| Network | JSON-RPC Port | Stratum Port | Database Path |
-|---------|--------------|-------------|---------------|
-| **Mainnet** | 10604 | 3334 | `./dbs/mainnet/stratum-accounting.sqlite3` |
-| **Testnet** | 11604 | 13334 | `./dbs/testnet/stratum-accounting.sqlite3` |
-| **Regtest** | 12604 | 23334 | `./dbs/regtest/stratum-accounting.sqlite3` |
-
-Network can be explicitly overridden in the config, but this is not recommended.
-
-### Where is accounting data stored?
-
-All accounting data is stored in a **SQLite database** (`stratum-accounting.sqlite3`). The database tracks:
-- **Workers** — Payout addresses and worker suffixes.
-- **Shares** — Accepted, rejected, and stale shares with difficulty weights.
-- **Rounds** — Mining rounds (for PPLNS window management).
-- **Found blocks** — Block lifecycle (confirmed → matured → paid, or orphaned).
-- **Payout batches** — Transaction creation, signing, submission, and confirmation status.
-- **Dust ledger** — Accumulated dust per address for carry-forward.
-- **Scheduler lease** — HA coordination state.
-
-### Is there an API for monitoring?
-
-Yes. The pool exposes a **REST API** (default: `127.0.0.1:18080`) with the following endpoints:
-
-| Endpoint | Auth | Description |
-|----------|------|-------------|
-| `GET /healthz` | No | Simple health check — returns `200 OK` |
-| `GET /readyz` | No | Readiness check — verifies the database is accessible |
-| `GET /status` | Yes | Full pool status: stats, found blocks, payout state |
-| `GET /workers` | Yes | List of registered workers |
-| `GET /workers/summary` | Yes | Worker accounting summary (shares, payouts) |
-| `GET /rounds` | Yes | Recent mining rounds |
-| `GET /shares` | Yes | Recent shares |
-| `GET /shares/rejected-reasons` | Yes | Breakdown of rejection reasons |
-| `GET /payouts` | Yes | Recent payout batches |
-| `GET /health/payout-scheduler` | Yes | Payout scheduler health (lease status, confirmed blocks) |
-| `GET /reconciliation/missing-found-blocks` | Yes | Data reconciliation details |
-
-Authenticated endpoints require a `Bearer` token in the `Authorization` header (configured via `api_token` in the config file or `STRATUM_API_TOKEN` environment variable).
+Pagination parameters (applied to list endpoints): `?limit=100&offset=0`. Default limit is 100; maximum is 1000.
 
 ---
 
-*This FAQ is maintained alongside the `stratum-server-nng` codebase. If you have additional questions, please consult the source code or contact the pool operator.*
+## Troubleshooting
+
+### Miners are connecting but all shares are rejected
+
+Check the following:
+
+1. Is the worker authorized? Ensure the miner is using the correct `address[.suffix]` format and sending `mining.authorize` before `mining.submit`.
+2. Is the job still active? If `clean_jobs` was sent in a recent `mining.notify`, all previous jobs are stale.
+3. Is the session difficulty reasonable? Very low difficulty can cause excessive share submissions that may be rate-limited. Check `vardiff_target_secs` in the configuration.
+4. Are the `extranonce2`, `ntime`, and `nonce` values valid hex of the correct length?
+
+### Miners are connecting but getting "unauthorized" errors
+
+The worker name must follow the format `payout_address[.suffix]`. For example:
+- `lotus_16PSJKdoxf1GgqytWwEop2rg7cNZHXCTxn2hhU3Zz` — bare address (one worker)
+- `lotus_16PSJKdoxf1GgqytWwEop2rg7cNZHXCTxn2hhU3Zz.rig1` — address with rig suffix
+- `lotus_16PSJKdoxf1GgqytWwEop2rg7cNZHXCTxn2hhU3Zz.rig2` — another rig, same address, different worker
+
+Both use the same payout address but are tracked as separate workers for statistics.
+
+### The server won't start
+
+Check these common issues:
+
+1. **NNG connection failure** — ensure lotusd is running and the `nng_rpc_url` / `nng_pub_url` in `config.toml` point to valid IPC endpoints
+2. **Port conflict** — the stratum port, API port, or HTTP port may already be in use
+3. **Database error** — if `sqlite_path` points to a non-writable location, the server will fail on schema initialization
+4. **Missing configuration** — ensure `config.toml` exists and has all required fields filled in (start from `config.example.toml`)
+
+### The database is growing large
+
+The SQLite database in WAL mode will grow over time. The server performs a WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`) during graceful shutdown to keep the file size in check. For ongoing maintenance, `VACUUM` can be run manually during a maintenance window.
+
+### How do I trigger a payout manually?
+
+Use the operator API:
+
+```bash
+curl -X POST "http://localhost:18080/api/v1/admin/payouts/trigger/<block-hash>" \
+  -H "Authorization: Bearer <your-api-token>"
+```
+
+This is useful for testing or if automatic payout processing was interrupted.
+
+---
+
+*This FAQ is maintained alongside the `stratum-server-nng` codebase. If you have additional questions, please consult the source code or documentation in `docs/`.*
