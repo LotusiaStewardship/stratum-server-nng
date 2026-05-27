@@ -1,8 +1,8 @@
 use anyhow::Result;
-use rusqlite::Connection;
-use rusqlite::params;
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::params;
+use rusqlite::Connection;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Worker {
@@ -24,9 +24,9 @@ impl WorkerRepository {
     pub fn upsert(&self, payout_address: &str, worker_suffix: Option<&str>) -> Result<Worker> {
         // Convert empty string to NULL for storage
         let suffix_value = worker_suffix.filter(|s| !s.is_empty());
-        
+
         let conn = self.conn.lock();
-        
+
         // Insert or get existing
         let mut stmt = conn.prepare(
             "INSERT INTO workers (payout_address, worker_suffix) 
@@ -36,24 +36,21 @@ impl WorkerRepository {
              RETURNING id, payout_address, worker_suffix",
         )?;
 
-        let worker = stmt.query_row(
-            params![payout_address, suffix_value],
-            |row| {
-                Ok(Worker {
-                    id: row.get(0)?,
-                    payout_address: row.get(1)?,
-                    worker_suffix: row.get(2)?,
-                })
-            },
-        )?;
+        let worker = stmt.query_row(params![payout_address, suffix_value], |row| {
+            Ok(Worker {
+                id: row.get(0)?,
+                payout_address: row.get(1)?,
+                worker_suffix: row.get(2)?,
+            })
+        })?;
 
         Ok(worker)
     }
 
     pub fn get_by_id(&self, id: i64) -> Result<Option<Worker>> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT id, payout_address, worker_suffix FROM workers WHERE id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT id, payout_address, worker_suffix FROM workers WHERE id = ?1")?;
 
         let worker = stmt.query_row([id], |row| {
             Ok(Worker {
@@ -72,9 +69,8 @@ impl WorkerRepository {
     /// List all workers ordered by ID ascending.
     pub fn list_all(&self) -> Result<Vec<Worker>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, payout_address, worker_suffix FROM workers ORDER BY id ASC"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, payout_address, worker_suffix FROM workers ORDER BY id ASC")?;
         let rows = stmt.query_map([], |row| {
             Ok(Worker {
                 id: row.get(0)?,
@@ -112,7 +108,10 @@ mod tests {
 
         let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker = repo
-            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .upsert(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+            )
             .unwrap();
 
         assert_eq!(
@@ -131,10 +130,16 @@ mod tests {
 
         let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker1 = repo
-            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .upsert(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+            )
             .unwrap();
         let worker2 = repo
-            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .upsert(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+            )
             .unwrap();
 
         // Same ID, not a duplicate
@@ -163,7 +168,10 @@ mod tests {
 
         let repo = WorkerRepository::new(Arc::new(Mutex::new(conn)));
         let worker = repo
-            .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", Some("rig1"))
+            .upsert(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                Some("rig1"),
+            )
             .unwrap();
 
         let fetched = repo.get_by_id(worker.id).unwrap().unwrap();

@@ -45,16 +45,16 @@ impl<T: Serialize> PaginatedResponse<T> {
         let data: Vec<T> = if offset >= all_data.len() {
             Vec::new()
         } else {
-            all_data
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect()
+            all_data.into_iter().skip(offset).take(limit).collect()
         };
 
         let has_more = (offset + limit) < total as usize;
 
-        Self { data, total, has_more }
+        Self {
+            data,
+            total,
+            has_more,
+        }
     }
 }
 

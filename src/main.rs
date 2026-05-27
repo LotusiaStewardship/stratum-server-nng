@@ -1,34 +1,44 @@
+mod logging;
+
 use anyhow::Result;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use parking_lot::Mutex;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tokio::sync::RwLock;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
+use stratum_server_nng::accounting::{init_schema, AccountingService, ChainTip};
 use stratum_server_nng::config::Config;
 use stratum_server_nng::http_api::{self, AppState, ServerStats};
-use stratum_server_nng::shutdown::ShutdownCoordinator;
-use stratum_server_nng::node_integration::{NngRpcClient, JobCache, template_to_job, JsonRpcClient};
-use stratum_server_nng::stratum_protocol::server::StratumServer;
-use stratum_server_nng::accounting::{init_schema, AccountingService, ChainTip};
+use stratum_server_nng::node_integration::{
+    template_to_job, JobCache, JsonRpcClient, NngRpcClient,
+};
 use stratum_server_nng::payout::handler::PayoutHandler;
-use stratum_server_nng::payout::signer::{Signer, internal::InternalSigner, external::ExternalSigner};
+use stratum_server_nng::payout::signer::{
+    external::ExternalSigner, internal::InternalSigner, Signer,
+};
+use stratum_server_nng::shutdown::ShutdownCoordinator;
+use stratum_server_nng::stratum_protocol::server::StratumServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Load configuration first (needed for logging setup)
+    let config = Config::load()?;
+
+    // Initialize logging — EnvFilter reads RUST_LOG first, falls back to config.debug
+    let log_filter = if config.debug {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"))
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
     let _subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(false)
+        .with_env_filter(log_filter)
+        .with_target(true)
         .init();
 
-    info!("stratum-server-nng starting (Slice 1 & 2: Minimal Server + NNG Integration)");
-
-    // Load configuration
-    let config = Config::load()?;
-    info!(
+    main_info!("stratum-server-nng starting (Slice 1 & 2: Minimal Server + NNG Integration)");
+    main_info!(
         stratum_bind = %config.stratum_bind,
         api_bind = %config.api_bind,
         nng_rpc_url = %config.nng_rpc_url,
@@ -37,10 +47,10 @@ async fn main() -> Result<()> {
     );
 
     // Initialize database
-    info!(path = %config.sqlite_path, "initializing database");
+    main_info!(path = %config.sqlite_path, "initializing database");
     let db_conn = Connection::open(&config.sqlite_path)?;
     init_schema(&db_conn)?;
-    info!("database initialized");
+    main_info!("database initialized");
 
     // Create shutdown coordinator with database connection for WAL checkpoint
     let db_conn_arc = Arc::new(Mutex::new(db_conn));
@@ -52,18 +62,22 @@ async fn main() -> Result<()> {
 
     // Resolve mining identity before connecting (fail fast on misconfiguration)
     // Without payout_address, lotusd creates OP_RETURN outputs and block rewards are BURNED.
-    let mining_id = config.pool.mining_identity
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(
+    let mining_id = config.pool.mining_identity.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
             "[pool.mining_identity] section not found in config. \
              Without payout_address, lotusd creates OP_RETURN outputs and \
              block rewards are BURNED. See config.example.toml."
-        ))?;
+        )
+    })?;
     let (coinbase_script, coinbase_identity) = mining_id.resolve()?;
 
-    info!("mining identity resolved: coinbase_script={} bytes, coinbase_identity={}",
+    main_info!(
+        "mining identity resolved: coinbase_script={} bytes, coinbase_identity={}",
         coinbase_script.len(),
-        coinbase_identity.as_ref().map(|b| b.len()).map_or("none".to_string(), |l| format!("{} bytes", l)),
+        coinbase_identity
+            .as_ref()
+            .map(|b| b.len())
+            .map_or("none".to_string(), |l| format!("{} bytes", l)),
     );
 
     // Create NNG RPC client and job cache
@@ -75,12 +89,12 @@ async fn main() -> Result<()> {
     let job_cache = Arc::new(JobCache::new(512));
 
     // Connect to lotusd and fetch initial template
-    info!(url = %config.nng_rpc_url, "connecting to lotusd");
+    main_info!(url = %config.nng_rpc_url, "connecting to lotusd");
     nng_client.connect().await?;
-    
-    info!("fetching initial mining template");
+
+    main_info!("fetching initial mining template");
     let template = nng_client.get_mining_template().await?;
-    info!(
+    main_info!(
         template_id = template.template_id,
         height = template.height,
         "fetched mining template"
@@ -89,7 +103,7 @@ async fn main() -> Result<()> {
     // DIAGNOSTIC: verify the template coinbase has spendable (non-OP_RETURN) outputs.
     // If all outputs are OP_RETURN, block rewards will be burned.
     if let Err(e) = stratum_server_nng::node_integration::verify_coinbase_outputs(&template) {
-        tracing::warn!(
+        main_warn!(
             "coinbase output check: {}. \
              If this pool finds a block, the reward may be BURNED. \
              Check pool.mining_identity configuration.",
@@ -100,28 +114,26 @@ async fn main() -> Result<()> {
     // Convert template to job and cache it
     let job = template_to_job(&template, false)?;
     job_cache.insert(job.clone()).await;
-    info!(job_id = %job.job_id, "cached mining job");
-    if config.debug {
-        info!(
-            job_id = %job.job_id,
-            template_id = job.template_id,
-            prevhash = %job.prevhash,
-            coinbase1 = %job.coinbase1,
-            coinbase2 = %job.coinbase2,
-            merkle_branches = %serde_json::to_string(&job.merkle_branches).unwrap_or_default(),
-            version = %job.version,
-            nbits = %job.nbits,
-            ntime = %job.ntime,
-            network_target_hex = %job.network_target_hex,
-            clean_jobs = job.clean_jobs,
-            template_epoch = job.template_epoch,
-            height = job.height,
-            epoch_hash = %job.epoch_hash,
-            extended_metadata_hash = %job.extended_metadata_hash,
-            block_size = job.block_size,
-            "verbose: mining job details",
-        );
-    }
+    main_info!(job_id = %job.job_id, "cached mining job");
+    main_debug!(
+        job_id = %job.job_id,
+        template_id = job.template_id,
+        prevhash = %job.prevhash,
+        coinbase1 = %job.coinbase1,
+        coinbase2 = %job.coinbase2,
+        merkle_branches = %serde_json::to_string(&job.merkle_branches).unwrap_or_default(),
+        version = %job.version,
+        nbits = %job.nbits,
+        ntime = %job.ntime,
+        network_target_hex = %job.network_target_hex,
+        clean_jobs = job.clean_jobs,
+        template_epoch = job.template_epoch,
+        height = job.height,
+        epoch_hash = %job.epoch_hash,
+        extended_metadata_hash = %job.extended_metadata_hash,
+        block_size = job.block_size,
+        "mining job details",
+    );
 
     // Update stats with network difficulty
     {
@@ -155,16 +167,16 @@ async fn main() -> Result<()> {
     let http_handle = tokio::spawn(async move {
         let router = http_api::create_router(http_state);
         let listener = tokio::net::TcpListener::bind(config.api_bind).await?;
-        info!(bind = %config.api_bind, "HTTP API listening");
+        main_info!(bind = %config.api_bind, "HTTP API listening");
 
         let mut shutdown_signal = http_shutdown_signal;
-        
+
         tokio::select! {
             result = axum::serve(listener, router) => {
                 result?;
             }
             _ = shutdown_signal.recv() => {
-                info!("HTTP API shutting down");
+                main_info!("HTTP API shutting down");
             }
         }
 
@@ -182,20 +194,23 @@ async fn main() -> Result<()> {
     ));
 
     // Block reconciliation: validate found_blocks against current chain state
-    info!("reconciling found_blocks against chain state");
+    main_info!("reconciling found_blocks against chain state");
     {
         let rpc = json_rpc_client.clone();
         match rpc.getblockcount().await {
             Ok(tip_height) => {
-                if let Err(e) = accounting_service.reconcile_found_blocks(tip_height, |height| {
-                    let rpc = rpc.clone();
-                    async move { rpc.getblockhash(height).await }
-                }).await {
-                    tracing::warn!(error = %e, "found_block reconciliation encountered errors");
+                if let Err(e) = accounting_service
+                    .reconcile_found_blocks(tip_height, |height| {
+                        let rpc = rpc.clone();
+                        async move { rpc.getblockhash(height).await }
+                    })
+                    .await
+                {
+                    main_warn!(error = %e, "found_block reconciliation encountered errors");
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                main_warn!(
                     error = %e,
                     "block reconciliation skipped: could not get chain tip"
                 );
@@ -212,8 +227,7 @@ async fn main() -> Result<()> {
         shutdown_tx.clone(),
         Some(accounting_service),
         Some(json_rpc_client.clone()),
-        config.vardiff.into(),
-        config.debug,
+        config.vardiff.into()
     ));
     // Notify server of the new job, broadcasting N_diff to all sessions.
     // Validates the integration path for future template refreshes (Slice 6).
@@ -234,19 +248,18 @@ async fn main() -> Result<()> {
         chain_tip.clone(),
         maturation_tx.clone(),
         config.pool.pplns.min_confirmations,
-        config.debug,
     ) {
         Ok(consumer) => {
             let consumer_handle = tokio::spawn(async move {
                 if let Err(e) = consumer.run(consumer_shutdown_rx).await {
-                    tracing::warn!(error = %e, "NNG event consumer exited with error");
+                    main_warn!(error = %e, "NNG event consumer exited with error");
                 }
             });
             shutdown.register_task(consumer_handle);
-            tracing::info!("NNG pub/sub event consumer started");
+            main_info!("NNG pub/sub event consumer started");
         }
         Err(e) => {
-            tracing::warn!(
+            main_warn!(
                 error = %e,
                 "failed to start NNG event consumer (pub/sub may be unavailable)",
             );
@@ -254,15 +267,17 @@ async fn main() -> Result<()> {
     }
 
     // Startup maturation reconciliation: check blocks that matured while offline
-    info!("checking for newly matured blocks at startup");
+    main_info!("checking for newly matured blocks at startup");
     {
         let rpc = json_rpc_client.clone();
         match rpc.getblockcount().await {
             Ok(tip_height) => {
-                match payout_accounting.check_maturation(tip_height, config.pool.pplns.min_confirmations) {
+                match payout_accounting
+                    .check_maturation(tip_height, config.pool.pplns.min_confirmations)
+                {
                     Ok(matured) => {
                         for block in &matured {
-                            info!(
+                            main_info!(
                                 hash = %block.block_hash,
                                 height = block.height,
                                 "block matured during startup reconciliation",
@@ -288,19 +303,15 @@ async fn main() -> Result<()> {
     if config.pool.pplns.payout_enabled {
         let signer: Arc<dyn Signer> = match config.pool.signing.mode.as_str() {
             "internal" => {
-                let key = config.pool.signing.private_key
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "pool.signing.private_key required for internal signing mode"
-                    ))?;
+                let key = config.pool.signing.private_key.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("pool.signing.private_key required for internal signing mode")
+                })?;
                 Arc::new(InternalSigner::new(key, json_rpc_client.clone())?)
             }
             "external" => {
-                let url = config.pool.signing.webhook_url
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "pool.signing.webhook_url required for external signing mode"
-                    ))?;
+                let url = config.pool.signing.webhook_url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("pool.signing.webhook_url required for external signing mode")
+                })?;
                 Arc::new(ExternalSigner::new(url.to_string()))
             }
             other => anyhow::bail!(
@@ -324,14 +335,17 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = handler.run() => {}
                 _ = payout_shutdown_signal.recv() => {
-                    info!("payout handler shutting down");
+                    main_info!("payout handler shutting down");
                 }
             }
         });
         shutdown.register_task(payout_handle);
-        info!("payout handler started (event-driven, {} mode)", config.pool.signing.mode);
+        main_info!(
+            "payout handler started (event-driven, {} mode)",
+            config.pool.signing.mode
+        );
     } else {
-        info!("payout handler disabled by config.pool.pplns.payout_enabled");
+        main_info!("payout handler disabled by config.pool.pplns.payout_enabled");
         // Drop the sender so the channel can close cleanly
         drop(maturation_tx);
     }
@@ -339,13 +353,13 @@ async fn main() -> Result<()> {
     let stratum_for_stats = stratum_server.clone();
     let stratum_handle = tokio::spawn(async move {
         let mut shutdown_signal = stratum_shutdown_signal;
-        
+
         tokio::select! {
             result = stratum_server.run() => {
                 result?;
             }
             _ = shutdown_signal.recv() => {
-                info!("Stratum server shutting down");
+                main_info!("Stratum server shutting down");
             }
         }
 
@@ -368,7 +382,7 @@ async fn main() -> Result<()> {
                     s.connected_miners = connected;
                 }
                 _ = stats_shutdown_signal.recv() => {
-                    info!("stats updater shutting down");
+                    main_info!("stats updater shutting down");
                     break;
                 }
             }
@@ -377,26 +391,26 @@ async fn main() -> Result<()> {
     shutdown.register_task(stats_handle);
 
     // Wait for shutdown signal
-    info!(stratum = %config.stratum_bind, http = %config.api_bind, "server ready");
-    info!("press Ctrl+C for graceful shutdown, Ctrl+\\ for emergency shutdown");
+    main_info!(stratum = %config.stratum_bind, http = %config.api_bind, "server ready");
+    main_info!("press Ctrl+C for graceful shutdown, Ctrl+\\ for emergency shutdown");
     let shutdown_type = wait_for_shutdown_signal().await?;
 
     // Initiate shutdown (graceful or emergency)
     match shutdown_type {
         ShutdownType::Graceful => {
-            info!("initiating graceful shutdown");
+            main_info!("initiating graceful shutdown");
             shutdown.initiate_shutdown();
-            
+
             // Wait for all registered tasks to complete
             shutdown.wait_for_completion().await?;
-            
+
             // Disconnect from lotusd
             nng_client.disconnect().await;
-            
-            info!("server shutdown complete");
+
+            main_info!("server shutdown complete");
         }
         ShutdownType::Emergency => {
-            info!("initiating emergency shutdown (no flush)");
+            main_info!("initiating emergency shutdown (no flush)");
             shutdown.initiate_emergency_shutdown();
             // Exit immediately without waiting for tasks
             std::process::exit(1);
@@ -418,18 +432,16 @@ async fn wait_for_shutdown_signal() -> Result<ShutdownType> {
 
     tokio::select! {
         _ = sigint.recv() => {
-            info!("received SIGINT");
+            main_info!("received SIGINT");
             Ok(ShutdownType::Graceful)
         }
         _ = sigterm.recv() => {
-            info!("received SIGTERM");
+            main_info!("received SIGTERM");
             Ok(ShutdownType::Graceful)
         }
         _ = sigquit.recv() => {
-            info!("received SIGQUIT");
+            main_info!("received SIGQUIT");
             Ok(ShutdownType::Emergency)
         }
     }
 }
-
-

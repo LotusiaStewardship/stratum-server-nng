@@ -220,18 +220,23 @@ impl MiningIdentity {
     pub fn resolve(&self) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         let coinbase_script = match (&self.payout_address, &self.payout_script_hex) {
             (Some(addr), None) => {
-                let addr: LotusAddress = addr.parse()
+                let addr: LotusAddress = addr
+                    .parse()
                     .map_err(|e| anyhow!("invalid payout_address: {e}"))?;
                 let script = addr.script();
-                anyhow::ensure!(!script.is_opreturn(),
-                    "payout_address resolves to OP_RETURN — block rewards would be BURNED");
+                anyhow::ensure!(
+                    !script.is_opreturn(),
+                    "payout_address resolves to OP_RETURN — block rewards would be BURNED"
+                );
                 script.bytecode().to_vec()
             }
             (None, Some(hex)) => {
-                let bytes = hex::decode(hex)
-                    .map_err(|e| anyhow!("invalid payout_script_hex: {e}"))?;
-                anyhow::ensure!(bytes.first() != Some(&0x6a),
-                    "payout_script_hex starts with OP_RETURN — block rewards would be BURNED");
+                let bytes =
+                    hex::decode(hex).map_err(|e| anyhow!("invalid payout_script_hex: {e}"))?;
+                anyhow::ensure!(
+                    bytes.first() != Some(&0x6a),
+                    "payout_script_hex starts with OP_RETURN — block rewards would be BURNED"
+                );
                 bytes
             }
             (Some(_), Some(_)) => {
@@ -246,7 +251,8 @@ impl MiningIdentity {
             }
         };
 
-        let coinbase_identity = self.coinbase_identity
+        let coinbase_identity = self
+            .coinbase_identity
             .as_ref()
             .filter(|s| !s.is_empty())
             .map(|s| s.as_bytes().to_vec());
@@ -294,10 +300,18 @@ fn default_bitcoind_rpc_url() -> String {
     "http://127.0.0.1:10604".to_string()
 }
 
-fn default_vardiff_min_floor() -> f64 { 0.001 }
-fn default_vardiff_initial_pct() -> f64 { 0.01 }
-fn default_vardiff_target_secs() -> f64 { 20.0 }
-fn default_vardiff_retarget_secs() -> f64 { 60.0 }
+fn default_vardiff_min_floor() -> f64 {
+    0.001
+}
+fn default_vardiff_initial_pct() -> f64 {
+    0.01
+}
+fn default_vardiff_target_secs() -> f64 {
+    20.0
+}
+fn default_vardiff_retarget_secs() -> f64 {
+    60.0
+}
 
 fn default_nng_pub_url() -> String {
     "ipc:///tmp/lotusd.pub".to_string()
@@ -307,76 +321,102 @@ fn default_api_token() -> String {
     "devtoken".to_string()
 }
 
-fn default_fee_enabled() -> bool { true }
-fn default_fee_bps() -> u32 { 100 }
+fn default_fee_enabled() -> bool {
+    true
+}
+fn default_fee_bps() -> u32 {
+    100
+}
 
-fn default_pplns_n_multiplier() -> f64 { 2.0 }
-fn default_pplns_min_payout_sat() -> i64 { 546 }
-fn default_pplns_payout_enabled() -> bool { true }
-fn default_pplns_min_confirmations() -> u64 { 100 }
+fn default_pplns_n_multiplier() -> f64 {
+    2.0
+}
+fn default_pplns_min_payout_sat() -> i64 {
+    546
+}
+fn default_pplns_payout_enabled() -> bool {
+    true
+}
+fn default_pplns_min_confirmations() -> u64 {
+    100
+}
 
-fn default_banning_enabled() -> bool { true }
-fn default_banning_check_threshold() -> u64 { 50 }
-fn default_banning_invalid_percent() -> f64 { 50.0 }
+fn default_banning_enabled() -> bool {
+    true
+}
+fn default_banning_check_threshold() -> u64 {
+    50
+}
+fn default_banning_invalid_percent() -> f64 {
+    50.0
+}
 
-fn default_signing_mode() -> String { "internal".to_string() }
+fn default_signing_mode() -> String {
+    "internal".to_string()
+}
 
 impl Config {
     /// Load configuration from config.toml with environment variable overrides.
     pub fn load() -> Result<Self> {
-        let config_path = std::env::var("CONFIG_PATH")
-            .unwrap_or_else(|_| "config.toml".to_string());
-        
+        let config_path =
+            std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+
         let raw = std::fs::read_to_string(&config_path)
             .map_err(|e| anyhow!("failed to read config file '{}': {}", config_path, e))?;
-        
-        let mut cfg: Config = toml::from_str(&raw)
-            .map_err(|e| anyhow!("failed to parse config: {}", e))?;
-        
+
+        let mut cfg: Config =
+            toml::from_str(&raw).map_err(|e| anyhow!("failed to parse config: {}", e))?;
+
         // Environment variable overrides
         if let Ok(url) = std::env::var("NNG_RPC_URL") {
             cfg.nng_rpc_url = url;
         }
-        
+
         if let Ok(url) = std::env::var("NNG_PUB_URL") {
             cfg.nng_pub_url = url;
         }
-        
+
         if let Ok(token) = std::env::var("STRATUM_API_TOKEN") {
             cfg.api_token = token;
         }
-        
+
         if let Ok(path) = std::env::var("DATABASE_PATH") {
             cfg.sqlite_path = path;
         }
-        
+
         if let Ok(url) = std::env::var("BITCOIND_RPC_URL") {
             cfg.bitcoind_rpc.url = url;
         }
-        
+
         if let Ok(user) = std::env::var("BITCOIND_RPC_USER") {
             cfg.bitcoind_rpc.rpc_user = user;
         }
-        
+
         if let Ok(pass) = std::env::var("BITCOIND_RPC_PASS") {
             cfg.bitcoind_rpc.rpc_pass = pass;
         }
 
         // Pool settings environment variable overrides
         if let Ok(addr) = std::env::var("POOL_PAYOUT_ADDRESS") {
-            cfg.pool.mining_identity.get_or_insert_with(|| MiningIdentity {
-                payout_address: None,
-                payout_script_hex: None,
-                coinbase_identity: None,
-            }).payout_address = Some(addr);
+            cfg.pool
+                .mining_identity
+                .get_or_insert_with(|| MiningIdentity {
+                    payout_address: None,
+                    payout_script_hex: None,
+                    coinbase_identity: None,
+                })
+                .payout_address = Some(addr);
         }
 
         if let Ok(identity) = std::env::var("POOL_COINBASE_IDENTITY") {
-            cfg.pool.mining_identity.get_or_insert_with(|| MiningIdentity {
-                payout_address: None,
-                payout_script_hex: None,
-                coinbase_identity: None,
-            }).coinbase_identity = Some(identity);
+            cfg.pool
+                .mining_identity
+                .get_or_insert_with(|| MiningIdentity {
+                    payout_address: None,
+                    payout_script_hex: None,
+                    coinbase_identity: None,
+                })
+                .coinbase_identity = Some(identity);
         }
 
         // Pool fee env var overrides
@@ -411,13 +451,13 @@ impl Config {
         if let Ok(key) = std::env::var("POOL_SIGNING_PRIVATE_KEY") {
             cfg.pool.signing.private_key = Some(key);
         }
-        
+
         if let Ok(val) = std::env::var("DEBUG") {
             if val == "true" || val == "1" || val == "yes" {
                 cfg.debug = true;
             }
         }
-        
+
         Ok(cfg)
     }
 }
@@ -437,17 +477,20 @@ mod tests {
     #[test]
     fn test_parse_toml() {
         let dir = TempDir::new().unwrap();
-        let config_path = create_test_config(&dir, r#"
+        let config_path = create_test_config(
+            &dir,
+            r#"
             stratum_bind = "0.0.0.0:3334"
             api_bind = "127.0.0.1:18080"
             nng_rpc_url = "ipc:///tmp/lotusd.rpc"
             sqlite_path = "./test.db"
             api_token = "mytoken"
-        "#);
-        
+        "#,
+        );
+
         let raw = fs::read_to_string(&config_path).unwrap();
         let cfg: Config = toml::from_str(&raw).unwrap();
-        
+
         assert_eq!(cfg.stratum_bind.to_string(), "0.0.0.0:3334");
         assert_eq!(cfg.api_bind.to_string(), "127.0.0.1:18080");
         assert_eq!(cfg.nng_rpc_url, "ipc:///tmp/lotusd.rpc");
@@ -458,16 +501,19 @@ mod tests {
     #[test]
     fn test_default_api_token() {
         let dir = TempDir::new().unwrap();
-        let config_path = create_test_config(&dir, r#"
+        let config_path = create_test_config(
+            &dir,
+            r#"
             stratum_bind = "0.0.0.0:3334"
             api_bind = "127.0.0.1:18080"
             nng_rpc_url = "ipc:///tmp/lotusd.rpc"
             sqlite_path = "./test.db"
-        "#);
-        
+        "#,
+        );
+
         let raw = fs::read_to_string(&config_path).unwrap();
         let cfg: Config = toml::from_str(&raw).unwrap();
-        
+
         assert_eq!(cfg.api_token, "devtoken"); // default
     }
 
@@ -579,7 +625,10 @@ mod tests {
             coinbase_identity = "/Lotusia Pool/"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        let id = cfg.pool.mining_identity.expect("mining_identity should be present");
+        let id = cfg
+            .pool
+            .mining_identity
+            .expect("mining_identity should be present");
         assert_eq!(
             id.payout_address.as_deref(),
             Some("lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD")
@@ -597,16 +646,16 @@ mod tests {
             sqlite_path = "./test.db"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.pool.mining_identity.is_none(),
-            "mining_identity should be None when [pool.mining_identity] section is absent");
+        assert!(
+            cfg.pool.mining_identity.is_none(),
+            "mining_identity should be None when [pool.mining_identity] section is absent"
+        );
     }
 
     #[test]
     fn test_mining_identity_resolve_payout_address() {
         let id = MiningIdentity {
-            payout_address: Some(
-                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
-            ),
+            payout_address: Some("lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string()),
             payout_script_hex: None,
             coinbase_identity: Some("/Lotusia Pool/".to_string()),
         };
@@ -640,7 +689,11 @@ mod tests {
         };
         let (script_bytes, identity_bytes) = id.resolve().unwrap();
 
-        assert_eq!(script_bytes.len(), 25, "decoded hex P2PKH should be 25 bytes");
+        assert_eq!(
+            script_bytes.len(),
+            25,
+            "decoded hex P2PKH should be 25 bytes"
+        );
         assert_eq!(script_bytes[0], 0x76);
         assert_eq!(script_bytes[1], 0xa9);
         assert_eq!(identity_bytes, None, "no identity set should return None");
@@ -681,9 +734,7 @@ mod tests {
     #[test]
     fn test_mining_identity_resolve_both_fails() {
         let id = MiningIdentity {
-            payout_address: Some(
-                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
-            ),
+            payout_address: Some("lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string()),
             payout_script_hex: Some(
                 "76a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac".to_string(),
             ),
@@ -701,9 +752,7 @@ mod tests {
     #[test]
     fn test_mining_identity_resolve_identity_empty_string() {
         let id = MiningIdentity {
-            payout_address: Some(
-                "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string(),
-            ),
+            payout_address: Some("lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD".to_string()),
             payout_script_hex: None,
             coinbase_identity: Some(String::new()),
         };

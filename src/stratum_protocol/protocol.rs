@@ -170,7 +170,10 @@ mod tests {
 
     #[test]
     fn test_decode_params_not_array() {
-        let result = decode_request_line(r#"{"id":1,"method":"mining.subscribe","params":"bad"}"#, 1024);
+        let result = decode_request_line(
+            r#"{"id":1,"method":"mining.subscribe","params":"bad"}"#,
+            1024,
+        );
         assert!(matches!(result, Err(StratumError::InvalidRequestShape)));
     }
 }

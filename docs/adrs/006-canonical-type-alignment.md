@@ -38,3 +38,7 @@ The original codebase used i64 for most numeric fields (height, template_id, tem
 - Adding a new field from the NNG schema requires checking its FBS type and using the corresponding Rust integer type. The cost of getting it wrong is a compilation error (mismatched types in struct construction) rather than a silent truncation.
 - The CAmount convention (i64 for monetary values) is preserved as a special case — coinbase_value enters the system as u64 from the NNG raw template but converts to i64 at the boundary where it becomes `gross_reward` in the PayoutPlan. This single conversion point is documented with a safety invariant.
 - ChainTip (chain tip height tracker) uses AtomicI32 to match lotusd's `int32_t` return from `ChainActive().Height()`, eliminating the unsafe `i32 as u64` cast that existed previously.
+
+### 2026-05-26 update: debug_assert promoted to assert
+
+All SQLite boundary `debug_assert!` guards were promoted to `assert!` (18 call sites across `accounting_event_repository.rs`, `found_block_repository.rs`, `stratum_protocol/server.rs`, and `block_builder.rs`). In release builds, `debug_assert!` is stripped — corrupt DB data (negative i64 in unsigned columns) would silently produce wrong u64 values. Since these represent unrecoverable data corruption, `assert!` is appropriate: crash with diagnostics rather than propagate garbage.

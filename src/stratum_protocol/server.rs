@@ -1,23 +1,26 @@
-use anyhow::Result;
+use crate::node_integration::block_builder::build_submit_block;
+use crate::node_integration::JsonRpcClient;
 use crate::share_processing::network_target_hex_to_difficulty;
 use crate::share_processing::VarDiffConfig;
-use crate::node_integration::JsonRpcClient;
-use crate::node_integration::block_builder::build_submit_block;
+use anyhow::Result;
 
+use crate::validator_info;
+use crate::{
+    stratum_debug as debug, stratum_error as error, stratum_info as info, stratum_warn as warn,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info, warn};
 
-use crate::stratum_protocol::session::SessionState;
-use crate::stratum_protocol::params;
-use crate::stratum_protocol::job::MiningJob;
-use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
-use crate::accounting::{ShareRepository, AuthorizationEvent, AccountingService};
+use crate::accounting::{AccountingService, AuthorizationEvent, ShareRepository};
 use crate::share_processing::validator;
+use crate::stratum_protocol::job::MiningJob;
+use crate::stratum_protocol::params;
+use crate::stratum_protocol::protocol::{decode_request_line, Method, StratumResponse};
+use crate::stratum_protocol::session::SessionState;
 
 /// TCP Stratum V1 server that accepts miner connections.
 pub struct StratumServer {
@@ -37,7 +40,6 @@ pub struct StratumServer {
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
     vardiff_config: VarDiffConfig,
-    debug: bool,
 }
 
 impl StratumServer {
@@ -49,7 +51,6 @@ impl StratumServer {
         accounting_service: Option<AccountingService>,
         json_rpc_client: Option<Arc<JsonRpcClient>>,
         vardiff_config: VarDiffConfig,
-        debug: bool,
     ) -> Self {
         let (job_tx, _) = broadcast::channel::<Arc<MiningJob>>(128);
         Self {
@@ -62,7 +63,6 @@ impl StratumServer {
             accounting_service,
             json_rpc_client,
             vardiff_config,
-            debug,
         }
     }
 
@@ -142,7 +142,7 @@ impl StratumServer {
                                 self.vardiff_config.clone(),
                                 n_diff,
                             );
-                            
+
                             // Clone Arcs for the connection handler
                             let connected_miners = self.connected_miners.clone();
                             let job_cache = self.job_cache.clone();
@@ -150,12 +150,11 @@ impl StratumServer {
                             let job_rx = self.job_tx.subscribe();
                             let accounting_service = self.accounting_service.clone();
                             let json_rpc_client = self.json_rpc_client.clone();
-                            let debug = self.debug;
-                            
+
                             tokio::spawn(async move {
                                 // Increment connected miners
                                 *connected_miners.write().await += 1;
-                                
+
                                 // Handle the connection
                                 if let Err(e) = handle_connection(
                                     stream,
@@ -165,11 +164,10 @@ impl StratumServer {
                                     job_rx,
                                     accounting_service,
                                     json_rpc_client,
-                                    debug,
                                 ).await {
                                     warn!(addr = %addr, error = %e, "connection error");
                                 }
-                                
+
                                 // Decrement connected miners
                                 *connected_miners.write().await -= 1;
                             });
@@ -188,8 +186,6 @@ impl StratumServer {
 
         Ok(())
     }
-
-
 }
 
 /// Handle a single miner connection.
@@ -201,7 +197,6 @@ async fn handle_connection(
     mut job_rx: broadcast::Receiver<Arc<MiningJob>>,
     accounting_service: Option<AccountingService>,
     json_rpc_client: Option<Arc<JsonRpcClient>>,
-    debug: bool,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -209,7 +204,7 @@ async fn handle_connection(
 
     loop {
         line.clear();
-        
+
         tokio::select! {
             read_result = reader.read_line(&mut line) => {
                 match read_result {
@@ -223,28 +218,19 @@ async fn handle_connection(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        
-                        if debug {
-                            info!(
-                                session = %session.session_id,
-                                line = %trimmed,
-                                "verbose: stratum request received",
-                            );
-                        }
+
                         debug!(session = %session.session_id, line = %trimmed, "received request");
-                        
+
                         // Parse the request
                         let req = match decode_request_line(trimmed, 4096) {
                             Ok(req) => req,
                             Err(e) => {
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        error = ?e,
-                                        raw = %trimmed,
-                                        "verbose: invalid request parse failure",
-                                    );
-                                }
+                                debug!(
+                                    session = %session.session_id,
+                                    error = ?e,
+                                    raw = %trimmed,
+                                    "invalid request parse failure",
+                                );
                                 warn!(error = ?e, "invalid request");
                                 let resp = StratumResponse::err(
                                     serde_json::Value::Null,
@@ -252,14 +238,14 @@ async fn handle_connection(
                                     "invalid request",
                                 );
                                 let resp_line = serde_json::to_string(&resp)?;
-                                debug_assert!(!resp_line.is_empty(), "write empty protocol message");
+                                assert!(!resp_line.is_empty(), "write empty protocol message");
                                 let mut buf = resp_line.as_bytes().to_vec();
                                 buf.push(b'\n');
                                 writer.write_all(&buf).await?;
                                 continue;
                             }
                         };
-                        
+
                         // Handle the request based on method
                         let resp = match req.method {
                             Method::Subscribe => {
@@ -294,7 +280,6 @@ async fn handle_connection(
                                     &job_cache,
                                     accounting_service.as_ref(),
                                     json_rpc_client.as_ref(),
-                                    debug,
                                 ).await;
                                 // If VarDiff retargeted, send mining.set_difficulty to miner
                                 if let Some(diff) = new_diff {
@@ -304,15 +289,8 @@ async fn handle_connection(
                                         "params": [diff]
                                     });
                                     let set_diff_line = serde_json::to_string(&set_diff)?;
-                                    if debug {
-                                        info!(
-                                            session = %session.session_id,
-                                            new_diff = diff,
-                                            message = %set_diff_line,
-                                            "verbose: mining.set_difficulty after VarDiff retarget",
-                                        );
-                                    }
-                                    debug_assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
+
+                                    assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
                                     let mut buf = set_diff_line.as_bytes().to_vec();
                                     buf.push(b'\n');
                                     writer.write_all(&buf).await?;
@@ -328,66 +306,51 @@ async fn handle_connection(
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
                             }
                             Method::ExtranonceSubscribe => {
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        "verbose: mining.extranonce.subscribe acknowledged",
-                                    );
-                                }
+                                debug!(
+                                    session = %session.session_id,
+                                    "mining.extranonce.subscribe acknowledged",
+                                );
                                 // Acknowledge subscription per Stratum V1 standard.
                                 // Since extranonce1 is per-session and never changes at runtime,
                                 // we accept the subscription but never send follow-up updates.
                                 StratumResponse::ok(req.id.clone(), serde_json::Value::Bool(true))
                             }
                             Method::SetDifficulty | Method::SetExtranonce | Method::SuggestDifficulty => {
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        method = ?req.method,
-                                        "verbose: unsupported method received from miner",
-                                    );
-                                }
                                 debug!(method = ?req.method, "unsupported method");
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
                             Method::Notify => {
                                 // mining.notify is server-to-miner only
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        "verbose: mining.notify received from miner (should be server-to-miner)",
-                                    );
-                                }
+                                debug!(
+                                    session = %session.session_id,
+                                    "mining.notify received from miner (should be server-to-miner)",
+                                );
                                 warn!("received mining.notify from miner (should be server-to-miner)");
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
                             Method::Unknown(ref method_name) => {
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        method = %method_name,
-                                        "verbose: unknown method received from miner",
-                                    );
-                                }
+                                debug!(
+                                    session = %session.session_id,
+                                    method = %method_name,
+                                    "unknown method received from miner",
+                                );
                                 StratumResponse::err(req.id.clone(), 3, "unknown method")
                             }
                         };
-                        
+
                         // Send response
                         let resp_line = serde_json::to_string(&resp)?;
-                        if debug {
-                            info!(
-                                session = %session.session_id,
-                                method = ?req.method,
-                                response = %resp_line,
-                                "verbose: stratum response sent",
-                            );
-                        }
-                        debug_assert!(!resp_line.is_empty(), "write empty response message");
+                        debug!(
+                            session = %session.session_id,
+                            method = ?req.method,
+                            response = %resp_line,
+                            "stratum response sent",
+                        );
+                        assert!(!resp_line.is_empty(), "write empty response message");
                         let mut buf = resp_line.as_bytes().to_vec();
                         buf.push(b'\n');
                         writer.write_all(&buf).await?;
-                        
+
                         // After subscribe, send mining.set_extranonce per Stratum V1 standard.
                         // The miner needs extranonce1 + extranonce2_size to construct the coinbase.
                         // This notification is sent in addition to the subscribe response which
@@ -399,15 +362,13 @@ async fn handle_connection(
                                 "params": [session.extranonce1, session.extranonce2_size]
                             });
                             let extranonce_line = serde_json::to_string(&extranonce_cmd)?;
-                            if debug {
-                                info!(
-                                    session = %session.session_id,
-                                    extranonce1 = %session.extranonce1,
-                                    message = %extranonce_line,
-                                    "verbose: mining.set_extranonce sent after subscribe",
-                                );
-                            }
-                            debug_assert!(!extranonce_line.is_empty(), "write empty set_extranonce");
+                            debug!(
+                                session = %session.session_id,
+                                extranonce1 = %session.extranonce1,
+                                message = %extranonce_line,
+                                "mining.set_extranonce sent after subscribe",
+                            );
+                            assert!(!extranonce_line.is_empty(), "write empty set_extranonce");
                             let mut buf = extranonce_line.as_bytes().to_vec();
                             buf.push(b'\n');
                             writer.write_all(&buf).await?;
@@ -417,7 +378,7 @@ async fn handle_connection(
                                 "sent mining.set_extranonce",
                             );
                         }
-                        
+
                         // If authorized, send mining.set_difficulty with current P_diff
                         // then mining.notify with current job, and record assigned job
                         if session.is_authorized && req.method == Method::Authorize {
@@ -429,15 +390,8 @@ async fn handle_connection(
                                 "params": [initial_diff]
                             });
                             let set_diff_line = serde_json::to_string(&set_diff_cmd)?;
-                            if debug {
-                                info!(
-                                    session = %session.session_id,
-                                    initial_diff = initial_diff,
-                                    message = %set_diff_line,
-                                    "verbose: mining.set_difficulty on session start",
-                                );
-                            }
-                            debug_assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
+
+                            assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
                             let mut buf = set_diff_line.as_bytes().to_vec();
                             buf.push(b'\n');
                             writer.write_all(&buf).await?;
@@ -446,23 +400,21 @@ async fn handle_connection(
                                 initial_diff = initial_diff,
                                 "sent mining.set_difficulty on session start",
                             );
-                            
+
                             if let Some(job) = job_cache.get_latest().await {
                                 let notify = create_notify(&job, &session.session_id);
                                 let notify_line = serde_json::to_string(&notify)?;
-                                if debug {
-                                    info!(
-                                        session = %session.session_id,
-                                        job_id = %job.job_id,
-                                        message = %notify_line,
-                                        "verbose: mining.notify on session start",
-                                    );
-                                }
-                                debug_assert!(!notify_line.is_empty(), "write empty notify");
+                                debug!(
+                                    session = %session.session_id,
+                                    job_id = %job.job_id,
+                                    message = %notify_line,
+                                    "mining.notify on session start",
+                                );
+                                assert!(!notify_line.is_empty(), "write empty notify");
                                 let mut buf = notify_line.as_bytes().to_vec();
                                 buf.push(b'\n');
                                 writer.write_all(&buf).await?;
-                                
+
                                 // Record assigned job with current P_diff and frozen ntime
                                 // Per UBQ: P_diff at assignment time becomes share difficulty
                                 let p_diff = session.current_difficulty();
@@ -493,16 +445,14 @@ async fn handle_connection(
             }
             new_job = job_rx.recv() => {
                 if let Ok(job) = new_job {
-                    if debug {
-                        info!(
-                            session = %session.session_id,
-                            job_id = %job.job_id,
-                            clean_jobs = job.clean_jobs,
-                            template_epoch = job.template_epoch,
-                            height = job.height,
-                            "verbose: new job received via broadcast",
-                        );
-                    }
+                    debug!(
+                        session = %session.session_id,
+                        job_id = %job.job_id,
+                        clean_jobs = job.clean_jobs,
+                        template_epoch = job.template_epoch,
+                        height = job.height,
+                        "new job received via broadcast",
+                    );
 
                     // Per UBQ §Pool Difficulty: P_diff ∈ [vardiff_min_floor, N_diff] at all times.
                     // When a new template arrives (via NNG event consumer -> job_tx), the N_diff
@@ -519,15 +469,13 @@ async fn handle_connection(
                                 "params": [clamped_diff]
                             });
                             let set_diff_line = serde_json::to_string(&set_diff)?;
-                            if debug {
-                                info!(
-                                    session = %session.session_id,
-                                    clamped_diff = clamped_diff,
-                                    message = %set_diff_line,
-                                    "verbose: mining.set_difficulty after N_diff ceiling update",
-                                );
-                            }
-                            debug_assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
+                            debug!(
+                                session = %session.session_id,
+                                clamped_diff = clamped_diff,
+                                message = %set_diff_line,
+                                "mining.set_difficulty after N_diff ceiling update",
+                            );
+                            assert!(!set_diff_line.is_empty(), "write empty set_difficulty");
                             buf.extend_from_slice(set_diff_line.as_bytes());
                             buf.push(b'\n');
                             debug!(
@@ -542,13 +490,6 @@ async fn handle_connection(
                     // Only clear when the job signals clean_jobs on the wire, so server
                     // behavior stays aligned with the wire-level protocol signal.
                     if job.clean_jobs {
-                        if debug {
-                            info!(
-                                session = %session.session_id,
-                                job_id = %job.job_id,
-                                "verbose: clean_jobs=true — clearing assigned jobs",
-                            );
-                        }
                         debug!(
                             session = %session.session_id,
                             job_id = %job.job_id,
@@ -567,15 +508,13 @@ async fn handle_connection(
                     // then flush in a single write_all.
                     let notify = create_notify(&job, &session.session_id);
                     let notify_line = serde_json::to_string(&notify)?;
-                    if debug {
-                        info!(
-                            session = %session.session_id,
-                            job_id = %job.job_id,
-                            message = %notify_line,
-                            "verbose: mining.notify on new job",
-                        );
-                    }
-                    debug_assert!(!notify_line.is_empty(), "write empty notify");
+                    debug!(
+                        session = %session.session_id,
+                        job_id = %job.job_id,
+                        message = %notify_line,
+                        "mining.notify on new job",
+                    );
+                    assert!(!notify_line.is_empty(), "write empty notify");
                     buf.extend_from_slice(notify_line.as_bytes());
                     buf.push(b'\n');
                     writer.write_all(&buf).await?;
@@ -620,7 +559,9 @@ async fn record_authorization_event(
     worker_parsed: &crate::stratum_protocol::session::WorkerName,
     share_repo: Option<&ShareRepository>,
 ) {
-    let worker_name = req.params.as_array()
+    let worker_name = req
+        .params
+        .as_array()
         .and_then(|a| a.first())
         .and_then(|v| v.as_str())
         .unwrap_or_default()
@@ -628,7 +569,12 @@ async fn record_authorization_event(
 
     let authorized = auth_resp.error.is_null();
     let reason = if !authorized {
-        auth_resp.error.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_str()).map(|s| s.to_string())
+        auth_resp
+            .error
+            .as_array()
+            .and_then(|a| a.get(1))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     } else {
         None
     };
@@ -662,11 +608,13 @@ async fn handle_submit(
     job_cache: &crate::node_integration::JobCache,
     accounting_service: Option<&AccountingService>,
     json_rpc_client: Option<&Arc<JsonRpcClient>>,
-    debug: bool,
 ) -> (StratumResponse, Option<f64>) {
     // Fast path: reject unsubscribed miners before any validation or persistence.
     if !session.is_subscribed {
-        return (StratumResponse::err(req.id.clone(), 25, "not-subscribed"), None);
+        return (
+            StratumResponse::err(req.id.clone(), 25, "not-subscribed"),
+            None,
+        );
     }
 
     // Extract submit parameters
@@ -680,73 +628,81 @@ async fn handle_submit(
     // Get the job from the cache to get template data for header building.
     // Keep the job for potential block submission if network_target_ok=true.
     let cached_job = job_cache.get(job_id).await;
-    let (validation, template_id, template_epoch, share_diff) =
-        if let Some(ref job) = cached_job {
-            // Run the full validation pipeline
-            let validation = validator::validate_share(
-                worker_name,
-                job_id,
-                extranonce2,
-                ntime_hex,
-                nonce_hex,
-                session,
-                job,
-                debug,
-            );
-            (
-                validation,
-                job.template_id,
-                job.template_epoch,
-                // Per UBQ: share difficulty = P_diff at assignment time, not submission time.
-                // Look up the specific assigned job's P_diff rather than using the latest.
-                session.get_assigned_job(job_id)
-                    .map(|a| a.p_diff)
-                    .unwrap_or_else(|| session.current_difficulty()),
-            )
-        } else if let Some(assigned) = session.get_assigned_job(job_id) {
-            // Job evicted from JobCache but still in session's assigned_jobs.
-            // Can't run full validation without header data, so reject as
-            // stale-job. Recover template_id/epoch from job_id format for
-            // accurate dedupe-key construction in persistence.
-            let (recovered_tid, recovered_epoch) =
-                crate::stratum_protocol::job::parse_template_metadata_from_job_id(job_id)
-                    .unwrap_or((0u64, 0u64));
-            (
-                validator::ValidationResult::rejected("stale-job"),
-                recovered_tid,
-                recovered_epoch,
-                assigned.p_diff,
-            )
-        } else {
-            // Job not in cache and not in assigned_jobs — truly stale/unknown.
-            (
-                validator::ValidationResult::rejected("stale-job"),
-                0u64,
-                0u64,
-                session.current_difficulty(),
-            )
-        };
+    let (validation, template_id, template_epoch, share_diff) = if let Some(ref job) = cached_job {
+        // Run the full validation pipeline
+        let validation = validator::validate_share(
+            worker_name,
+            job_id,
+            extranonce2,
+            ntime_hex,
+            nonce_hex,
+            session,
+            job,
+        );
+        (
+            validation,
+            job.template_id,
+            job.template_epoch,
+            // Per UBQ: share difficulty = P_diff at assignment time, not submission time.
+            // Look up the specific assigned job's P_diff rather than using the latest.
+            session
+                .get_assigned_job(job_id)
+                .map(|a| a.p_diff)
+                .unwrap_or_else(|| session.current_difficulty()),
+        )
+    } else if let Some(assigned) = session.get_assigned_job(job_id) {
+        // Job evicted from JobCache but still in session's assigned_jobs.
+        // Can't run full validation without header data, so reject as
+        // stale-job. Recover template_id/epoch from job_id format for
+        // accurate dedupe-key construction in persistence.
+        let (recovered_tid, recovered_epoch) =
+            crate::stratum_protocol::job::parse_template_metadata_from_job_id(job_id)
+                .unwrap_or((0u64, 0u64));
+        (
+            validator::ValidationResult::rejected("stale-job"),
+            recovered_tid,
+            recovered_epoch,
+            assigned.p_diff,
+        )
+    } else {
+        // Job not in cache and not in assigned_jobs — truly stale/unknown.
+        (
+            validator::ValidationResult::rejected("stale-job"),
+            0u64,
+            0u64,
+            session.current_difficulty(),
+        )
+    };
+
+    // Always-on: every share submission produces a surface-level log entry.
+    // Operators see accept/reject per worker regardless of debug setting.
+    validator_info!(
+        worker = %worker_name,
+        job_id = %job_id,
+        accepted = validation.accepted,
+        reject_reason = ?validation.reject_reason,
+        p_diff = share_diff,
+        "share processed",
+    );
 
     // Verbose share submission details
-    if debug {
-        info!(
-            session = %session.session_id,
-            worker = %worker_name,
-            job_id = %job_id,
-            extranonce2 = %extranonce2,
-            ntime = %ntime_hex,
-            nonce = %nonce_hex,
-            accepted = validation.accepted,
-            reject_reason = ?validation.reject_reason,
-            low_diff_ok = validation.low_diff_ok,
-            network_target_ok = validation.network_target_ok,
-            block_hash = ?validation.block_hash,
-            p_diff = share_diff,
-            template_id = template_id,
-            template_epoch = template_epoch,
-            "verbose: share submission details",
-        );
-    }
+    debug!(
+        session = %session.session_id,
+        worker = %worker_name,
+        job_id = %job_id,
+        extranonce2 = %extranonce2,
+        ntime = %ntime_hex,
+        nonce = %nonce_hex,
+        accepted = validation.accepted,
+        reject_reason = ?validation.reject_reason,
+        low_diff_ok = validation.low_diff_ok,
+        network_target_ok = validation.network_target_ok,
+        block_hash = ?validation.block_hash,
+        p_diff = share_diff,
+        template_id = template_id,
+        template_epoch = template_epoch,
+        "share submission details",
+    );
 
     // Persist share + outcome via AccountingService (records accounting events too).
     // This runs for ALL submissions (accepted or rejected) per UBQ.
@@ -756,8 +712,7 @@ async fn handle_submit(
     let mut actual_dedupe_key = String::new();
 
     if let Some(acct) = accounting_service {
-        if let Ok(worker_parsed) =
-            crate::stratum_protocol::session::parse_worker_name(worker_name)
+        if let Ok(worker_parsed) = crate::stratum_protocol::session::parse_worker_name(worker_name)
         {
             match acct.record_share(
                 &worker_parsed.payout_address,
@@ -771,7 +726,11 @@ async fn handle_submit(
                 ntime_hex,
                 nonce_hex,
                 share_diff,
-                if validation.accepted { "accepted" } else { "rejected" },
+                if validation.accepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                },
                 validation.reject_reason.as_deref(),
                 validation.low_diff_ok,
                 validation.network_target_ok,
@@ -787,11 +746,11 @@ async fn handle_submit(
         }
     }
 
-    if debug && validation.network_target_ok {
-        info!(
+    if validation.network_target_ok {
+        debug!(
             block_hash = ?validation.block_hash,
             block_bytes_len = cached_job.as_ref().map(|j| j.block_bytes.len()),
-            "verbose: block candidate detected, preparing submission",
+            "block candidate detected, preparing submission",
         );
     }
 
@@ -825,29 +784,19 @@ async fn handle_submit(
                                 );
                             }
                         }
-                        if debug {
-                            info!(
-                                block_hash = built_block_hash,
-                                block_hex_len = block_hex.len(),
-                                "verbose: block built, submitting to lotusd",
-                            );
-                        }
+                        debug!(
+                            block_hash = built_block_hash,
+                            block_hex_len = block_hex.len(),
+                            "block built, submitting to lotusd",
+                        );
                         let submit_result = json_rpc.submitblock(&block_hex).await;
                         match submit_result {
                             Ok(result) if result.accepted => {
-                                if debug {
-                                    info!(
-                                        block_hash = built_block_hash,
-                                        "verbose: block accepted by lotusd",
-                                    );
-                                }
-                                debug!(
-                                    block_hash = built_block_hash,
-                                    "block accepted by lotusd"
-                                );
+                                debug!(block_hash = built_block_hash, "block accepted by lotusd");
                                 if let Some(acct) = accounting_service {
                                     // Resolve the actual round for this template (not template_id as round_id)
-                                    if let Ok(round) = acct.resolve_round_for_template(template_id) {
+                                    if let Ok(round) = acct.resolve_round_for_template(template_id)
+                                    {
                                         let _ = acct.record_found_block(
                                             round.id,
                                             &built_block_hash,
@@ -861,51 +810,46 @@ async fn handle_submit(
                                         // Close the round: transition from 'open' to 'found'
                                         let _ = acct.close_round(round.id, template_id, "found");
                                     } else {
-                                        warn!(template_id, "failed to resolve round for found block");
+                                        warn!(
+                                            template_id,
+                                            "failed to resolve round for found block"
+                                        );
                                     }
                                     let _ = acct.update_share_outcome_node_result(
-                                        &actual_dedupe_key, "accepted"
+                                        &actual_dedupe_key,
+                                        "accepted",
                                     );
                                 }
                             }
                             Ok(result) => {
-                                if debug {
-                                    info!(
-                                        block_hash = built_block_hash,
-                                        error = ?result.error,
-                                        "verbose: block rejected by lotusd",
-                                    );
-                                }
                                 debug!(
                                     error = ?result.error,
                                     "block rejected by lotusd"
                                 );
                                 if let Some(acct) = accounting_service {
-                                    let reason = result.error.unwrap_or_else(|| "unknown".to_string());
+                                    let reason =
+                                        result.error.unwrap_or_else(|| "unknown".to_string());
                                     let _ = acct.update_share_outcome_node_result(
-                                        &actual_dedupe_key, &format!("rejected: {}", reason)
+                                        &actual_dedupe_key,
+                                        &format!("rejected: {}", reason),
                                     );
                                 }
                             }
                             Err(e) => {
-                                if debug {
-                                    info!(
-                                        block_hash = built_block_hash,
-                                        error = %e,
-                                        "verbose: block submission to lotusd failed",
-                                    );
-                                }
+                                debug!(
+                                    block_hash = built_block_hash,
+                                    error = %e,
+                                    "block submission to lotusd failed",
+                                );
                                 warn!(error = %e, "failed to submit block to lotusd (best-effort)");
                             }
                         }
                     }
                     Err(e) => {
-                        if debug {
-                            info!(
-                                error = %e,
-                                "verbose: failed to build submit block",
-                            );
-                        }
+                        debug!(
+                            error = %e,
+                            "failed to build submit block",
+                        );
                         warn!(error = %e, "failed to build submit block");
                     }
                 }
@@ -986,7 +930,14 @@ mod tests {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
+        let server = StratumServer::new(
+            addr,
+            job_cache,
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
 
         // Subscribe to job_tx to verify the job is broadcast through it
         let mut job_rx = server.job_tx().subscribe();
@@ -995,13 +946,10 @@ mod tests {
         server.notify_new_job(&job).await;
 
         // Verify the job was sent through job_tx (fails before Layer 3 consolidation)
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            job_rx.recv(),
-        )
-        .await
-        .expect("should receive job via job_tx")
-        .expect("job_tx should not be closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), job_rx.recv())
+            .await
+            .expect("should receive job via job_tx")
+            .expect("job_tx should not be closed");
 
         assert_eq!(received.job_id, job.job_id);
     }
@@ -1010,11 +958,18 @@ mod tests {
     async fn test_server_starts_and_accepts_connections() {
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
-        
+        let server = StratumServer::new(
+            addr,
+            job_cache,
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
         // Server should start without error
         assert_eq!(server.connected_miners().await, 0);
     }
@@ -1024,8 +979,15 @@ mod tests {
         let job_cache = Arc::new(JobCache::new(10));
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache, shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
-        
+        let server = StratumServer::new(
+            addr,
+            job_cache,
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
         let id1 = {
             let mut c = server.session_counter.write().await;
             *c += 1;
@@ -1041,7 +1003,7 @@ mod tests {
             *c += 1;
             format!("sess-{}", *c)
         };
-        
+
         assert_eq!(id1, "sess-1");
         assert_eq!(id2, "sess-2");
         assert_eq!(id3, "sess-3");
@@ -1051,10 +1013,10 @@ mod tests {
     async fn test_create_notify() {
         let job = create_test_job();
         let notify = create_notify(&job, "sess-1");
-        
+
         assert_eq!(notify["method"], "mining.notify");
         assert_eq!(notify["id"], serde_json::Value::Null);
-        
+
         let params = notify["params"].as_array().unwrap();
         assert_eq!(params[0], "job-890-100"); // job_id with epoch
         assert_eq!(params[1], job.prevhash); // prevhash
@@ -1070,11 +1032,16 @@ mod tests {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13339".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1083,7 +1050,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1107,8 +1077,15 @@ mod tests {
         let params = set_en["params"].as_array().unwrap();
         assert_eq!(params.len(), 2);
         let notif_extranonce1 = params[0].as_str().unwrap();
-        assert_eq!(notif_extranonce1, extranonce1, "set_extranonce extranonce1 must match subscribe response");
-        assert_eq!(params[1].as_u64().unwrap(), 4, "set_extranonce extranonce2_size must be 4");
+        assert_eq!(
+            notif_extranonce1, extranonce1,
+            "set_extranonce extranonce1 must match subscribe response"
+        );
+        assert_eq!(
+            params[1].as_u64().unwrap(),
+            4,
+            "set_extranonce extranonce2_size must be 4"
+        );
 
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
@@ -1122,11 +1099,16 @@ mod tests {
 
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13346".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1135,7 +1117,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe first (required before extranonce.subscribe in some clients)
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         // Drain mining.set_extranonce
@@ -1143,7 +1128,10 @@ mod tests {
         reader.read_line(&mut response).await.unwrap();
 
         // Send mining.extranonce.subscribe
-        write_half.write_all(b"{\"id\":2,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":2,\"method\":\"mining.extranonce.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         response.clear();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1165,33 +1153,41 @@ mod tests {
         // Start server
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13334".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
-        
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
-        
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let stream = TcpStream::connect("127.0.0.1:13334").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        
+
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"].as_array().unwrap().len(), 3);
-        
+
         // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
         response.clear();
@@ -1199,7 +1195,7 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(resp["error"].is_null());
         assert_eq!(resp["result"], serde_json::Value::Bool(true));
-        
+
         // Receive mining.set_difficulty after authorize
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
@@ -1209,8 +1205,12 @@ mod tests {
         let set_diff: serde_json::Value = serde_json::from_str(&response.trim()).unwrap();
         assert_eq!(set_diff["method"], "mining.set_difficulty");
         let diff_val = set_diff["params"][0].as_f64().unwrap();
-        assert!(diff_val > 0.0, "initial P_diff should be positive, got {}", diff_val);
-        
+        assert!(
+            diff_val > 0.0,
+            "initial P_diff should be positive, got {}",
+            diff_val
+        );
+
         // Receive mining.notify after set_difficulty
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
@@ -1220,16 +1220,19 @@ mod tests {
         let notify: serde_json::Value = serde_json::from_str(&response.trim()).unwrap();
         assert_eq!(notify["method"], "mining.notify");
         assert_eq!(notify["params"][0], "job-890-100");
-        
+
         // Submit with correct params. Share may be accepted or rejected as
         // low-difficulty — both are valid pipeline outcomes.
         write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
-        
+
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert!(!resp.get("result").is_none(), "expected a result field in response");
-        
+        assert!(
+            !resp.get("result").is_none(),
+            "expected a result field in response"
+        );
+
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
@@ -1245,30 +1248,35 @@ mod tests {
     async fn test_authorize_requires_subscribe() {
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13335".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
-        
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
-        
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let stream = TcpStream::connect("127.0.0.1:13335").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        
+
         write_half.write_all(b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
-        
+
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
-        
+
         assert!(!resp["error"].is_null());
         assert_eq!(resp["error"].as_array().unwrap()[1], "not-subscribed");
-        
+
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
@@ -1277,29 +1285,34 @@ mod tests {
     async fn test_invalid_json_request() {
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13336".parse().unwrap();
-        let server = StratumServer::new(addr, job_cache.clone(), shutdown_tx.clone(), None, None, VarDiffConfig::default(), false);
-        
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
-        
+        let server = StratumServer::new(
+            addr,
+            job_cache.clone(),
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let stream = TcpStream::connect("127.0.0.1:13336").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        
+
         write_half.write_all(b"not valid json\n").await.unwrap();
-        
+
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
-        
+
         assert!(!resp["error"].is_null());
-        
+
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
@@ -1307,10 +1320,10 @@ mod tests {
     /// Integration test: verify shares persisted during graceful shutdown
     #[tokio::test]
     async fn test_graceful_shutdown_persists_in_flight_shares() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService, ShareRepository};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
@@ -1321,7 +1334,7 @@ mod tests {
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13337".parse().unwrap();
         let server = StratumServer::new(
@@ -1331,61 +1344,64 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
-        
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
-        
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let stream = TcpStream::connect("127.0.0.1:13337").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        
+
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Drain mining.set_extranonce notification (sent after subscribe per Stratum V1)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Authorize
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Read mining.set_difficulty (sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Wait for mining.notify
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
             .await
             .expect("should receive mining.notify")
             .unwrap();
-        
+
         // Submit share with correct params. Share may be accepted or rejected;
         // the key assertion is that the pipeline runs and persists the outcome.
         write_half.write_all(b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"job-890-100\",\"00000003\",\"6adc0c6a0000\",\"B02B4ABB3DD6E835\"]}\n").await.unwrap();
-        
+
         response.clear();
         reader.read_line(&mut response).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert!(!resp.get("result").is_none(), "expected a result field in response");
-        
+        assert!(
+            !resp.get("result").is_none(),
+            "expected a result field in response"
+        );
+
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
-        
+
         // Verify both share and share_outcome were persisted
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total_shares = share_repo.total_count().unwrap();
         let total_outcomes = share_repo.total_outcome_count().unwrap();
-        
+
         assert_eq!(total_shares, 1, "raw share should be persisted");
         assert_eq!(total_outcomes, 1, "share outcome should be persisted");
     }
@@ -1393,10 +1409,10 @@ mod tests {
     /// Integration test: verify authorizing records an authorization event
     #[tokio::test]
     async fn test_authorization_event_recorded() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1406,7 +1422,7 @@ mod tests {
 
         let job_cache = Arc::new(JobCache::new(10));
         job_cache.insert(create_test_job()).await;
-        
+
         let (shutdown_tx, _) = broadcast::channel::<()>(10);
         let addr: SocketAddr = "127.0.0.1:13338".parse().unwrap();
         let server = StratumServer::new(
@@ -1416,44 +1432,44 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
-        
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
-        
+
+        let server_handle = tokio::spawn(async move { server.run().await });
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let stream = TcpStream::connect("127.0.0.1:13338").await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        
+
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Authorize with valid worker
         write_half.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig\",\"x\"]}\n").await.unwrap();
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Read mining.set_difficulty (sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        
+
         // Wait for mining.notify
         response.clear();
         tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response))
             .await
             .expect("should receive mining.notify")
             .unwrap();
-        
+
         // Shutdown
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
-        
+
         // Verify auth event was recorded
         // Query the authorization_events table directly
         let conn = db_conn_arc.lock();
@@ -1470,10 +1486,10 @@ mod tests {
     /// Integration test: rejected share (unauthorized worker) persists share_outcome.
     #[tokio::test]
     async fn test_rejected_share_unauthorized_persists_outcome() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1493,12 +1509,9 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1507,7 +1520,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1535,7 +1551,10 @@ mod tests {
         // Verify outcome was persisted with correct reject_reason
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total = share_repo.total_outcome_count().unwrap();
-        assert_eq!(total, 1, "share outcome should be persisted for unauthorized worker");
+        assert_eq!(
+            total, 1,
+            "share outcome should be persisted for unauthorized worker"
+        );
         let reasons = share_repo.count_rejected_by_reason().unwrap();
         assert_eq!(reasons.get("unauthorized-worker"), Some(&1));
     }
@@ -1543,10 +1562,10 @@ mod tests {
     /// Integration test: rejected share (stale job) persists share_outcome.
     #[tokio::test]
     async fn test_rejected_share_stale_job_persists_outcome() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1566,12 +1585,9 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1580,7 +1596,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe and authorize
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1622,7 +1641,10 @@ mod tests {
         // Verify outcome was persisted
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total = share_repo.total_outcome_count().unwrap();
-        assert!(total >= 1, "share outcome should be persisted for stale job");
+        assert!(
+            total >= 1,
+            "share outcome should be persisted for stale job"
+        );
         let reasons = share_repo.count_rejected_by_reason().unwrap();
         assert_eq!(reasons.get("stale-job"), Some(&1));
     }
@@ -1630,10 +1652,10 @@ mod tests {
     /// Integration test: rejected share (ntime-mismatch) persists share_outcome.
     #[tokio::test]
     async fn test_rejected_share_ntime_mismatch_persists_outcome() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1653,12 +1675,9 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1667,7 +1686,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe and authorize
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1709,7 +1731,10 @@ mod tests {
         // Verify outcome was persisted
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total = share_repo.total_outcome_count().unwrap();
-        assert!(total >= 1, "share outcome should be persisted for ntime mismatch");
+        assert!(
+            total >= 1,
+            "share outcome should be persisted for ntime mismatch"
+        );
         let reasons = share_repo.count_rejected_by_reason().unwrap();
         assert_eq!(reasons.get("ntime-mismatch"), Some(&1));
     }
@@ -1717,10 +1742,10 @@ mod tests {
     /// Integration test: rejected share (invalid-submit-shape) persists share_outcome.
     #[tokio::test]
     async fn test_rejected_share_invalid_shape_persists_outcome() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1740,12 +1765,9 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1754,7 +1776,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe and authorize
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1796,7 +1821,10 @@ mod tests {
         // Verify outcome was persisted
         let share_repo = ShareRepository::new(db_conn_arc.clone());
         let total = share_repo.total_outcome_count().unwrap();
-        assert!(total >= 1, "share outcome should be persisted for invalid shape");
+        assert!(
+            total >= 1,
+            "share outcome should be persisted for invalid shape"
+        );
         let reasons = share_repo.count_rejected_by_reason().unwrap();
         assert_eq!(reasons.get("invalid-submit-shape"), Some(&1));
     }
@@ -1805,10 +1833,10 @@ mod tests {
     /// Per UBQ §Accounting Event: the hot path must produce share_outcome events.
     #[tokio::test]
     async fn test_accounting_event_recorded_in_submission_path() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1828,12 +1856,9 @@ mod tests {
             Some(accounting_svc.clone()),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1842,7 +1867,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -1876,7 +1904,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
 
         // Verify accounting events were recorded (regardless of accept/reject status)
-        let events = accounting_svc.event_repo.list_by_type("share_outcome", 10, 0).unwrap();
+        let events = accounting_svc
+            .event_repo
+            .list_by_type("share_outcome", 10, 0)
+            .unwrap();
         assert!(
             !events.is_empty(),
             "share_outcome accounting event should be recorded in TCP submission path"
@@ -1888,18 +1919,24 @@ mod tests {
             events[0].status,
         );
         assert_eq!(events[0].event_type, "share_outcome");
-        assert!(events[0].session_id.is_some(), "session_id should be recorded");
-        assert!(events[0].worker_id.is_some(), "worker_id should be recorded");
+        assert!(
+            events[0].session_id.is_some(),
+            "session_id should be recorded"
+        );
+        assert!(
+            events[0].worker_id.is_some(),
+            "worker_id should be recorded"
+        );
     }
 
     /// Integration test: submitting the identical share twice via TCP results
     /// in only one database record (dedupe_key enforcement through the full path).
     #[tokio::test]
     async fn test_deduplicate_identical_share_tcp() {
-        use tempfile::NamedTempFile;
         use crate::accounting::{init_schema, AccountingService, ShareRepository};
         use parking_lot::Mutex;
         use rusqlite::Connection;
+        use tempfile::NamedTempFile;
 
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
@@ -1920,7 +1957,6 @@ mod tests {
             Some(accounting_svc),
             None,
             VarDiffConfig::default(),
-            false,
         );
 
         let server_handle = tokio::spawn(async move { server.run().await });
@@ -1931,7 +1967,10 @@ mod tests {
         let mut reader = BufReader::new(read_half);
 
         // Subscribe
-        write_half.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n").await.unwrap();
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         reader.read_line(&mut response).await.unwrap();
 
@@ -2013,7 +2052,6 @@ mod tests {
             None,
             None,
             VarDiffConfig::default(),
-            false,
         );
 
         // Capture job_tx before spawning the server task
@@ -2031,9 +2069,7 @@ mod tests {
 
         // Subscribe
         write_half
-            .write_all(
-                b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n",
-            )
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
             .await
             .unwrap();
         let mut response = String::new();
@@ -2056,8 +2092,7 @@ mod tests {
         // Read mining.set_difficulty (initial P_diff, sent after authorize)
         response.clear();
         reader.read_line(&mut response).await.unwrap();
-        let set_diff: serde_json::Value =
-            serde_json::from_str(response.trim()).unwrap();
+        let set_diff: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
         assert_eq!(set_diff["method"], "mining.set_difficulty");
         let initial_p_diff = set_diff["params"][0].as_f64().unwrap();
         assert!(initial_p_diff > 0.0, "initial P_diff must be positive");
@@ -2070,9 +2105,8 @@ mod tests {
             .unwrap();
 
         // Compute the initial N_diff for context
-        let _initial_n_diff =
-            network_target_hex_to_difficulty(&initial_job.network_target_hex)
-                .unwrap_or(f64::INFINITY);
+        let _initial_n_diff = network_target_hex_to_difficulty(&initial_job.network_target_hex)
+            .unwrap_or(f64::INFINITY);
 
         // Create a new job with a vastly lower N_diff (all-0xFF target ≈ 0 difficulty)
         // This forces P_diff to clamp because P_diff > N_diff after the update.
@@ -2083,8 +2117,7 @@ mod tests {
         new_job.template_epoch = 101;
         new_job.clean_jobs = true;
         new_job.network_target_hex =
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                .to_string();
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
 
         // Broadcast the new job through job_tx (the NNG event consumer path)
         job_tx.send(Arc::new(new_job)).unwrap();
@@ -2095,16 +2128,12 @@ mod tests {
         response.clear();
         tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut response))
             .await
-            .expect(
-                "should receive mining.set_difficulty after VarDiff ceiling update",
-            )
+            .expect("should receive mining.set_difficulty after VarDiff ceiling update")
             .unwrap();
 
-        let clamped: serde_json::Value =
-            serde_json::from_str(response.trim()).unwrap();
+        let clamped: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
         assert_eq!(
-            clamped["method"],
-            "mining.set_difficulty",
+            clamped["method"], "mining.set_difficulty",
             "expected mining.set_difficulty before mining.notify after N_diff clamp"
         );
         let clamped_p_diff = clamped["params"][0].as_f64().unwrap();

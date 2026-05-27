@@ -1,6 +1,6 @@
+use super::{SignedBatchData, Signer};
 use anyhow::Result;
 use async_trait::async_trait;
-use super::{SignedBatchData, Signer};
 
 /// Signer that delegates payout transaction signing to an external webhook.
 ///
@@ -69,10 +69,7 @@ impl Signer for ExternalSigner {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!(
-                "external signer returned HTTP {}",
-                status.as_u16()
-            );
+            anyhow::bail!("external signer returned HTTP {}", status.as_u16());
         }
 
         let body: serde_json::Value = response
@@ -93,9 +90,9 @@ impl Signer for ExternalSigner {
 mod tests {
     use super::*;
     use crate::payout::plan::{PayoutOutput, PayoutPlan};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use std::sync::Arc;
 
     /// Helper: spawn a mock webhook server that returns a canned response.
     /// Returns the URL and a shared buffer capturing the POST body.
@@ -199,13 +196,13 @@ mod tests {
         assert_eq!(txid, expected_txid);
 
         // Verify the POST body contains the payout plan data
-        let body = captured.lock().unwrap().take()
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
             .expect("mock webhook should have received a request");
         assert!(body.contains("POST"), "should be a POST request");
-        assert!(
-            body.contains("retry_key"),
-            "body should contain retry_key"
-        );
+        assert!(body.contains("retry_key"), "body should contain retry_key");
         assert!(
             body.contains("\"test:2\""),
             "body should contain the batch's retry_key value"

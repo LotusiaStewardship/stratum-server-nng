@@ -1,11 +1,11 @@
+use crate::shutdown_info;
 use anyhow::Result;
+use parking_lot::Mutex;
+use rusqlite::Connection;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
-use tracing::info;
-use rusqlite::Connection;
-use std::sync::Arc;
-use parking_lot::Mutex;
 
 /// Graceful shutdown coordinator for managing server lifecycle.
 ///
@@ -37,9 +37,7 @@ impl ShutdownCoordinator {
     }
 
     /// Create a new shutdown coordinator with database connection for WAL checkpoint.
-    pub fn with_db_conn(
-        db_conn: Arc<Mutex<Connection>>,
-    ) -> Self {
+    pub fn with_db_conn(db_conn: Arc<Mutex<Connection>>) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1024);
         Self {
             shutdown_tx,
@@ -59,7 +57,7 @@ impl ShutdownCoordinator {
 
     /// Initiate graceful shutdown by broadcasting signal to all tasks.
     pub fn initiate_shutdown(&self) {
-        info!("initiating graceful shutdown");
+        shutdown_info!("initiating graceful shutdown");
         let _ = self.shutdown_tx.send(());
     }
 
@@ -69,7 +67,7 @@ impl ShutdownCoordinator {
     /// it might start cleanup that will be interrupted by the immediate
     /// `exit(1)` in main.rs, potentially leaving partial state.
     pub fn initiate_emergency_shutdown(&self) {
-        info!("initiating emergency shutdown (no flush, no cleanup)");
+        shutdown_info!("initiating emergency shutdown (no flush, no cleanup)");
     }
 
     /// Register a task handle to be awaited during shutdown.
@@ -84,7 +82,7 @@ impl ShutdownCoordinator {
     /// Wait for all tasks to complete shutdown (max timeout).
     /// Performs WAL checkpoint on database connection if available.
     pub async fn wait_for_completion(&self) -> Result<()> {
-        info!(
+        shutdown_info!(
             timeout_secs = self.shutdown_timeout_secs,
             "waiting for tasks to complete shutdown"
         );
@@ -96,38 +94,35 @@ impl ShutdownCoordinator {
         };
 
         if !tasks.is_empty() {
-            info!(task_count = tasks.len(), "awaiting tasks to complete");
-            
+            shutdown_info!(task_count = tasks.len(), "awaiting tasks to complete");
+
             // Wait for all tasks with overall timeout
             let wait_all = async {
                 for task in tasks {
                     let _ = task.await;
                 }
             };
-            
-            timeout(
-                Duration::from_secs(self.shutdown_timeout_secs),
-                wait_all,
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("shutdown timeout exceeded"))?;
-            
-            info!("all tasks completed");
+
+            timeout(Duration::from_secs(self.shutdown_timeout_secs), wait_all)
+                .await
+                .map_err(|_| anyhow::anyhow!("shutdown timeout exceeded"))?;
+
+            shutdown_info!("all tasks completed");
         }
 
         // Perform WAL checkpoint if database connection is available
         if let Some(conn) = &self.db_conn {
-            info!("performing WAL checkpoint");
+            shutdown_info!("performing WAL checkpoint");
             let conn_guard = conn.lock();
             conn_guard
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .unwrap_or_else(|e| {
-                    info!(error = %e, "WAL checkpoint failed (non-fatal)");
+                    shutdown_info!(error = %e, "WAL checkpoint failed (non-fatal)");
                 });
-            info!("WAL checkpoint complete");
+            shutdown_info!("WAL checkpoint complete");
         }
 
-        info!("shutdown complete");
+        shutdown_info!("shutdown complete");
         Ok(())
     }
 
@@ -241,6 +236,9 @@ mod tests {
         let result = coordinator.wait_for_completion().await;
 
         assert!(result.is_ok());
-        assert!(*completed.lock().await, "task should have completed before wait_for_completion returned");
+        assert!(
+            *completed.lock().await,
+            "task should have completed before wait_for_completion returned"
+        );
     }
 }

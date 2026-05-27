@@ -1,8 +1,8 @@
 use anyhow::Result;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use rusqlite::ToSql;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 /// Raw share submission record (per UBQ §Share).
 /// Captures the fact that a miner submitted work. Immutable once persisted.
@@ -107,9 +107,7 @@ impl ShareRepository {
 
         if rows_affected == 0 {
             // Duplicate — get the existing ID
-            let mut query = conn.prepare(
-                "SELECT id FROM shares WHERE dedupe_key = ?1"
-            )?;
+            let mut query = conn.prepare("SELECT id FROM shares WHERE dedupe_key = ?1")?;
             let id: i64 = query.query_row([&share.dedupe_key], |row| row.get(0))?;
             Ok(Some(id))
         } else {
@@ -147,9 +145,7 @@ impl ShareRepository {
 
         if rows_affected == 0 {
             // Duplicate
-            let mut query = conn.prepare(
-                "SELECT id FROM share_outcomes WHERE dedupe_key = ?1"
-            )?;
+            let mut query = conn.prepare("SELECT id FROM share_outcomes WHERE dedupe_key = ?1")?;
             let id: i64 = query.query_row([&outcome.dedupe_key], |row| row.get(0))?;
             Ok(Some(id))
         } else {
@@ -182,8 +178,7 @@ impl ShareRepository {
     /// Count share_outcomes by status (used for stats).
     pub fn count_outcomes_by_status(&self, status: &str) -> Result<i64> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM share_outcomes WHERE status = ?1")?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM share_outcomes WHERE status = ?1")?;
         let count: i64 = stmt.query_row([status], |row| row.get(0))?;
         Ok(count)
     }
@@ -192,9 +187,8 @@ impl ShareRepository {
     /// Returns the number of rows updated (should be 0 or 1).
     pub fn update_outcome_node_result(&self, dedupe_key: &str, node_result: &str) -> Result<usize> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "UPDATE share_outcomes SET node_result = ?1 WHERE dedupe_key = ?2"
-        )?;
+        let mut stmt =
+            conn.prepare("UPDATE share_outcomes SET node_result = ?1 WHERE dedupe_key = ?2")?;
         let rows = stmt.execute(rusqlite::params![node_result, dedupe_key])?;
         Ok(rows)
     }
@@ -210,8 +204,7 @@ impl ShareRepository {
     /// Count shares by worker (legacy — queries shares table).
     pub fn count_by_worker(&self, worker_id: i64) -> Result<i64> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM shares WHERE worker_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM shares WHERE worker_id = ?1")?;
         let count: i64 = stmt.query_row([worker_id], |row| row.get(0))?;
         Ok(count)
     }
@@ -302,7 +295,11 @@ impl ShareRepository {
                 (id, is_new)
             };
 
-            Ok((Some(share_id), Some(outcome_id), share_is_new || outcome_is_new))
+            Ok((
+                Some(share_id),
+                Some(outcome_id),
+                share_is_new || outcome_is_new,
+            ))
         })();
 
         match result {
@@ -353,7 +350,7 @@ impl ShareRepository {
              JOIN workers w ON w.id = so.worker_id
              WHERE so.round_id = ?1
              GROUP BY so.worker_id
-             ORDER BY so.worker_id"
+             ORDER BY so.worker_id",
         )?;
 
         let rows = stmt.query_map([round_id], |row| {
@@ -619,9 +616,7 @@ impl ShareRepository {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let sql = format!(
-            "SELECT COUNT(*) FROM shares s {join_clause} {where_clause}"
-        );
+        let sql = format!("SELECT COUNT(*) FROM shares s {join_clause} {where_clause}");
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -668,9 +663,7 @@ impl ShareRepository {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let sql = format!(
-            "SELECT COUNT(*) FROM share_outcomes so {where_clause}"
-        );
+        let sql = format!("SELECT COUNT(*) FROM share_outcomes so {where_clause}");
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -686,7 +679,12 @@ mod tests {
     use crate::accounting::schema::init_schema;
     use tempfile::NamedTempFile;
 
-    fn create_test_share(worker_id: i64, template_id: u64, template_epoch: u64, dedupe_key: &str) -> Share {
+    fn create_test_share(
+        worker_id: i64,
+        template_id: u64,
+        template_epoch: u64,
+        dedupe_key: &str,
+    ) -> Share {
         Share {
             id: 0,
             worker_id,
@@ -703,7 +701,12 @@ mod tests {
         }
     }
 
-    fn create_test_outcome(share_id: i64, worker_id: i64, dedupe_key: &str, status: &str) -> ShareOutcome {
+    fn create_test_outcome(
+        share_id: i64,
+        worker_id: i64,
+        dedupe_key: &str,
+        status: &str,
+    ) -> ShareOutcome {
         ShareOutcome {
             id: 0,
             share_id,
@@ -737,7 +740,12 @@ mod tests {
         setup_worker(&conn, 1, "test_address", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        let share = create_test_share(1, 42, 12345, "1:42:12345:00112233:001122334455:0011223344556677");
+        let share = create_test_share(
+            1,
+            42,
+            12345,
+            "1:42:12345:00112233:001122334455:0011223344556677",
+        );
 
         let id = repo.insert_share(&share).unwrap();
         assert!(id.is_some());
@@ -775,10 +783,20 @@ mod tests {
         setup_worker(&conn, 1, "test_address", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        let share = create_test_share(1, 42, 12345, "1:42:12345:00112233:001122334455:0011223344556677");
+        let share = create_test_share(
+            1,
+            42,
+            12345,
+            "1:42:12345:00112233:001122334455:0011223344556677",
+        );
         let share_id = repo.insert_share(&share).unwrap().unwrap();
 
-        let outcome = create_test_outcome(share_id, 1, "1:42:12345:00112233:001122334455:0011223344556677", "accepted");
+        let outcome = create_test_outcome(
+            share_id,
+            1,
+            "1:42:12345:00112233:001122334455:0011223344556677",
+            "accepted",
+        );
         let outcome_id = repo.insert_share_outcome(&outcome).unwrap();
         assert!(outcome_id.is_some());
         assert!(outcome_id.unwrap() > 0);
@@ -835,9 +853,12 @@ mod tests {
         setup_worker(&conn, 2, "addr2", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 1, 100, "dk1")).unwrap();
-        repo.insert_share(&create_test_share(1, 1, 101, "dk2")).unwrap();
-        repo.insert_share(&create_test_share(2, 1, 102, "dk3")).unwrap();
+        repo.insert_share(&create_test_share(1, 1, 100, "dk1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 1, 101, "dk2"))
+            .unwrap();
+        repo.insert_share(&create_test_share(2, 1, 102, "dk3"))
+            .unwrap();
 
         assert_eq!(repo.count_by_worker(1).unwrap(), 2);
         assert_eq!(repo.count_by_worker(2).unwrap(), 1);
@@ -855,11 +876,13 @@ mod tests {
         // Insert shares and outcomes
         let s1 = create_test_share(1, 1, 100, "dk1");
         let sid1 = repo.insert_share(&s1).unwrap().unwrap();
-        repo.insert_share_outcome(&create_test_outcome(sid1, 1, "dk1", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(sid1, 1, "dk1", "accepted"))
+            .unwrap();
 
         let s2 = create_test_share(1, 1, 101, "dk2");
         let sid2 = repo.insert_share(&s2).unwrap().unwrap();
-        repo.insert_share_outcome(&create_test_outcome(sid2, 1, "dk2", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(sid2, 1, "dk2", "accepted"))
+            .unwrap();
 
         let s3 = create_test_share(1, 1, 102, "dk3");
         let sid3 = repo.insert_share(&s3).unwrap().unwrap();
@@ -881,8 +904,10 @@ mod tests {
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
         assert_eq!(repo.total_count().unwrap(), 0);
 
-        repo.insert_share(&create_test_share(1, 1, 100, "dk1")).unwrap();
-        repo.insert_share(&create_test_share(1, 1, 101, "dk2")).unwrap();
+        repo.insert_share(&create_test_share(1, 1, 100, "dk1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 1, 101, "dk2"))
+            .unwrap();
 
         assert_eq!(repo.total_count().unwrap(), 2);
     }
@@ -917,7 +942,8 @@ mod tests {
 
         let s4 = create_test_share(1, 1, 103, "dk4");
         let sid4 = repo.insert_share(&s4).unwrap().unwrap();
-        repo.insert_share_outcome(&create_test_outcome(sid4, 1, "dk4", "accepted")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(sid4, 1, "dk4", "accepted"))
+            .unwrap();
 
         let reasons = repo.count_rejected_by_reason().unwrap();
 
@@ -929,7 +955,14 @@ mod tests {
 
     #[test]
     fn test_build_dedupe_key() {
-        let key = ShareRepository::build_dedupe_key(1, 42, 12345, "00112233", "001122334455", "0011223344556677");
+        let key = ShareRepository::build_dedupe_key(
+            1,
+            42,
+            12345,
+            "00112233",
+            "001122334455",
+            "0011223344556677",
+        );
         assert_eq!(key, "1:42:12345:00112233:001122334455:0011223344556677");
     }
 
@@ -940,7 +973,9 @@ mod tests {
         init_schema(&conn).unwrap();
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        let shares = repo.list_shares(None, None, None, None, None, None).unwrap();
+        let shares = repo
+            .list_shares(None, None, None, None, None, None)
+            .unwrap();
         assert!(shares.is_empty(), "expected no shares in empty database");
     }
 
@@ -958,7 +993,9 @@ mod tests {
         repo.insert_share(&s1).unwrap();
         repo.insert_share(&s2).unwrap();
 
-        let shares = repo.list_shares(None, None, None, None, None, None).unwrap();
+        let shares = repo
+            .list_shares(None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(shares.len(), 2, "should return all inserted shares");
     }
 
@@ -971,11 +1008,16 @@ mod tests {
         setup_worker(&conn, 2, "addr2", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "key1")).unwrap();
-        repo.insert_share(&create_test_share(2, 20, 200, "key2")).unwrap();
-        repo.insert_share(&create_test_share(1, 30, 300, "key3")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "key1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(2, 20, 200, "key2"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 30, 300, "key3"))
+            .unwrap();
 
-        let shares = repo.list_shares(Some(1), None, None, None, None, None).unwrap();
+        let shares = repo
+            .list_shares(Some(1), None, None, None, None, None)
+            .unwrap();
         assert_eq!(shares.len(), 2, "worker 1 should have 2 shares");
         assert!(shares.iter().all(|s| s.worker_id == 1));
     }
@@ -993,13 +1035,20 @@ mod tests {
             repo.insert_share(&s).unwrap();
         }
 
-        let limited = repo.list_shares(None, None, None, None, Some(2), None).unwrap();
+        let limited = repo
+            .list_shares(None, None, None, None, Some(2), None)
+            .unwrap();
         assert_eq!(limited.len(), 2, "limit=2 should return 2 shares");
 
-        let offset = repo.list_shares(None, None, None, None, Some(2), Some(2)).unwrap();
+        let offset = repo
+            .list_shares(None, None, None, None, Some(2), Some(2))
+            .unwrap();
         assert_eq!(offset.len(), 2, "offset=2 limit=2 should return 2 shares");
         // With offset=2, we skip the first 2, so results differ
-        assert_ne!(limited[0].id, offset[0].id, "offset should return different results");
+        assert_ne!(
+            limited[0].id, offset[0].id,
+            "offset should return different results"
+        );
     }
 
     #[test]
@@ -1010,14 +1059,20 @@ mod tests {
         setup_worker(&conn, 1, "addr1", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "key_accept")).unwrap();
-        repo.insert_share(&create_test_share(1, 20, 200, "key_reject")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "key_accept"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "key_reject"))
+            .unwrap();
 
         // Insert matching share_outcomes (share IDs are 1 and 2 after inserts)
-        repo.insert_share_outcome(&create_test_outcome(1, 1, "key_accept", "accepted")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(2, 1, "key_reject", "rejected")).unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "key_accept", "accepted"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "key_reject", "rejected"))
+            .unwrap();
 
-        let accepted = repo.list_shares(None, Some("accepted"), None, None, None, None).unwrap();
+        let accepted = repo
+            .list_shares(None, Some("accepted"), None, None, None, None)
+            .unwrap();
         assert_eq!(accepted.len(), 1, "should find 1 accepted share");
         assert_eq!(accepted[0].dedupe_key, "key_accept");
     }
@@ -1030,10 +1085,20 @@ mod tests {
         setup_worker(&conn, 1, "addr1", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "key1")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "key1"))
+            .unwrap();
 
         // Use a far-past and far-future date to ensure all shares are included
-        let shares = repo.list_shares(None, None, Some("2020-01-01"), Some("2030-01-01"), None, None).unwrap();
+        let shares = repo
+            .list_shares(
+                None,
+                None,
+                Some("2020-01-01"),
+                Some("2030-01-01"),
+                None,
+                None,
+            )
+            .unwrap();
         assert!(!shares.is_empty(), "should find shares in wide date range");
     }
 
@@ -1044,8 +1109,13 @@ mod tests {
         init_schema(&conn).unwrap();
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        let outcomes = repo.list_outcomes(None, None, None, None, None, None).unwrap();
-        assert!(outcomes.is_empty(), "expected no outcomes in empty database");
+        let outcomes = repo
+            .list_outcomes(None, None, None, None, None, None)
+            .unwrap();
+        assert!(
+            outcomes.is_empty(),
+            "expected no outcomes in empty database"
+        );
     }
 
     #[test]
@@ -1056,12 +1126,18 @@ mod tests {
         setup_worker(&conn, 1, "addr1", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
-        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "k1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected"))
+            .unwrap();
 
-        let outcomes = repo.list_outcomes(None, None, None, None, None, None).unwrap();
+        let outcomes = repo
+            .list_outcomes(None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(outcomes.len(), 2, "should return all outcomes");
     }
 
@@ -1074,14 +1150,22 @@ mod tests {
         setup_worker(&conn, 2, "addr2", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
-        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
-        repo.insert_share(&create_test_share(2, 30, 300, "k3")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(3, 2, "k3", "accepted")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "k1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2"))
+            .unwrap();
+        repo.insert_share(&create_test_share(2, 30, 300, "k3"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(3, 2, "k3", "accepted"))
+            .unwrap();
 
-        let outcomes = repo.list_outcomes(Some(1), None, None, None, None, None).unwrap();
+        let outcomes = repo
+            .list_outcomes(Some(1), None, None, None, None, None)
+            .unwrap();
         assert_eq!(outcomes.len(), 2, "worker 1 should have 2 outcomes");
     }
 
@@ -1093,12 +1177,18 @@ mod tests {
         setup_worker(&conn, 1, "addr1", None);
 
         let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
-        repo.insert_share(&create_test_share(1, 10, 100, "k1")).unwrap();
-        repo.insert_share(&create_test_share(1, 20, 200, "k2")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted")).unwrap();
-        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected")).unwrap();
+        repo.insert_share(&create_test_share(1, 10, 100, "k1"))
+            .unwrap();
+        repo.insert_share(&create_test_share(1, 20, 200, "k2"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(1, 1, "k1", "accepted"))
+            .unwrap();
+        repo.insert_share_outcome(&create_test_outcome(2, 1, "k2", "rejected"))
+            .unwrap();
 
-        let outcomes = repo.list_outcomes(None, Some("accepted"), None, None, None, None).unwrap();
+        let outcomes = repo
+            .list_outcomes(None, Some("accepted"), None, None, None, None)
+            .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, "accepted");
     }

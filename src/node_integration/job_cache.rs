@@ -31,14 +31,14 @@ impl JobCache {
         // Track insertion order
         let mut order = self.job_order.write().await;
         order.push_back(job_id.clone());
-        
+
         // Evict oldest if over capacity (synchronous LRU)
         while order.len() > self.max_size as usize {
             if let Some(oldest_id) = order.pop_front() {
                 self.cache.invalidate(&oldest_id).await;
             }
         }
-        
+
         // Insert into cache
         self.cache.insert(job_id.clone(), job).await;
     }
@@ -96,7 +96,8 @@ mod tests {
         MiningJob {
             job_id: job_id.to_string(),
             template_id,
-            prevhash: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            prevhash: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             coinbase1: "coinbase1".to_string(),
             coinbase2: "coinbase2".to_string(),
             merkle_branches: vec![],
@@ -208,7 +209,10 @@ mod tests {
         cache.insert(job2).await;
 
         // Should return latest
-        assert_eq!(cache.get_latest_target_hex().await, Some("target2".to_string()));
+        assert_eq!(
+            cache.get_latest_target_hex().await,
+            Some("target2".to_string())
+        );
     }
 
     #[tokio::test]
@@ -261,12 +265,12 @@ mod tests {
     #[tokio::test]
     async fn test_len_matches_cache_size() {
         let cache = JobCache::new(10);
-        
+
         assert_eq!(cache.len().await, 0);
-        
+
         cache.insert(create_test_job("job-1", 1)).await;
         assert_eq!(cache.len().await, 1);
-        
+
         cache.insert(create_test_job("job-2", 2)).await;
         cache.insert(create_test_job("job-3", 3)).await;
         assert_eq!(cache.len().await, 3);

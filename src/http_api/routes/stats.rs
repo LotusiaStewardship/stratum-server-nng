@@ -1,10 +1,7 @@
-use axum::{
-    extract::State,
-    response::Json,
-};
+use crate::http_api::server::AppState;
+use axum::{extract::State, response::Json};
 use serde::Serialize;
 use std::collections::HashMap;
-use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
 pub struct StatsResponse {
@@ -18,7 +15,7 @@ pub struct StatsResponse {
 
 pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
     let stats = state.stats.read().await;
-    
+
     // Query share outcome counts from repository
     let (total_shares, accepted_shares, rejected_shares, rejection_breakdown) =
         if let Some(ref share_repo) = state.share_repo {
@@ -30,7 +27,7 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
         } else {
             (0, 0, 0, HashMap::new())
         };
-    
+
     let accepted_pct = if total_shares > 0 {
         (accepted_shares as f64 / total_shares as f64) * 100.0
     } else {
@@ -112,13 +109,13 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_conn = Connection::open(temp_file.path()).unwrap();
         init_schema(&db_conn).unwrap();
-        
+
         // Insert a worker
         db_conn.execute(
             "INSERT INTO workers (id, payout_address, worker_suffix) VALUES (1, 'test_addr', 'rig1')",
             [],
         ).unwrap();
-        
+
         // Insert raw shares (one per outcome)
         db_conn.execute(
             "INSERT INTO shares (worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key) 
@@ -135,7 +132,7 @@ mod tests {
              VALUES (1, 'sess-1', 'job-1', 1, 102, '00000001', '00112235', '001122334457', '0011223344556679', 1.0, 'dk3')",
             [],
         ).unwrap();
-        
+
         // Insert share outcomes (what stats queries)
         db_conn.execute(
             "INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, low_diff_ok, network_target_ok) 
@@ -174,6 +171,9 @@ mod tests {
         assert_eq!(response.accepted_shares, 2);
         assert_eq!(response.rejected_shares, 1);
         assert!((response.accepted_pct - 66.67).abs() < 0.01);
-        assert_eq!(response.rejection_breakdown.get("low-difficulty-share"), Some(&1));
+        assert_eq!(
+            response.rejection_breakdown.get("low-difficulty-share"),
+            Some(&1)
+        );
     }
 }

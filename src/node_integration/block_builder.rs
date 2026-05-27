@@ -1,7 +1,7 @@
+use crate::stratum_protocol::job::MiningJob;
 use anyhow::Result;
 use bitcoinsuite_bitcoind_stratum::build_stratum_header;
 use bitcoinsuite_core::{BitcoinCode, Bytes, BytesMut, Hashed, LotusBlock, LotusHeader};
-use crate::stratum_protocol::job::MiningJob;
 
 /// Build the full block hex for submitblock from a MiningJob and miner submit params.
 ///
@@ -99,11 +99,12 @@ pub fn build_submit_block(
     // Sanity check: the actual serialized length should match job.block_size.
     // If they diverge, the block_size computation (compute_block_size_with_extranonce)
     // has a bug that will cause lotusd to reject the block with "bad-blk-size-mismatch".
-    debug_assert!(
+    assert!(
         (serialized.len() as i64 - job.block_size as i64).abs() <= 1,
         "block size mismatch: serialized={} vs job.block_size={} — \
          compute_block_size_with_extranonce may be wrong",
-        serialized.len(), job.block_size,
+        serialized.len(),
+        job.block_size,
     );
 
     Ok((hex::encode(serialized), block_hash))
@@ -115,7 +116,7 @@ mod tests {
     use crate::node_integration::template::template_to_job;
     use crate::stratum_protocol::params;
     use bitcoinsuite_bitcoind_nng::MiningTemplate;
-    use bitcoinsuite_core::{Sha256d, LotusHeader, Tx, Hashed};
+    use bitcoinsuite_core::{Hashed, LotusHeader, Sha256d, Tx};
 
     fn test_template() -> MiningTemplate {
         // Build a minimal serialized LotusBlock from the template's coinbase parts.
@@ -178,7 +179,8 @@ mod tests {
             coinbase1: coinbase1.to_string(),
             coinbase2: coinbase2.to_string(),
             merkle_branches: vec![],
-            prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000"
+                .to_string(),
             nbits_stratum: "10d0091c".to_string(),
             ntime_stratum: "6adc0c6a0000".to_string(),
         }
@@ -196,7 +198,7 @@ mod tests {
             "00000002",
             "6adc0c6a0000",
             "0000000000000001",
-            &[],  // empty block — deserialization will fail
+            &[], // empty block — deserialization will fail
         );
 
         assert!(
@@ -243,7 +245,7 @@ mod tests {
     /// Constructs a minimal LotusBlock (coinbase only), serializes it, and builds a MiningJob
     /// from the resulting template.
     fn create_test_job_with_block() -> MiningJob {
-        use bitcoinsuite_core::{BytesMut, BitcoinCode};
+        use bitcoinsuite_core::{BitcoinCode, BytesMut};
 
         // Build a minimal coinbase matching the coinbase1/coinbase2 from the test template.
         // The coinbase1 ends with extranonce insertion point; we use placeholder "00000000" + "00000000".
@@ -330,10 +332,10 @@ mod tests {
         // block should match the template (ntime and nonce also match).
         let result = build_submit_block(
             &job,
-            "00000000",  // extranonce1 (matches placeholder)
-            "00000000",  // extranonce2 (matches placeholder)
-            "6adc0c6a0000",  // ntime (matches template)
-            "0000000000000000",  // nonce (matches template)
+            "00000000",         // extranonce1 (matches placeholder)
+            "00000000",         // extranonce2 (matches placeholder)
+            "6adc0c6a0000",     // ntime (matches template)
+            "0000000000000000", // nonce (matches template)
             &job.block_bytes,
         );
 
@@ -378,8 +380,6 @@ mod tests {
             "returned hash should match recomputed hash from built block"
         );
     }
-
-
 
     #[test]
     fn test_submit_block_hash_matches_validator_hash() {
@@ -443,6 +443,4 @@ mod tests {
             expected_hash, built_hash,
         );
     }
-
-
 }

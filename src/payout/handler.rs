@@ -1,10 +1,10 @@
+use crate::{payout_debug, payout_info, payout_warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
 
+use super::signer::Signer;
 use crate::accounting::AccountingService;
 use crate::node_integration::JsonRpcClient;
-use super::signer::Signer;
 
 /// Event-driven payout handler that replaces the old timer-based scheduler.
 ///
@@ -65,23 +65,27 @@ impl PayoutHandler {
     /// closes (sender dropped, signalling shutdown).
     pub async fn run(&mut self) {
         while let Some(block_hash) = self.rx.recv().await {
-            debug!(hash = %block_hash, "payout handler: received maturation event");
+            payout_debug!(hash = %block_hash, "payout handler: received maturation event");
 
             // Look up the found block
             let found_block = match self.accounting.found_block_repo.get_by_hash(&block_hash) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
-                    warn!(hash = %block_hash, "payout handler: block not found in DB");
+                    payout_warn!(hash = %block_hash, "payout handler: block not found in DB");
                     continue;
                 }
                 Err(e) => {
-                    warn!(hash = %block_hash, error = %e, "payout handler: DB error");
+                    payout_warn!(hash = %block_hash, error = %e, "payout handler: DB error");
                     continue;
                 }
             };
 
             // Skip if a payout batch already exists for this block
-            let existing = self.accounting.payout_repo.list_batches(None).unwrap_or_default();
+            let existing = self
+                .accounting
+                .payout_repo
+                .list_batches(None)
+                .unwrap_or_default();
             let already_paid = existing.iter().any(|b| {
                 b.retry_key
                     .as_deref()
@@ -98,14 +102,14 @@ impl PayoutHandler {
                     self.n_multiplier,
                 ) {
                     Ok(batch_id) => {
-                        info!(
+                        payout_info!(
                             hash = %found_block.block_hash,
                             batch_id = batch_id,
                             "payout batch created via maturation event",
                         );
                     }
                     Err(e) => {
-                        warn!(
+                        payout_warn!(
                             hash = %found_block.block_hash,
                             error = %e,
                             "failed to create payout batch",
@@ -113,18 +117,19 @@ impl PayoutHandler {
                     }
                 }
             } else {
-                debug!(hash = %block_hash, "payout batch already exists, skipping creation");
+                payout_debug!(hash = %block_hash, "payout batch already exists, skipping creation");
             }
 
             // Process any pending batches (sign and submit)
-            if let Err(e) = self.accounting
+            if let Err(e) = self
+                .accounting
                 .process_pending_payouts(self.signer.as_ref(), &self.rpc_client)
                 .await
             {
-                warn!(error = %e, "process_pending_payouts failed");
+                payout_warn!(error = %e, "process_pending_payouts failed");
             }
         }
 
-        info!("payout handler: event channel closed, shutting down");
+        payout_info!("payout handler: event channel closed, shutting down");
     }
 }

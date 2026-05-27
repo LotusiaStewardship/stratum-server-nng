@@ -1,12 +1,10 @@
-use anyhow::Result;
-use bitcoinsuite_bitcoind_nng::RpcInterface;
-use bitcoinsuite_bitcoind_nng::MiningTemplate;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
-
 use crate::shutdown::ShutdownSignal;
 use crate::stratum_protocol::params;
+use anyhow::Result;
+use bitcoinsuite_bitcoind_nng::MiningTemplate;
+use bitcoinsuite_bitcoind_nng::RpcInterface;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// NNG RPC client for communicating with lotusd.
 pub struct NngRpcClient {
@@ -42,12 +40,12 @@ impl NngRpcClient {
 
     /// Connect to lotusd via NNG RPC.
     pub async fn connect(&self) -> Result<()> {
-        info!(url = %self.rpc_url, "connecting to lotusd via NNG RPC");
+        crate::node_int_info!(url = %self.rpc_url, "connecting to lotusd via NNG RPC");
         let interface = RpcInterface::open(&self.rpc_url)
             .map_err(|e| anyhow::anyhow!("failed to open NNG RPC connection: {}", e))?;
         let mut guard = self.interface.write().await;
         *guard = Some(interface);
-        info!("connected to lotusd");
+        crate::node_int_info!("connected to lotusd");
         Ok(())
     }
 
@@ -65,13 +63,14 @@ impl NngRpcClient {
         // extranonce1_size: 4 bytes (standard)
         // extranonce2_size: 4 bytes (standard)
         // include_transactions: true (we want full template)
-        let template = interface.get_mining_template(
-            self.coinbase_script.as_deref(),
-            self.coinbase_identity.as_deref(),
-            params::EXTRANONCE_1_SIZE.into(),
-            params::EXTRANONCE_2_SIZE.into(),
-            true,
-        )
+        let template = interface
+            .get_mining_template(
+                self.coinbase_script.as_deref(),
+                self.coinbase_identity.as_deref(),
+                params::EXTRANONCE_1_SIZE.into(),
+                params::EXTRANONCE_2_SIZE.into(),
+                true,
+            )
             .map_err(|e| anyhow::anyhow!("failed to fetch mining template: {}", e))?;
         Ok(template)
     }
@@ -86,10 +85,10 @@ impl NngRpcClient {
     pub async fn disconnect(&self) {
         let mut guard = self.interface.write().await;
         if let Some(interface) = guard.take() {
-            info!(url = %self.rpc_url, "disconnecting from lotusd");
+            crate::node_int_info!(url = %self.rpc_url, "disconnecting from lotusd");
             // RpcInterface is dropped here, which closes the NNG connection
             drop(interface);
-            info!("disconnected from lotusd");
+            crate::node_int_info!("disconnected from lotusd");
         }
     }
 
@@ -99,14 +98,14 @@ impl NngRpcClient {
         self: Arc<Self>,
         shutdown_signal: ShutdownSignal,
     ) -> Result<()> {
-        info!("starting template fetcher (placeholder for Slice 6)");
-        
+        crate::node_int_info!("starting template fetcher (placeholder for Slice 6)");
+
         // For Slice 2, we just fetch once on startup
         // Slice 6 will add event-driven refresh via pub/sub
         let mut signal = shutdown_signal;
         signal.recv().await;
-        
-        info!("template fetcher shutting down");
+
+        crate::node_int_info!("template fetcher shutting down");
         Ok(())
     }
 }
@@ -134,7 +133,7 @@ mod tests {
             Some(b"/Test/".to_vec()),
         );
         let result = client.get_mining_template().await;
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not connected"));
     }
@@ -180,11 +179,9 @@ mod tests {
         let coinbase_script: Option<Vec<u8>> = config
             .as_ref()
             .and_then(|c| c.pool.mining_identity.as_ref())
-            .and_then(|id| {
-                match id.resolve() {
-                    Ok((script, _)) => Some(script),
-                    Err(_) => None,
-                }
+            .and_then(|id| match id.resolve() {
+                Ok((script, _)) => Some(script),
+                Err(_) => None,
             })
             .or_else(|| {
                 // Fallback: a known P2PKH script for testing
@@ -203,7 +200,9 @@ mod tests {
             return;
         }
 
-        let template = client.get_mining_template().await
+        let template = client
+            .get_mining_template()
+            .await
             .expect("get_mining_template should succeed with a live lotusd");
 
         // Verify the template has spendable (non-OP_RETURN) coinbase outputs.
@@ -215,8 +214,14 @@ mod tests {
         );
 
         // Basic sanity checks on the returned template
-        assert!(!template.coinbase1.is_empty(), "coinbase1 must not be empty");
-        assert!(!template.coinbase2.is_empty(), "coinbase2 must not be empty");
+        assert!(
+            !template.coinbase1.is_empty(),
+            "coinbase1 must not be empty"
+        );
+        assert!(
+            !template.coinbase2.is_empty(),
+            "coinbase2 must not be empty"
+        );
         assert!(template.height > 0, "template height must be > 0");
         assert!(template.coinbase_value > 0, "coinbase_value must be > 0");
     }

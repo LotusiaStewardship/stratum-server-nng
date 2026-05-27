@@ -1,6 +1,6 @@
 use crate::share_processing::{VarDiff, VarDiffConfig};
-use crate::stratum_protocol::protocol::{StratumRequest, StratumResponse};
 use crate::stratum_protocol::params;
+use crate::stratum_protocol::protocol::{StratumRequest, StratumResponse};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
@@ -30,7 +30,12 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(session_id: String, extranonce1: String, vardiff_config: VarDiffConfig, n_diff: f64) -> Self {
+    pub fn new(
+        session_id: String,
+        extranonce1: String,
+        vardiff_config: VarDiffConfig,
+        n_diff: f64,
+    ) -> Self {
         Self {
             session_id,
             extranonce1,
@@ -136,7 +141,12 @@ mod tests {
 
     fn test_session(id: &str) -> SessionState {
         // Use a fixed but unique per-test extranonce1.
-        SessionState::new(id.to_string(), "00000001".to_string(), VarDiffConfig::default(), 100.0)
+        SessionState::new(
+            id.to_string(),
+            "00000001".to_string(),
+            VarDiffConfig::default(),
+            100.0,
+        )
     }
 
     #[test]
@@ -147,9 +157,9 @@ mod tests {
             method: Method::Subscribe,
             params: Value::Array(vec![]),
         };
-        
+
         let resp = session.handle_subscribe(&req);
-        
+
         assert!(resp.error.is_null());
         assert!(session.is_subscribed);
         assert_eq!(session.extranonce1.len(), 8);
@@ -163,11 +173,12 @@ mod tests {
         let req = StratumRequest {
             id: Value::Number(2.into()),
             method: Method::Authorize,
-            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "x"]).into(),
+            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "x"])
+                .into(),
         };
-        
+
         let resp = session.handle_authorize(&req);
-        
+
         assert!(!resp.error.is_null());
         assert!(!session.is_authorized);
     }
@@ -176,37 +187,42 @@ mod tests {
     fn test_authorize_with_valid_worker() {
         let mut session = test_session("sess-3");
         session.is_subscribed = true;
-        
+
         let req = StratumRequest {
             id: Value::Number(2.into()),
             method: Method::Authorize,
-            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "x"]).into(),
+            params: serde_json::json!(["lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig", "x"])
+                .into(),
         };
-        
+
         let resp = session.handle_authorize(&req);
-        
+
         assert!(resp.error.is_null());
         assert!(session.is_authorized);
-        assert!(session.authorized_workers.contains("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig"));
+        assert!(session
+            .authorized_workers
+            .contains("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig"));
     }
 
     #[test]
     fn test_assigned_jobs_cap() {
         let mut session = test_session("sess-8");
         for i in 0..params::MAX_ASSIGNED_JOBS_PER_SESSION + 10 {
-            session.record_assigned_job(
-                format!("job-{}", i),
-                1.0,
-                format!("ntime-{}", i),
-            );
+            session.record_assigned_job(format!("job-{}", i), 1.0, format!("ntime-{}", i));
         }
-        
-        assert_eq!(session.assigned_jobs.len(), params::MAX_ASSIGNED_JOBS_PER_SESSION);
+
+        assert_eq!(
+            session.assigned_jobs.len(),
+            params::MAX_ASSIGNED_JOBS_PER_SESSION
+        );
         assert!(session.get_assigned_job("job-0").is_none());
         assert!(session.get_assigned_job("job-1").is_none());
-        assert!(session.get_assigned_job(
-            &format!("job-{}", params::MAX_ASSIGNED_JOBS_PER_SESSION + 9)
-        ).is_some());
+        assert!(session
+            .get_assigned_job(&format!(
+                "job-{}",
+                params::MAX_ASSIGNED_JOBS_PER_SESSION + 9
+            ))
+            .is_some());
     }
 
     #[test]
@@ -214,7 +230,7 @@ mod tests {
         let mut session = test_session("sess-9");
         session.record_assigned_job("job-1".to_string(), 1.0, "ntime-1".to_string());
         session.record_assigned_job("job-2".to_string(), 1.0, "ntime-2".to_string());
-        
+
         assert_eq!(session.assigned_jobs.len(), 2);
         session.clear_assigned_jobs();
         assert_eq!(session.assigned_jobs.len(), 0);
@@ -241,15 +257,22 @@ mod tests {
 
     #[test]
     fn test_parse_worker_name_valid() {
-        let worker = parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01").unwrap();
-        assert_eq!(worker.payout_address, "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi");
+        let worker =
+            parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig01").unwrap();
+        assert_eq!(
+            worker.payout_address,
+            "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+        );
         assert_eq!(worker.worker_suffix, Some("rig01".to_string()));
     }
 
     #[test]
     fn test_parse_worker_name_no_suffix() {
         let worker = parse_worker_name("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi").unwrap();
-        assert_eq!(worker.payout_address, "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi");
+        assert_eq!(
+            worker.payout_address,
+            "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+        );
         assert_eq!(worker.worker_suffix, None);
     }
 

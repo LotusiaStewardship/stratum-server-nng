@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+use std::sync::Arc;
 
 /// A payout batch created when a found block matures and PPLNS payout is calculated.
 #[derive(Debug, Clone)]
@@ -104,7 +104,7 @@ impl PayoutRepository {
             "SELECT id, round_id, status, total_amount, pool_fee_amount, pool_fee_address,
                     miner_count, retry_key, last_error, next_retry_at, attempt_count,
                     signed_payload_ref, submitted_txid
-             FROM payout_batches WHERE id = ?1"
+             FROM payout_batches WHERE id = ?1",
         )?;
         let batch = stmt.query_row(params![id], |row| {
             Ok(PayoutBatch {
@@ -139,7 +139,8 @@ impl PayoutRepository {
                     "SELECT id, round_id, status, total_amount, pool_fee_amount, pool_fee_address,
                             miner_count, retry_key, last_error, next_retry_at, attempt_count,
                             signed_payload_ref, submitted_txid
-                     FROM payout_batches WHERE status = ?1 ORDER BY id DESC".to_string(),
+                     FROM payout_batches WHERE status = ?1 ORDER BY id DESC"
+                        .to_string(),
                     vec![Box::new(status.to_string())],
                 )
             } else {
@@ -147,7 +148,8 @@ impl PayoutRepository {
                     "SELECT id, round_id, status, total_amount, pool_fee_amount, pool_fee_address,
                             miner_count, retry_key, last_error, next_retry_at, attempt_count,
                             signed_payload_ref, submitted_txid
-                     FROM payout_batches ORDER BY id DESC".to_string(),
+                     FROM payout_batches ORDER BY id DESC"
+                        .to_string(),
                     vec![],
                 )
             };
@@ -183,9 +185,7 @@ impl PayoutRepository {
     /// Update a payout batch's status.
     pub fn update_batch_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "UPDATE payout_batches SET status = ?1 WHERE id = ?2"
-        )?;
+        let mut stmt = conn.prepare("UPDATE payout_batches SET status = ?1 WHERE id = ?2")?;
         stmt.execute(params![status, id])?;
         Ok(())
     }
@@ -194,7 +194,7 @@ impl PayoutRepository {
     pub fn mark_batch_submitted(&self, id: i64, txid: &str) -> Result<()> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "UPDATE payout_batches SET status = 'submitted', submitted_txid = ?1 WHERE id = ?2"
+            "UPDATE payout_batches SET status = 'submitted', submitted_txid = ?1 WHERE id = ?2",
         )?;
         stmt.execute(params![txid, id])?;
         Ok(())
@@ -237,7 +237,7 @@ impl PayoutRepository {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, batch_id, worker_id, payout_address, amount, dust_carried_forward
-             FROM payouts WHERE batch_id = ?1 ORDER BY id ASC"
+             FROM payouts WHERE batch_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![batch_id], |row| {
             Ok(Payout {
@@ -269,7 +269,7 @@ impl PayoutRepository {
             Ok(balance) => Ok((balance, false)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let mut stmt = conn.prepare(
-                    "INSERT INTO dust_balances (payout_address, balance) VALUES (?1, 0)"
+                    "INSERT INTO dust_balances (payout_address, balance) VALUES (?1, 0)",
                 )?;
                 stmt.execute(params![payout_address])?;
                 Ok((0, true))
@@ -352,14 +352,16 @@ mod tests {
         conn.execute(
             "INSERT INTO rounds (id, start_template_id, status) VALUES (?1, ?2, 'open')",
             rusqlite::params![id, start],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn create_worker(conn: &Connection, id: i64, addr: &str) {
         conn.execute(
             "INSERT INTO workers (id, payout_address) VALUES (?1, ?2)",
             rusqlite::params![id, addr],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -370,7 +372,9 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
 
-        let batch = repo.create_payout_batch(1, 100000, 1000, None, 3, "hash:3").unwrap();
+        let batch = repo
+            .create_payout_batch(1, 100000, 1000, None, 3, "hash:3")
+            .unwrap();
         assert_eq!(batch.status, "pending");
         assert_eq!(batch.total_amount, 100000);
         assert_eq!(batch.pool_fee_amount, 1000);
@@ -402,8 +406,10 @@ mod tests {
         let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
 
         assert!(repo.list_batches(None).unwrap().is_empty());
-        repo.create_payout_batch(1, 50000, 500, None, 2, "h1:2").unwrap();
-        repo.create_payout_batch(1, 60000, 600, None, 1, "h2:1").unwrap();
+        repo.create_payout_batch(1, 50000, 500, None, 2, "h1:2")
+            .unwrap();
+        repo.create_payout_batch(1, 60000, 600, None, 1, "h2:1")
+            .unwrap();
         assert_eq!(repo.list_batches(None).unwrap().len(), 2);
     }
 
@@ -415,7 +421,9 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
 
-        let b = repo.create_payout_batch(1, 50000, 500, None, 1, "h1:1").unwrap();
+        let b = repo
+            .create_payout_batch(1, 50000, 500, None, 1, "h1:1")
+            .unwrap();
         repo.update_batch_status(b.id, "submitted").unwrap();
 
         let pending = repo.list_batches(Some("pending")).unwrap();
@@ -432,7 +440,9 @@ mod tests {
         create_round(&conn, 1, 42);
         let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
 
-        let b = repo.create_payout_batch(1, 50000, 500, None, 1, "h1:1").unwrap();
+        let b = repo
+            .create_payout_batch(1, 50000, 500, None, 1, "h1:1")
+            .unwrap();
         repo.update_batch_status(b.id, "failed").unwrap();
 
         let fetched = repo.get_batch_by_id(b.id).unwrap().unwrap();
@@ -449,7 +459,9 @@ mod tests {
         create_worker(&conn, 20, "addr2");
         let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
 
-        let batch = repo.create_payout_batch(1, 100000, 1000, None, 2, "hash:2").unwrap();
+        let batch = repo
+            .create_payout_batch(1, 100000, 1000, None, 2, "hash:2")
+            .unwrap();
 
         repo.record_payout(batch.id, 10, "addr1", 60000, 0).unwrap();
         repo.record_payout(batch.id, 20, "addr2", 39000, 0).unwrap();

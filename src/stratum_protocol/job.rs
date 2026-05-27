@@ -81,19 +81,23 @@ mod tests {
         let job = MiningJob {
             job_id: "job-890-100".to_string(),
             template_id: 890,
-            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000"
+                .to_string(),
             coinbase1: "abc".to_string(),
             coinbase2: "def".to_string(),
             merkle_branches: vec!["hash1".to_string()],
             version: "00000001".to_string(),
             nbits: "10d0091c".to_string(),
             ntime: "6adc0c6a0000".to_string(),
-            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
+            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000"
+                .to_string(),
             clean_jobs: true,
             template_epoch: 100,
             height: 1292529,
-            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
-            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7"
+                .to_string(),
+            extended_metadata_hash:
+                "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
             block_bytes: vec![],
             coinbase_value: 5000000000,
@@ -110,19 +114,23 @@ mod tests {
         let job = MiningJob {
             job_id: "job-890-100".to_string(),
             template_id: 890,
-            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000"
+                .to_string(),
             coinbase1: "abc".to_string(),
             coinbase2: "def".to_string(),
             merkle_branches: vec!["hash1".to_string()],
             version: "00000001".to_string(),
             nbits: "10d0091c".to_string(),
             ntime: "6adc0c6a0000".to_string(),
-            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000".to_string(),
+            network_target_hex: "0000000009d01000000000000000000000000000000000000000000000000000"
+                .to_string(),
             clean_jobs: true,
             template_epoch: 100,
             height: 1292529,
-            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7".to_string(),
-            extended_metadata_hash: "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
+            epoch_hash: "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7"
+                .to_string(),
+            extended_metadata_hash:
+                "9a538906e6466ebd2617d321f71bc94e56056ce213d366773699e28158e00614".to_string(),
             block_size: 2588,
             block_bytes: vec![],
             coinbase_value: 5000000000,

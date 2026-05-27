@@ -4,7 +4,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::super::{AppState, AppError};
+use super::super::{AppError, AppState};
 
 #[derive(Debug, Serialize)]
 pub struct PayoutBatchResponse {
@@ -69,9 +69,7 @@ pub async fn trigger_payout(
     State(state): State<AppState>,
     Path(block_hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let accounting = state
-        .accounting_service
-        .ok_or(AppError::DbNotConfigured)?;
+    let accounting = state.accounting_service.ok_or(AppError::DbNotConfigured)?;
     let config = state
         .payout_config
         .ok_or(AppError::Internal("payout config not loaded".to_string()))?;
@@ -90,9 +88,7 @@ pub async fn trigger_payout(
         ));
     }
     if found_block.status == "paid" {
-        return Err(AppError::BadRequest(
-            "block already paid".to_string(),
-        ));
+        return Err(AppError::BadRequest("block already paid".to_string()));
     }
 
     // Calculate payout using the accounting service.
@@ -156,11 +152,11 @@ pub async fn get_payout(
 mod tests {
     use super::*;
     use crate::accounting::{schema::init_schema, PayoutRepository};
+    use parking_lot::Mutex;
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use parking_lot::Mutex;
-    
+
     fn setup_repo() -> PayoutRepository {
         let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
         let c = conn.lock();

@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+use std::sync::Arc;
 
 /// An append-only audit log entry recording significant pool operations.
 /// Per UBQ §Accounting Event: provides a complete chronological record for financial auditing.
@@ -42,7 +42,7 @@ impl AccountingEventRepository {
             "INSERT INTO accounting_events
              (event_type, status, session_id, worker_id, worker_name, payout_address,
               round_id, template_id, template_epoch, job_id, block_hash, height, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
 
         let id = stmt.insert(params![
@@ -65,7 +65,12 @@ impl AccountingEventRepository {
     }
 
     /// List events by type, most recent first.
-    pub fn list_by_type(&self, event_type: &str, limit: i64, offset: i64) -> Result<Vec<AccountingEvent>> {
+    pub fn list_by_type(
+        &self,
+        event_type: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AccountingEvent>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, event_type, status, session_id, worker_id, worker_name, payout_address,
@@ -73,7 +78,7 @@ impl AccountingEventRepository {
              FROM accounting_events
              WHERE event_type = ?1
              ORDER BY id DESC
-             LIMIT ?2 OFFSET ?3"
+             LIMIT ?2 OFFSET ?3",
         )?;
 
         let rows = stmt.query_map(params![event_type, limit, offset], |row| {
@@ -88,19 +93,25 @@ impl AccountingEventRepository {
                 round_id: row.get(7)?,
                 template_id: {
                     let tid: Option<i64> = row.get(8)?;
-                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    assert!(
+                        tid.map_or(true, |v| v >= 0),
+                        "template_id must be non-negative"
+                    );
                     tid.map(|v| v as u64)
                 },
                 template_epoch: {
                     let ep: Option<i64> = row.get(9)?;
-                    debug_assert!(ep.map_or(true, |v| v >= 0), "template_epoch must be non-negative");
+                    assert!(
+                        ep.map_or(true, |v| v >= 0),
+                        "template_epoch must be non-negative"
+                    );
                     ep.map(|v| v as u64)
                 },
                 job_id: row.get(10)?,
                 block_hash: row.get(11)?,
                 height: {
                     let h: Option<i64> = row.get(12)?;
-                    debug_assert!(h.map_or(true, |v| v >= 0), "height must be non-negative");
+                    assert!(h.map_or(true, |v| v >= 0), "height must be non-negative");
                     h.map(|v| v as i32)
                 },
                 payload_json: row.get(13)?,
@@ -117,9 +128,8 @@ impl AccountingEventRepository {
     /// Count events by type.
     pub fn count_by_type(&self, event_type: &str) -> Result<i64> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM accounting_events WHERE event_type = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT COUNT(*) FROM accounting_events WHERE event_type = ?1")?;
         let count: i64 = stmt.query_row(params![event_type], |row| row.get(0))?;
         Ok(count)
     }
@@ -170,9 +180,12 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = AccountingEventRepository::new(Arc::new(Mutex::new(conn)));
 
-        repo.record_event(&make_event("share_outcome", "accepted", Some(1))).unwrap();
-        repo.record_event(&make_event("round_opened", "open", None)).unwrap();
-        repo.record_event(&make_event("share_outcome", "rejected", Some(1))).unwrap();
+        repo.record_event(&make_event("share_outcome", "accepted", Some(1)))
+            .unwrap();
+        repo.record_event(&make_event("round_opened", "open", None))
+            .unwrap();
+        repo.record_event(&make_event("share_outcome", "rejected", Some(1)))
+            .unwrap();
 
         let outcomes = repo.list_by_type("share_outcome", 10, 0).unwrap();
         assert_eq!(outcomes.len(), 2);
@@ -188,8 +201,10 @@ mod tests {
         init_schema(&conn).unwrap();
         let repo = AccountingEventRepository::new(Arc::new(Mutex::new(conn)));
 
-        repo.record_event(&make_event("share_outcome", "accepted", None)).unwrap();
-        repo.record_event(&make_event("share_outcome", "accepted", None)).unwrap();
+        repo.record_event(&make_event("share_outcome", "accepted", None))
+            .unwrap();
+        repo.record_event(&make_event("share_outcome", "accepted", None))
+            .unwrap();
 
         assert_eq!(repo.count_by_type("share_outcome").unwrap(), 2);
         assert_eq!(repo.count_by_type("round_opened").unwrap(), 0);

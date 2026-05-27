@@ -189,7 +189,7 @@ mod tests {
         let now = Instant::now();
         let mut config = default_config();
         config.initial_pct = 2.0; // 200% — would exceed N_diff
-        // N_diff = 100.0, raw = 200.0, clamped to max = 100.0
+                                  // N_diff = 100.0, raw = 200.0, clamped to max = 100.0
         let vardiff = VarDiff::new(config, 100.0, now);
         assert!(
             (vardiff.current() - 100.0).abs() < f64::EPSILON,
@@ -225,7 +225,10 @@ mod tests {
         // Retarget at t = 61s (window = 61s from creation, exceeds 60s retarget_secs)
         let result = vardiff.maybe_retarget(now + Duration::from_secs(61));
 
-        assert!(result.is_some(), "expected retarget to fire for fast shares");
+        assert!(
+            result.is_some(),
+            "expected retarget to fire for fast shares"
+        );
         let new_diff = result.unwrap();
         // Ratio = 6/3 = 2.0, capped at 1.5x → 1.0 * 1.5 = 1.5
         assert!(
@@ -249,7 +252,10 @@ mod tests {
 
         let result = vardiff.maybe_retarget(now + Duration::from_secs(61));
 
-        assert!(result.is_some(), "expected retarget to fire for slow shares");
+        assert!(
+            result.is_some(),
+            "expected retarget to fire for slow shares"
+        );
         let new_diff = result.unwrap();
         // Ratio = 1/3 ≈ 0.33, floored at 0.67x → 1.0 * 0.67 = 0.67
         assert!(
@@ -395,7 +401,10 @@ mod tests {
         // Update max to 200.0 (higher) — should not affect current
         let result = vardiff.update_max(200.0);
 
-        assert!(result.is_none(), "update_max should not signal when P_diff unchanged");
+        assert!(
+            result.is_none(),
+            "update_max should not signal when P_diff unchanged"
+        );
         assert!(
             (vardiff.current() - 1.0).abs() < f64::EPSILON,
             "current should stay at 1.0 when max increases"
@@ -415,7 +424,10 @@ mod tests {
         // New max = 50.0 — current (1.0) is below max, no clamp needed
         let result = vardiff.update_max(50.0);
 
-        assert!(result.is_none(), "update_max should not signal when current is already below new max");
+        assert!(
+            result.is_none(),
+            "update_max should not signal when current is already below new max"
+        );
         assert!(
             (vardiff.current() - 1.0).abs() < f64::EPSILON,
             "current should stay at 1.0 when below new max"

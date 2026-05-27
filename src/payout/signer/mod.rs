@@ -1,8 +1,8 @@
-pub mod internal;
 pub mod external;
+pub mod internal;
 
-use async_trait::async_trait;
 use crate::payout::plan::PayoutPlan;
+use async_trait::async_trait;
 
 /// Data needed by a Signer to build and submit a payout transaction.
 ///

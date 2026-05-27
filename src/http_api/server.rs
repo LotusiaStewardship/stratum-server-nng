@@ -1,3 +1,8 @@
+use crate::accounting::{
+    AccountingService, FoundBlockRepository, PayoutRepository, RoundRepository, ShareRepository,
+    WorkerRepository,
+};
+use axum::routing::{get, post};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -8,8 +13,6 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use axum::routing::{get, post};
-use crate::accounting::{AccountingService, ShareRepository, WorkerRepository, RoundRepository, FoundBlockRepository, PayoutRepository};
 
 /// Payout configuration needed by the trigger endpoint.
 #[derive(Clone, Debug)]
@@ -42,11 +45,7 @@ pub struct ServerStats {
 
 /// Authentication middleware that checks Bearer token from Authorization header.
 /// Returns 401 Unauthorized if the token is missing or doesn't match.
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let token = req
         .headers()
         .get("authorization")
@@ -75,9 +74,10 @@ impl axum::response::IntoResponse for AppError {
         let (status, body) = match self {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::DbNotConfigured => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "database not configured".to_string())
-            }
+            AppError::DbNotConfigured => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database not configured".to_string(),
+            ),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, body).into_response()
@@ -98,23 +98,49 @@ impl From<rusqlite::Error> for AppError {
 
 pub fn create_router(state: AppState) -> Router {
     // Public routes (no auth required)
-    let public = Router::new()
-        .route("/api/v1/health", get(crate::http_api::routes::health_handler));
+    let public = Router::new().route(
+        "/api/v1/health",
+        get(crate::http_api::routes::health_handler),
+    );
 
     // Protected routes (require Bearer token)
     let protected = Router::new()
         .route("/api/v1/stats", get(crate::http_api::routes::stats_handler))
-        .route("/api/v1/workers", get(crate::http_api::routes::list_workers))
-        .route("/api/v1/workers/{id}", get(crate::http_api::routes::get_worker))
+        .route(
+            "/api/v1/workers",
+            get(crate::http_api::routes::list_workers),
+        )
+        .route(
+            "/api/v1/workers/{id}",
+            get(crate::http_api::routes::get_worker),
+        )
         .route("/api/v1/rounds", get(crate::http_api::routes::list_rounds))
-        .route("/api/v1/rounds/{id}", get(crate::http_api::routes::get_round))
+        .route(
+            "/api/v1/rounds/{id}",
+            get(crate::http_api::routes::get_round),
+        )
         .route("/api/v1/blocks", get(crate::http_api::routes::list_blocks))
-        .route("/api/v1/blocks/{hash}", get(crate::http_api::routes::get_block))
-        .route("/api/v1/payouts", get(crate::http_api::routes::list_payouts))
-        .route("/api/v1/payouts/{id}", get(crate::http_api::routes::get_payout))
-        .route("/api/v1/admin/payouts/trigger/{block_hash}", post(crate::http_api::routes::trigger_payout))
+        .route(
+            "/api/v1/blocks/{hash}",
+            get(crate::http_api::routes::get_block),
+        )
+        .route(
+            "/api/v1/payouts",
+            get(crate::http_api::routes::list_payouts),
+        )
+        .route(
+            "/api/v1/payouts/{id}",
+            get(crate::http_api::routes::get_payout),
+        )
+        .route(
+            "/api/v1/admin/payouts/trigger/{block_hash}",
+            post(crate::http_api::routes::trigger_payout),
+        )
         .route("/api/v1/shares", get(crate::http_api::routes::list_shares))
-        .route("/api/v1/share-outcomes", get(crate::http_api::routes::list_share_outcomes))
+        .route(
+            "/api/v1/share-outcomes",
+            get(crate::http_api::routes::list_share_outcomes),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

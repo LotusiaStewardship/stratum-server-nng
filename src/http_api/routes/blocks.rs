@@ -1,9 +1,9 @@
+use crate::http_api::server::AppState;
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
 pub struct BlockSummary {
@@ -121,12 +121,14 @@ mod tests {
         conn.execute(
             "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'open')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Create a worker for foreign key (used by test_get_block_by_hash with worker_id=42)
         conn.execute(
             "INSERT INTO workers (id, payout_address) VALUES (42, 'lotus_test')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
         (Connection::open(f.path()).unwrap(), repo)
     }
@@ -142,8 +144,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_blocks_with_data() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "block1", 100, None, None, None, 0, "").unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None, 0, "").unwrap();
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
+            .unwrap();
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "")
+            .unwrap();
 
         let state = test_state(Some(repo));
         let params = ListBlocksParams { status: None };
@@ -156,18 +160,24 @@ mod tests {
     #[tokio::test]
     async fn test_list_blocks_by_status() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "block1", 100, None, None, None, 0, "").unwrap();
-        repo.record_found_block(1, "block2", 101, None, None, None, 0, "").unwrap();
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
+            .unwrap();
+        repo.record_found_block(1, "block2", 101, None, None, None, 0, "")
+            .unwrap();
         repo.mark_orphaned("block1", "reorg").unwrap();
 
         let state = test_state(Some(repo));
 
-        let params = ListBlocksParams { status: Some("immature".to_string()) };
+        let params = ListBlocksParams {
+            status: Some("immature".to_string()),
+        };
         let immature = list_blocks(State(state.clone()), Query(params)).await;
         assert_eq!(immature.len(), 1);
         assert_eq!(immature[0].block_hash, "block2");
 
-        let params = ListBlocksParams { status: Some("orphaned".to_string()) };
+        let params = ListBlocksParams {
+            status: Some("orphaned".to_string()),
+        };
         let orphaned = list_blocks(State(state), Query(params)).await;
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].block_hash, "block1");
@@ -176,7 +186,17 @@ mod tests {
     #[tokio::test]
     async fn test_get_block_by_hash() {
         let (_conn, repo) = setup_db();
-        repo.record_found_block(1, "blockhash123", 500, Some(42), Some(100), Some("json-rpc"), 0, "").unwrap();
+        repo.record_found_block(
+            1,
+            "blockhash123",
+            500,
+            Some(42),
+            Some(100),
+            Some("json-rpc"),
+            0,
+            "",
+        )
+        .unwrap();
 
         let state = test_state(Some(repo));
         let response = get_block(State(state), Path("blockhash123".to_string())).await;

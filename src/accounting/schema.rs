@@ -224,4 +224,3 @@ mod tests {
         init_schema(&conn).unwrap();
     }
 }
-

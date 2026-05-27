@@ -1,9 +1,9 @@
 use crate::stratum_protocol::job::MiningJob;
 use crate::stratum_protocol::session::SessionState;
+use crate::validator_debug;
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, header_meets_difficulty};
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 use primitive_types::U256;
-use tracing::info;
 
 /// Result of validating a share submission.
 ///
@@ -42,11 +42,7 @@ impl ValidationResult {
 /// - extranonce2: hex string, even length, max 16 chars (8 bytes)
 /// - ntime: 6 bytes = 12 hex chars
 /// - nonce: 8 bytes = 16 hex chars
-pub fn validate_share_format(
-    extranonce2: &str,
-    ntime: &str,
-    nonce: &str,
-) -> Result<(), String> {
+pub fn validate_share_format(extranonce2: &str, ntime: &str, nonce: &str) -> Result<(), String> {
     // extranonce2: hex string, even length, max 16 chars (8 bytes)
     if extranonce2.is_empty() || extranonce2.len() % 2 != 0 || extranonce2.len() > 16 {
         return Err("invalid-submit-shape".into());
@@ -96,31 +92,26 @@ pub fn validate_share(
     nonce: &str,
     session: &SessionState,
     job: &MiningJob,
-    debug: bool,
 ) -> ValidationResult {
     // 1. Check worker authorization
     if !session.authorized_workers.contains(worker_name) {
-        if debug {
-            info!(
-                session = %session.session_id,
-                worker = %worker_name,
-                "verbose: validation step 1 FAILED — unauthorized worker",
-            );
-        }
+        validator_debug!(
+            session = %session.session_id,
+            worker = %worker_name,
+            "validation step 1 FAILED — unauthorized worker",
+        );
         return ValidationResult::rejected("unauthorized-worker");
     }
 
     // 2. Parse and validate submit params format
     if let Err(reason) = validate_share_format(extranonce2, ntime, nonce) {
-        if debug {
-            info!(
-                session = %session.session_id,
-                extranonce2 = %extranonce2,
-                ntime = %ntime,
-                nonce = %nonce,
-                "verbose: validation step 2 FAILED — invalid submit shape",
-            );
-        }
+        validator_debug!(
+            session = %session.session_id,
+            extranonce2 = %extranonce2,
+            ntime = %ntime,
+            nonce = %nonce,
+            "validation step 2 FAILED — invalid submit shape",
+        );
         return ValidationResult::rejected(&reason);
     }
 
@@ -128,13 +119,11 @@ pub fn validate_share(
     let assigned = match session.get_assigned_job(job_id) {
         Some(a) => a,
         None => {
-            if debug {
-                info!(
-                    session = %session.session_id,
-                    job_id = %job_id,
-                    "verbose: validation step 3 FAILED — stale job (not in assigned_jobs)",
-                );
-            }
+            validator_debug!(
+                session = %session.session_id,
+                job_id = %job_id,
+                "validation step 3 FAILED — stale job (not in assigned_jobs)",
+            );
             return ValidationResult::rejected("stale-job");
         }
     };
@@ -142,14 +131,12 @@ pub fn validate_share(
     // 4. Check ntime matches frozen ntime from assignment
     // Per UBQ §Assigned Job: prevents miners from reusing valid nonces across different ntime values
     if ntime != assigned.ntime {
-        if debug {
-            info!(
-                session = %session.session_id,
-                submitted_ntime = %ntime,
-                assigned_ntime = %assigned.ntime,
-                "verbose: validation step 4 FAILED — ntime mismatch",
-            );
-        }
+        validator_debug!(
+            session = %session.session_id,
+            submitted_ntime = %ntime,
+            assigned_ntime = %assigned.ntime,
+            "validation step 4 FAILED — ntime mismatch",
+        );
         return ValidationResult::rejected("ntime-mismatch");
     }
 
@@ -195,14 +182,12 @@ pub fn validate_share(
     };
 
     if !meets_pdiff {
-        if debug {
-            info!(
-                session = %session.session_id,
-                p_diff = assigned.p_diff,
-                hash_be = %hex::encode(hash_be),
-                "verbose: validation step 6 FAILED — low-difficulty share",
-            );
-        }
+        validator_debug!(
+            session = %session.session_id,
+            p_diff = assigned.p_diff,
+            hash_be = %hex::encode(hash_be),
+            "validation step 6 FAILED — low-difficulty share",
+        );
         return ValidationResult::rejected("low-difficulty-share");
     }
 
@@ -234,16 +219,14 @@ pub fn validate_share(
         None
     };
 
-    if debug {
-        info!(
-            session = %session.session_id,
-            accepted = true,
-            low_diff_ok = true,
-            network_target_ok = meets_network,
-            block_hash = ?block_hash,
-            "verbose: validation PASSED — all checks ok",
-        );
-    }
+    validator_debug!(
+        session = %session.session_id,
+        accepted = true,
+        low_diff_ok = true,
+        network_target_ok = meets_network,
+        block_hash = ?block_hash,
+        "validation PASSED — all checks ok",
+    );
 
     ValidationResult {
         accepted: true,
@@ -257,8 +240,8 @@ pub fn validate_share(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stratum_protocol::session::SessionState;
     use crate::share_processing::VarDiffConfig;
+    use crate::stratum_protocol::session::SessionState;
 
     // Real-world MiningJob reconstructed from lotusd template at height 1292529
     // Source: template_id=890, epoch=100, prevhash in stratum format
@@ -291,10 +274,17 @@ mod tests {
     }
 
     fn create_authorized_session() -> SessionState {
-        let mut session = SessionState::new("sess-1".to_string(), "00000001".to_string(), VarDiffConfig::default(), 100.0);
+        let mut session = SessionState::new(
+            "sess-1".to_string(),
+            "00000001".to_string(),
+            VarDiffConfig::default(),
+            100.0,
+        );
         session.is_subscribed = true;
         session.is_authorized = true;
-        session.authorized_workers.insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
+        session
+            .authorized_workers
+            .insert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig".to_string());
         session.record_assigned_job("job-890-100".to_string(), 1.0, "6adc0c6a0000".to_string());
         session
     }
@@ -303,7 +293,9 @@ mod tests {
     fn test_validate_format_valid_params() {
         assert!(validate_share_format("00000003", "6adc0c6a0000", "B02B4ABB3DD6E835").is_ok());
         assert!(validate_share_format("aabb", "6adc0c6a0000", "B02B4ABB3DD6E835").is_ok());
-        assert!(validate_share_format("0011223344556677", "6adc0c6a0000", "B02B4ABB3DD6E835").is_ok());
+        assert!(
+            validate_share_format("0011223344556677", "6adc0c6a0000", "B02B4ABB3DD6E835").is_ok()
+        );
     }
 
     #[test]
@@ -311,7 +303,10 @@ mod tests {
         assert!(validate_share_format("", "6adc0c6a0000", "B02B4ABB3DD6E835").is_err());
         assert!(validate_share_format("0000000", "6adc0c6a0000", "B02B4ABB3DD6E835").is_err());
         assert!(validate_share_format("000000xx", "6adc0c6a0000", "B02B4ABB3DD6E835").is_err());
-        assert!(validate_share_format("000000030000000000", "6adc0c6a0000", "B02B4ABB3DD6E835").is_err());
+        assert!(
+            validate_share_format("000000030000000000", "6adc0c6a0000", "B02B4ABB3DD6E835")
+                .is_err()
+        );
     }
 
     #[test]
@@ -340,7 +335,6 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
@@ -360,11 +354,13 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
-        assert_eq!(result.reject_reason.as_deref(), Some("invalid-submit-shape"));
+        assert_eq!(
+            result.reject_reason.as_deref(),
+            Some("invalid-submit-shape")
+        );
     }
 
     #[test]
@@ -380,7 +376,6 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
@@ -400,7 +395,6 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
@@ -414,9 +408,19 @@ mod tests {
 
         let cases = vec![
             ("00000003", "6adc0c6a0000", "xx", "invalid-submit-shape"),
-            ("00000003", "6adc0c6a0000", "B02B4ABB3DD6E835xx", "invalid-submit-shape"),
+            (
+                "00000003",
+                "6adc0c6a0000",
+                "B02B4ABB3DD6E835xx",
+                "invalid-submit-shape",
+            ),
             ("00000003", "zz", "B02B4ABB3DD6E835", "invalid-submit-shape"),
-            ("zz", "6adc0c6a0000", "B02B4ABB3DD6E835", "invalid-submit-shape"),
+            (
+                "zz",
+                "6adc0c6a0000",
+                "B02B4ABB3DD6E835",
+                "invalid-submit-shape",
+            ),
         ];
 
         for (extranonce2, ntime, nonce, expected_reason) in cases {
@@ -428,9 +432,12 @@ mod tests {
                 nonce,
                 &session,
                 &job,
-                false,
             );
-            assert!(!result.accepted, "expected rejection for {:?}/{:?}/{:?}", extranonce2, ntime, nonce);
+            assert!(
+                !result.accepted,
+                "expected rejection for {:?}/{:?}/{:?}",
+                extranonce2, ntime, nonce
+            );
             assert_eq!(result.reject_reason.as_deref(), Some(expected_reason));
         }
     }
@@ -449,7 +456,6 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         if result.accepted {
@@ -468,7 +474,12 @@ mod tests {
 
     #[test]
     fn test_validate_share_rejects_when_not_authorized() {
-        let session = SessionState::new("sess-unauth".to_string(), "00000002".to_string(), VarDiffConfig::default(), 100.0);
+        let session = SessionState::new(
+            "sess-unauth".to_string(),
+            "00000002".to_string(),
+            VarDiffConfig::default(),
+            100.0,
+        );
         let job = create_test_job();
 
         let result = validate_share(
@@ -479,7 +490,6 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
@@ -499,11 +509,13 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
-        assert_eq!(result.reject_reason.as_deref(), Some("invalid-submit-shape"));
+        assert_eq!(
+            result.reject_reason.as_deref(),
+            Some("invalid-submit-shape")
+        );
     }
 
     #[test]
@@ -525,7 +537,12 @@ mod tests {
         let nonce = hex::encode(13573272464251480634u64.to_le_bytes());
 
         // Build the session with the exact extranonce1 from the block-finding share
-        let mut session = SessionState::new("sess-finder".to_string(), extranonce1.to_string(), VarDiffConfig::default(), 100.0);
+        let mut session = SessionState::new(
+            "sess-finder".to_string(),
+            extranonce1.to_string(),
+            VarDiffConfig::default(),
+            100.0,
+        );
         session.is_subscribed = true;
         session.is_authorized = true;
         // Authorize the exact worker that submitted the block-finding share
@@ -544,19 +561,18 @@ mod tests {
             &nonce,
             &session,
             &job,
-            false,
         );
 
         assert!(
             result.accepted,
             "block-finding share rejected: reason={:?} low_diff={:?} net_ok={:?} hash={:?}",
-            result.reject_reason,
-            result.low_diff_ok,
-            result.network_target_ok,
-            result.block_hash,
+            result.reject_reason, result.low_diff_ok, result.network_target_ok, result.block_hash,
         );
         assert!(result.low_diff_ok);
-        assert!(result.network_target_ok, "block-finding share must meet network target");
+        assert!(
+            result.network_target_ok,
+            "block-finding share must meet network target"
+        );
         assert!(result.reject_reason.is_none());
         assert!(
             result.block_hash.is_some(),
@@ -622,7 +638,11 @@ mod tests {
     #[test]
     fn test_low_difficulty_share_rejection() {
         let mut session = create_authorized_session();
-        session.record_assigned_job("job-890-100".to_string(), f64::MAX, "6adc0c6a0000".to_string());
+        session.record_assigned_job(
+            "job-890-100".to_string(),
+            f64::MAX,
+            "6adc0c6a0000".to_string(),
+        );
         let job = create_test_job();
 
         let result = validate_share(
@@ -633,11 +653,13 @@ mod tests {
             "B02B4ABB3DD6E835",
             &session,
             &job,
-            false,
         );
 
         assert!(!result.accepted);
-        assert_eq!(result.reject_reason.as_deref(), Some("low-difficulty-share"));
+        assert_eq!(
+            result.reject_reason.as_deref(),
+            Some("low-difficulty-share")
+        );
         assert!(!result.low_diff_ok);
         assert!(!result.network_target_ok);
         assert!(result.block_hash.is_none());

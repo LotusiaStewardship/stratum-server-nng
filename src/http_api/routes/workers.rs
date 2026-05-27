@@ -1,10 +1,10 @@
+use crate::http_api::pagination::{PaginatedResponse, PaginationParams};
+use crate::http_api::server::AppState;
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
 use serde::Serialize;
-use crate::http_api::pagination::{PaginationParams, PaginatedResponse};
-use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
 pub struct WorkerSummary {
@@ -56,13 +56,16 @@ pub async fn get_worker(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<Option<WorkerDetail>> {
-    let result = state.worker_repo.as_ref().and_then(|repo| {
-        repo.get_by_id(id).ok()?
-    });
+    let result = state
+        .worker_repo
+        .as_ref()
+        .and_then(|repo| repo.get_by_id(id).ok()?);
 
     match result {
         Some(worker) => {
-            let count = state.share_repo.as_ref()
+            let count = state
+                .share_repo
+                .as_ref()
                 .map(|r| r.count_by_worker(worker.id).unwrap_or(0))
                 .unwrap_or(0);
             Json(Some(WorkerDetail {
@@ -79,34 +82,40 @@ pub async fn get_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounting::{init_schema, WorkerRepository, ShareRepository};
+    use crate::accounting::{init_schema, ShareRepository, WorkerRepository};
+    use crate::http_api::pagination::PaginationParams;
     use crate::http_api::ServerStats;
+    use axum::extract::Query;
     use parking_lot::Mutex;
     use rusqlite::Connection;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::sync::RwLock;
-    use axum::extract::Query;
-    use crate::http_api::pagination::PaginationParams;
 
     fn no_pagination() -> Query<PaginationParams> {
-        Query(PaginationParams { limit: None, offset: None })
+        Query(PaginationParams {
+            limit: None,
+            offset: None,
+        })
     }
 
     #[tokio::test]
     async fn test_list_workers_empty() {
         let stats = ServerStats::default();
-        let response = list_workers(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), no_pagination())
+        let response = list_workers(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            no_pagination(),
+        )
         .await;
 
         assert!(response.data.is_empty());
@@ -128,17 +137,20 @@ mod tests {
         worker_repo.upsert("addr2", Some("rig2")).unwrap();
 
         let stats = ServerStats::default();
-        let response = list_workers(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: Some(share_repo),
-            worker_repo: Some(worker_repo),
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), no_pagination())
+        let response = list_workers(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: Some(share_repo),
+                worker_repo: Some(worker_repo),
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            no_pagination(),
+        )
         .await;
 
         assert_eq!(response.data.len(), 2);
@@ -159,17 +171,20 @@ mod tests {
         let worker = worker_repo.upsert("addr1", Some("rig1")).unwrap();
 
         let stats = ServerStats::default();
-        let response = get_worker(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: Some(share_repo),
-            worker_repo: Some(worker_repo),
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Path(worker.id))
+        let response = get_worker(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: Some(share_repo),
+                worker_repo: Some(worker_repo),
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Path(worker.id),
+        )
         .await;
 
         assert!(response.0.is_some());
@@ -186,17 +201,20 @@ mod tests {
         let share_repo = ShareRepository::new(conn_arc);
 
         let stats = ServerStats::default();
-        let response = get_worker(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: Some(share_repo),
-            worker_repo: Some(worker_repo),
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Path(999))
+        let response = get_worker(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: Some(share_repo),
+                worker_repo: Some(worker_repo),
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Path(999),
+        )
         .await;
 
         assert!(response.0.is_none());

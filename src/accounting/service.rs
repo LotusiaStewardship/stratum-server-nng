@@ -1,12 +1,14 @@
+use crate::accounting_error;
+use crate::accounting_info;
+use crate::accounting_warn;
 use anyhow::Result;
-use std::sync::Arc;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::sync::Arc;
 
 use super::{
-    ShareRepository, WorkerRepository, RoundRepository,
-    FoundBlockRepository, AccountingEventRepository, PayoutRepository,
-    Share, ShareOutcome, Round, AccountingEvent, FoundBlock,
+    AccountingEvent, AccountingEventRepository, FoundBlock, FoundBlockRepository, PayoutRepository,
+    Round, RoundRepository, Share, ShareOutcome, ShareRepository, WorkerRepository,
 };
 
 /// Facade that orchestrates accounting operations across multiple repositories.
@@ -116,7 +118,9 @@ impl AccountingService {
         };
 
         // 6. Insert atomically
-        let (share_id, outcome_id, is_new) = self.share_repo.insert_share_and_outcome_atomic(&share, &outcome)?;
+        let (share_id, outcome_id, is_new) = self
+            .share_repo
+            .insert_share_and_outcome_atomic(&share, &outcome)?;
 
         // 7. Record accounting event (only for fresh inserts, not duplicates)
         if is_new {
@@ -152,7 +156,9 @@ impl AccountingService {
     /// Get the current open round, creating one if needed.
     /// Records a `round_opened` accounting event when a new round is created.
     pub fn get_or_create_current_round(&self, start_template_id: u64) -> Result<Round> {
-        let (round, is_new) = self.round_repo.get_or_create_current_round(start_template_id)?;
+        let (round, is_new) = self
+            .round_repo
+            .get_or_create_current_round(start_template_id)?;
         if is_new {
             let event = AccountingEvent {
                 id: 0,
@@ -225,8 +231,13 @@ impl AccountingService {
     }
 
     /// Update the node_result field on a share_outcome after block submission.
-    pub fn update_share_outcome_node_result(&self, dedupe_key: &str, node_result: &str) -> Result<usize> {
-        self.share_repo.update_outcome_node_result(dedupe_key, node_result)
+    pub fn update_share_outcome_node_result(
+        &self,
+        dedupe_key: &str,
+        node_result: &str,
+    ) -> Result<usize> {
+        self.share_repo
+            .update_outcome_node_result(dedupe_key, node_result)
     }
 
     /// Record a found block after successful lotusd submission.
@@ -242,8 +253,14 @@ impl AccountingService {
         network_target_hex: &str,
     ) -> Result<FoundBlock> {
         let block = self.found_block_repo.record_found_block(
-            round_id, block_hash, height, worker_id, template_id, persist_source,
-            coinbase_value, network_target_hex,
+            round_id,
+            block_hash,
+            height,
+            worker_id,
+            template_id,
+            persist_source,
+            coinbase_value,
+            network_target_hex,
         )?;
         // Record accounting event
         let event = AccountingEvent {
@@ -289,18 +306,18 @@ impl AccountingService {
         min_payout_sat: i64,
         n_multiplier: f64,
     ) -> Result<i64> {
-        use crate::payout::pplns::calculate_pplns_window;
         use crate::payout::plan::build_payout_plan;
+        use crate::payout::pplns::calculate_pplns_window;
         use crate::share_processing::network_target_hex_to_difficulty;
 
         // 1. Read the coinbase_value and network difficulty from the found_block
         // NNG raw coinbase_value (u64) → CAmount/i64 (lotusd monetary domain).
         // Safety: Lotus coinbase values are < 10^12 satoshis, well below i64::MAX.
         let gross_reward = found_block.coinbase_value as i64;
-        let network_difficulty = network_target_hex_to_difficulty(&found_block.network_target_hex)
-            .unwrap_or(1.0);
+        let network_difficulty =
+            network_target_hex_to_difficulty(&found_block.network_target_hex).unwrap_or(1.0);
         if found_block.coinbase_value == 0 {
-            tracing::warn!(
+            accounting_warn!(
                 hash = %found_block.block_hash,
                 "create_payout_for_found_block: coinbase_value is 0 — block reward may be unset",
             );
@@ -317,7 +334,7 @@ impl AccountingService {
                  WHERE so.block_hash = ?1
                    AND so.status = 'accepted'
                    AND so.network_target_ok = 1
-                 LIMIT 1"
+                 LIMIT 1",
             )?;
             let result = stmt.query_row(rusqlite::params![&found_block.block_hash], |row| {
                 row.get::<_, String>(0)
@@ -344,9 +361,7 @@ impl AccountingService {
 
         // 3. Read existing dust balances
         let dust_balances: Vec<(String, i64)> = {
-            let mut stmt = conn.prepare(
-                "SELECT payout_address, balance FROM dust_balances"
-            )?;
+            let mut stmt = conn.prepare("SELECT payout_address, balance FROM dust_balances")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -375,9 +390,8 @@ impl AccountingService {
         // Uses retry_key prefix match (same pattern as the scheduler).
         // Prevents duplicate batches regardless of caller.
         {
-            let mut stmt = conn.prepare(
-                "SELECT COUNT(*) FROM payout_batches WHERE retry_key LIKE ?1"
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT COUNT(*) FROM payout_batches WHERE retry_key LIKE ?1")?;
             let existing: i64 = stmt.query_row(
                 rusqlite::params![format!("{}%", found_block.block_hash)],
                 |row| row.get(0),
@@ -431,17 +445,15 @@ impl AccountingService {
                 // Snapshot ALL miner window shares for audit trail (including dusted)
                 for share in &shares {
                     if share.payout_address == output.payout_address {
-                        snapshots.push(
-                            crate::accounting::PayoutShareSnapshot {
-                                id: 0,
-                                batch_id,
-                                share_id: share.share_id,
-                                share_outcome_id: share.share_outcome_id,
-                                payout_address: share.payout_address.clone(),
-                                work_units: share.difficulty,
-                                share_created_at: share.created_at.clone(),
-                            }
-                        );
+                        snapshots.push(crate::accounting::PayoutShareSnapshot {
+                            id: 0,
+                            batch_id,
+                            share_id: share.share_id,
+                            share_outcome_id: share.share_outcome_id,
+                            payout_address: share.payout_address.clone(),
+                            work_units: share.difficulty,
+                            share_created_at: share.created_at.clone(),
+                        });
                     }
                 }
             }
@@ -466,7 +478,8 @@ impl AccountingService {
             }
 
             // Update dust balances
-            let outputs_by_addr: std::collections::BTreeMap<&str, i64> = plan.outputs
+            let outputs_by_addr: std::collections::BTreeMap<&str, i64> = plan
+                .outputs
                 .iter()
                 .map(|o| (o.payout_address.as_str(), o.dust_carried_forward))
                 .collect();
@@ -519,49 +532,65 @@ impl AccountingService {
         let pending = self.payout_repo.list_batches(Some("pending"))?;
 
         for batch in &pending {
-            let Some(found_block) = self.found_block_repo.get_by_round_id(batch.round_id)?
-            else {
-                tracing::warn!(round_id = batch.round_id, "no found_block for pending batch");
+            let Some(found_block) = self.found_block_repo.get_by_round_id(batch.round_id)? else {
+                accounting_warn!(
+                    round_id = batch.round_id,
+                    "no found_block for pending batch"
+                );
                 continue;
             };
 
             // Resolve coinbase txid
             let coinbase_txid = match &found_block.coinbase_txid {
                 Some(txid) => txid.clone(),
-                None => {
-                    match rpc_client.get_block(&found_block.block_hash).await {
-                        Ok(block_data) => {
-                            let tx_list = match block_data["tx"].as_array() {
-                                Some(txs) => txs,
-                                None => { tracing::warn!(hash = %found_block.block_hash, "getblock missing 'tx'"); continue; }
-                            };
-                            let cb_txid = match tx_list.first() {
-                                Some(tx_entry) => {
-                                    tx_entry.as_object()
-                                        .and_then(|o| o.get("txid").and_then(|v| v.as_str()))
-                                        .or_else(|| tx_entry.as_str())
-                                        .unwrap_or("")
-                                }
-                                None => { tracing::warn!(hash = %found_block.block_hash, "empty tx list"); continue; }
-                            };
-                            if cb_txid.is_empty() { continue; }
-                            let _ = self.found_block_repo.update_coinbase_txid(found_block.id, cb_txid);
-                            cb_txid.to_string()
+                None => match rpc_client.get_block(&found_block.block_hash).await {
+                    Ok(block_data) => {
+                        let tx_list = match block_data["tx"].as_array() {
+                            Some(txs) => txs,
+                            None => {
+                                accounting_warn!(hash = %found_block.block_hash, "getblock missing 'tx'");
+                                continue;
+                            }
+                        };
+                        let cb_txid = match tx_list.first() {
+                            Some(tx_entry) => tx_entry
+                                .as_object()
+                                .and_then(|o| o.get("txid").and_then(|v| v.as_str()))
+                                .or_else(|| tx_entry.as_str())
+                                .unwrap_or(""),
+                            None => {
+                                accounting_warn!(hash = %found_block.block_hash, "empty tx list");
+                                continue;
+                            }
+                        };
+                        if cb_txid.is_empty() {
+                            continue;
                         }
-                        Err(e) => { tracing::warn!(hash = %found_block.block_hash, error = %e, "getblock failed"); continue; }
+                        let _ = self
+                            .found_block_repo
+                            .update_coinbase_txid(found_block.id, cb_txid);
+                        cb_txid.to_string()
                     }
-                }
+                    Err(e) => {
+                        accounting_warn!(hash = %found_block.block_hash, error = %e, "getblock failed");
+                        continue;
+                    }
+                },
             };
 
             // Fetch coinbase output details. Lotus: vout[0] = OP_RETURN metadata,
             // so find first non-OP_RETURN spendable output.
             let (coinbase_amount, coinbase_vout, coinbase_script) = match rpc_client
-                .get_raw_transaction(&coinbase_txid).await
+                .get_raw_transaction(&coinbase_txid)
+                .await
             {
                 Ok(raw_tx) => {
                     let vouts = match raw_tx["vout"].as_array() {
                         Some(v) => v,
-                        None => { tracing::warn!(txid = %coinbase_txid, "no vout"); continue; }
+                        None => {
+                            accounting_warn!(txid = %coinbase_txid, "no vout");
+                            continue;
+                        }
                     };
                     let spendable = vouts.iter().enumerate().find(|(_idx, vout)| {
                         let is_nulldata = vout["scriptPubKey"]["type"].as_str() == Some("nulldata");
@@ -570,19 +599,31 @@ impl AccountingService {
                     });
                     let (vout_idx, vout) = match spendable {
                         Some(v) => v,
-                        None => { tracing::warn!(txid = %coinbase_txid, "no spendable vout"); continue; }
+                        None => {
+                            tracing::warn!(txid = %coinbase_txid, "no spendable vout");
+                            continue;
+                        }
                     };
                     let value_btc = vout["value"].as_f64().unwrap_or(0.0);
-                    let script = vout["scriptPubKey"]["hex"].as_str().unwrap_or("").to_string();
+                    let script = vout["scriptPubKey"]["hex"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let amount_sat = (value_btc * 100_000_000.0) as i64;
                     (amount_sat, vout_idx as u32, script)
                 }
-                Err(e) => { tracing::warn!(txid = %coinbase_txid, error = %e, "getrawtransaction failed"); continue; }
+                Err(e) => {
+                    tracing::warn!(txid = %coinbase_txid, error = %e, "getrawtransaction failed");
+                    continue;
+                }
             };
 
             let payouts = match self.payout_repo.get_payouts_by_batch(batch.id) {
                 Ok(p) => p,
-                Err(e) => { tracing::warn!(batch_id = batch.id, error = %e, "load payouts failed"); continue; }
+                Err(e) => {
+                    tracing::warn!(batch_id = batch.id, error = %e, "load payouts failed");
+                    continue;
+                }
             };
 
             let plan = crate::payout::plan::PayoutPlan {
@@ -594,12 +635,15 @@ impl AccountingService {
                 gross_reward: batch.total_amount,
                 pool_fee_amount: batch.pool_fee_amount,
                 pool_fee_address: batch.pool_fee_address.clone(),
-                outputs: payouts.iter().map(|p| PayoutOutput {
-                    payout_address: p.payout_address.clone(),
-                    worker_id: p.worker_id,
-                    amount: p.amount,
-                    dust_carried_forward: p.dust_carried_forward,
-                }).collect(),
+                outputs: payouts
+                    .iter()
+                    .map(|p| PayoutOutput {
+                        payout_address: p.payout_address.clone(),
+                        worker_id: p.worker_id,
+                        amount: p.amount,
+                        dust_carried_forward: p.dust_carried_forward,
+                    })
+                    .collect(),
                 dust_carried_forward_total: 0,
                 retry_key: batch.retry_key.clone().unwrap_or_default(),
             };
@@ -616,10 +660,10 @@ impl AccountingService {
                 Ok(txid) => {
                     let _ = self.payout_repo.mark_batch_submitted(batch.id, &txid);
                     let _ = self.found_block_repo.update_status(found_block.id, "paid");
-                    tracing::info!(batch_id = batch.id, txid = %txid, "payout submitted");
+                    accounting_info!(batch_id = batch.id, txid = %txid, "payout submitted");
                 }
                 Err(e) => {
-                    tracing::warn!(batch_id = batch.id, error = %e, "sign/submit failed (will retry)");
+                    accounting_warn!(batch_id = batch.id, error = %e, "sign/submit failed (will retry)");
                 }
             }
         }
@@ -649,17 +693,20 @@ impl AccountingService {
 
         for block in &confirmed {
             if block.height > tip_height {
-                tracing::warn!(
+                accounting_warn!(
                     hash = %block.block_hash,
                     height = block.height,
                     tip = tip_height,
                     "found_block above chain tip at startup — orphaning",
                 );
-                if let Err(e) = self.found_block_repo.mark_orphaned(&block.block_hash, "block_not_found") {
-                    tracing::error!(error = %e, "failed to orphan block above tip");
+                if let Err(e) = self
+                    .found_block_repo
+                    .mark_orphaned(&block.block_hash, "block_not_found")
+                {
+                    accounting_error!(error = %e, "failed to orphan block above tip");
                 }
                 if let Err(e) = self.close_round(block.round_id, 0, "orphaned") {
-                    tracing::error!(error = %e, "failed to close orphaned round");
+                    accounting_error!(error = %e, "failed to close orphaned round");
                 }
                 continue;
             }
@@ -669,7 +716,7 @@ impl AccountingService {
                 Ok(Some(hash)) => hash,
                 Ok(None) => {
                     // Height exists but no block at this height — unlikely but handle gracefully
-                    tracing::warn!(
+                    accounting_warn!(
                         hash = %block.block_hash,
                         height = block.height,
                         "no canonical block at height during reconciliation",
@@ -677,7 +724,7 @@ impl AccountingService {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    accounting_warn!(
                         error = %e,
                         height = block.height,
                         "failed to fetch canonical block hash during reconciliation",
@@ -687,17 +734,20 @@ impl AccountingService {
             };
 
             if canonical_hash != block.block_hash {
-                tracing::warn!(
+                accounting_warn!(
                     stored = %block.block_hash,
                     canonical = %canonical_hash,
                     height = block.height,
                     "found_block hash mismatch at startup — orphaning (reorg detected)",
                 );
-                if let Err(e) = self.found_block_repo.mark_orphaned(&block.block_hash, "reorg_detected") {
-                    tracing::error!(error = %e, "failed to orphan reorged block");
+                if let Err(e) = self
+                    .found_block_repo
+                    .mark_orphaned(&block.block_hash, "reorg_detected")
+                {
+                    accounting_error!(error = %e, "failed to orphan reorged block");
                 }
                 if let Err(e) = self.close_round(block.round_id, 0, "orphaned") {
-                    tracing::error!(error = %e, "failed to close orphaned round");
+                    accounting_error!(error = %e, "failed to close orphaned round");
                 }
             }
         }
@@ -713,14 +763,18 @@ impl AccountingService {
     ///
     /// Returns the list of newly matured blocks so the caller can send
     /// maturation events to the payout handler.
-    pub fn check_maturation(&self, tip_height: i32, min_confirmations: u64) -> Result<Vec<FoundBlock>> {
+    pub fn check_maturation(
+        &self,
+        tip_height: i32,
+        min_confirmations: u64,
+    ) -> Result<Vec<FoundBlock>> {
         let immature = self.found_block_repo.list(Some("immature"))?;
         let mut matured = Vec::new();
         for block in &immature {
             let confirms = tip_height - block.height + 1;
             if confirms >= min_confirmations as i32 {
                 self.found_block_repo.mark_matured(block.id)?;
-                tracing::info!(
+                accounting_info!(
                     hash = %block.block_hash,
                     height = block.height,
                     confirms = confirms,
@@ -854,7 +908,16 @@ mod tests {
 
         // Record a found block using the resolved round.id (NOT template_id)
         let found = svc
-            .record_found_block(round.id, "0000abc", 1292529, None, Some(42), Some("json-rpc"), 0, "")
+            .record_found_block(
+                round.id,
+                "0000abc",
+                1292529,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                0,
+                "",
+            )
             .unwrap();
 
         // The found_block.round_id must equal the resolved round.id
@@ -866,7 +929,10 @@ mod tests {
         assert_eq!(found.status, "immature");
 
         // Verify accounting event was recorded
-        let events = svc.event_repo.list_by_type("found_block_observed", 10, 0).unwrap();
+        let events = svc
+            .event_repo
+            .list_by_type("found_block_observed", 10, 0)
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].round_id, Some(round.id));
     }
@@ -880,7 +946,17 @@ mod tests {
 
         // Create a round and record a found_block
         let _round = svc.get_or_create_current_round(42).unwrap();
-        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 1000, None, Some(42), Some("json-rpc"), 0, "").unwrap();
+        svc.record_found_block(
+            1,
+            "0000abcdef12345678900000000000000000000000000000000000000000000000",
+            1000,
+            None,
+            Some(42),
+            Some("json-rpc"),
+            0,
+            "",
+        )
+        .unwrap();
 
         // Reconcile with a different canonical hash at height 1000
         // The mock returns a different hash, simulating a reorg
@@ -895,15 +971,28 @@ mod tests {
                 async move {
                     call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     assert_eq!(height, 1000);
-                    Ok(Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()))
+                    Ok(Some(
+                        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                            .to_string(),
+                    ))
                 }
             },
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1, "get_block_hash should be called once");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "get_block_hash should be called once"
+        );
 
         // Verify block was orphaned
-        let block = svc.found_block_repo.get_by_hash("0000abcdef12345678900000000000000000000000000000000000000000000000").unwrap().unwrap();
+        let block = svc
+            .found_block_repo
+            .get_by_hash("0000abcdef12345678900000000000000000000000000000000000000000000000")
+            .unwrap()
+            .unwrap();
         assert_eq!(block.status, "orphaned");
         assert_eq!(block.orphan_reason, Some("reorg_detected".to_string()));
 
@@ -921,15 +1010,31 @@ mod tests {
 
         // Create a round and record a found_block with height above tip
         let _round = svc.get_or_create_current_round(42).unwrap();
-        svc.record_found_block(1, "0000abcdef12345678900000000000000000000000000000000000000000000000", 999, None, Some(42), Some("json-rpc"), 0, "").unwrap();
+        svc.record_found_block(
+            1,
+            "0000abcdef12345678900000000000000000000000000000000000000000000000",
+            999,
+            None,
+            Some(42),
+            Some("json-rpc"),
+            0,
+            "",
+        )
+        .unwrap();
 
         // Reconcile with tip = 100 — block at height 999 is above tip
         svc.reconcile_found_blocks(100, |_height| async {
             unreachable!("should not be called for blocks above tip");
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Verify block was orphaned
-        let block = svc.found_block_repo.get_by_hash("0000abcdef12345678900000000000000000000000000000000000000000000000").unwrap().unwrap();
+        let block = svc
+            .found_block_repo
+            .get_by_hash("0000abcdef12345678900000000000000000000000000000000000000000000000")
+            .unwrap()
+            .unwrap();
         assert_eq!(block.status, "orphaned");
         assert_eq!(block.orphan_reason, Some("block_not_found".to_string()));
 
@@ -970,15 +1075,31 @@ mod tests {
 
         // Record a block at height 950
         let block = svc
-            .record_found_block(round_id, "blockhash1", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .record_found_block(
+                round_id,
+                "blockhash1",
+                950,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                50000,
+                "",
+            )
             .unwrap();
         assert_eq!(block.status, "immature");
 
         // Tip = 999 → 50 confirmations, below threshold of 100
         let matured = svc.check_maturation(999, 100).unwrap();
-        assert!(matured.is_empty(), "block should NOT mature below threshold");
+        assert!(
+            matured.is_empty(),
+            "block should NOT mature below threshold"
+        );
 
-        let block = svc.found_block_repo.get_by_hash("blockhash1").unwrap().unwrap();
+        let block = svc
+            .found_block_repo
+            .get_by_hash("blockhash1")
+            .unwrap()
+            .unwrap();
         assert_eq!(block.status, "immature", "block should still be immature");
     }
 
@@ -1013,7 +1134,16 @@ mod tests {
 
         // Block at height 950, tip = 1049 → 100 confirmations (at threshold)
         let block = svc
-            .record_found_block(round_id, "blockhash2", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .record_found_block(
+                round_id,
+                "blockhash2",
+                950,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                50000,
+                "",
+            )
             .unwrap();
         assert_eq!(block.status, "immature");
 
@@ -1021,7 +1151,11 @@ mod tests {
         assert_eq!(matured.len(), 1, "block should mature at threshold");
         assert_eq!(matured[0].block_hash, "blockhash2");
 
-        let block = svc.found_block_repo.get_by_hash("blockhash2").unwrap().unwrap();
+        let block = svc
+            .found_block_repo
+            .get_by_hash("blockhash2")
+            .unwrap()
+            .unwrap();
         assert_eq!(block.status, "matured");
         assert!(block.matured_at.is_some(), "matured_at should be set");
     }
@@ -1057,7 +1191,16 @@ mod tests {
 
         // Block at height 950, tip = 1100 → 151 confirmations (above threshold)
         let block = svc
-            .record_found_block(round_id, "blockhash3", 950, None, Some(42), Some("json-rpc"), 50000, "")
+            .record_found_block(
+                round_id,
+                "blockhash3",
+                950,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                50000,
+                "",
+            )
             .unwrap();
         assert_eq!(block.status, "immature");
 
@@ -1066,7 +1209,11 @@ mod tests {
         assert_eq!(matured[0].block_hash, "blockhash3");
 
         // Verify DB was updated
-        let block = svc.found_block_repo.get_by_hash("blockhash3").unwrap().unwrap();
+        let block = svc
+            .found_block_repo
+            .get_by_hash("blockhash3")
+            .unwrap()
+            .unwrap();
         assert_eq!(block.status, "matured");
     }
 
@@ -1111,10 +1258,20 @@ mod tests {
             .unwrap();
         let round_id = round_id.unwrap();
 
-        svc
-            .record_found_block(round_id, "orphanedblock", 950, None, Some(42), Some("json-rpc"), 50000, "")
+        svc.record_found_block(
+            round_id,
+            "orphanedblock",
+            950,
+            None,
+            Some(42),
+            Some("json-rpc"),
+            50000,
+            "",
+        )
+        .unwrap();
+        svc.found_block_repo
+            .mark_orphaned("orphanedblock", "reorg")
             .unwrap();
-        svc.found_block_repo.mark_orphaned("orphanedblock", "reorg").unwrap();
 
         // Tip is 1100, which would mature if block were still immature
         let matured = svc.check_maturation(1100, 100).unwrap();
@@ -1152,21 +1309,41 @@ mod tests {
         assert!(round_id.is_some(), "round should exist");
 
         // Verify round is open before block found
-        let round_before = svc.round_repo.get_by_id(round_id.unwrap()).unwrap().unwrap();
+        let round_before = svc
+            .round_repo
+            .get_by_id(round_id.unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(round_before.status, "open", "round should start as 'open'");
 
         // Record a found block and close the round (as handle_submit should)
         let template_id: u64 = 42;
         let round = svc.resolve_round_for_template(template_id).unwrap();
         let _found = svc
-            .record_found_block(round.id, "foundblockhash", 1000, None, Some(template_id), Some("json-rpc"), 0, "")
+            .record_found_block(
+                round.id,
+                "foundblockhash",
+                1000,
+                None,
+                Some(template_id),
+                Some("json-rpc"),
+                0,
+                "",
+            )
             .unwrap();
         svc.close_round(round.id, template_id, "found").unwrap();
 
         // Verify round is now 'found'
         let round_after = svc.round_repo.get_by_id(round.id).unwrap().unwrap();
-        assert_eq!(round_after.status, "found", "round should transition to 'found'");
-        assert_eq!(round_after.end_template_id, Some(template_id), "end_template_id should be set");
+        assert_eq!(
+            round_after.status, "found",
+            "round should transition to 'found'"
+        );
+        assert_eq!(
+            round_after.end_template_id,
+            Some(template_id),
+            "end_template_id should be set"
+        );
 
         // Verify accounting event was recorded
         let events = svc.event_repo.list_by_type("round_closed", 10, 0).unwrap();
@@ -1220,7 +1397,6 @@ mod tests {
             "dedupe_key should contain template_id, epoch, extranonce2, ntime, nonce, got: {}",
             dedupe_key
         );
-
     }
 
     #[test]
@@ -1278,7 +1454,10 @@ mod tests {
 
         // Total share count should be 1, not 2
         let total_shares = svc.share_repo.total_count().unwrap();
-        assert_eq!(total_shares, 1, "only one share should exist despite two insert attempts");
+        assert_eq!(
+            total_shares, 1,
+            "only one share should exist despite two insert attempts"
+        );
 
         // Only one accounting event
         let events = svc.event_repo.list_by_type("share_outcome", 10, 0).unwrap();
@@ -1300,18 +1479,24 @@ mod tests {
             let setup = Connection::open(&db_path).unwrap();
             init_schema(&setup).unwrap();
 
-            setup.execute(
-                "INSERT INTO workers (id, payout_address) VALUES (1, 'big_addr')",
-                [],
-            ).unwrap();
-            setup.execute(
-                "INSERT INTO workers (id, payout_address) VALUES (2, 'small_addr')",
-                [],
-            ).unwrap();
-            setup.execute(
-                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open')",
-                [],
-            ).unwrap();
+            setup
+                .execute(
+                    "INSERT INTO workers (id, payout_address) VALUES (1, 'big_addr')",
+                    [],
+                )
+                .unwrap();
+            setup
+                .execute(
+                    "INSERT INTO workers (id, payout_address) VALUES (2, 'small_addr')",
+                    [],
+                )
+                .unwrap();
+            setup
+                .execute(
+                    "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open')",
+                    [],
+                )
+                .unwrap();
 
             // Big miner share (diff 500)
             setup.execute(
@@ -1364,43 +1549,66 @@ mod tests {
 
         // Record the found block with a modest coinbase_value
         let block_hash = "00000000deadbeef00000000000000000000000000000000000000000000000000";
-        let found_block = svc.record_found_block(
-            1,      // round_id
-            block_hash,
-            5000,
-            Some(1),  // big miner found it
-            Some(100),
-            Some("json-rpc"),
-            1000,          // coinbase_value = 1000 sat
-            "0000ffff0000000000000000000000000000000000000000000000000000000000",
-        ).unwrap();
+        let found_block = svc
+            .record_found_block(
+                1, // round_id
+                block_hash,
+                5000,
+                Some(1), // big miner found it
+                Some(100),
+                Some("json-rpc"),
+                1000, // coinbase_value = 1000 sat
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
 
         // Calculate payout with min_payout_sat high enough that small miner gets dusted
-        let batch_id = svc.create_payout_for_found_block(
-            &found_block,
-            0,                         // 0 bps fee
-            None,                      // no fee address
-            500,                       // min_payout_sat = 500
-            10.0,                      // n_multiplier = 10.0 (window covers all shares)
-        ).unwrap();
+        let batch_id = svc
+            .create_payout_for_found_block(
+                &found_block,
+                0,    // 0 bps fee
+                None, // no fee address
+                500,  // min_payout_sat = 500
+                10.0, // n_multiplier = 10.0 (window covers all shares)
+            )
+            .unwrap();
 
         // Query snapshots for this batch
         let snapshots = svc.payout_repo.get_snapshots_by_batch(batch_id).unwrap();
 
         // Assert BOTH miners have snapshot entries
-        let big_snaps: Vec<_> = snapshots.iter().filter(|s| s.payout_address == "big_addr").collect();
-        let small_snaps: Vec<_> = snapshots.iter().filter(|s| s.payout_address == "small_addr").collect();
+        let big_snaps: Vec<_> = snapshots
+            .iter()
+            .filter(|s| s.payout_address == "big_addr")
+            .collect();
+        let small_snaps: Vec<_> = snapshots
+            .iter()
+            .filter(|s| s.payout_address == "small_addr")
+            .collect();
 
-        assert!(!big_snaps.is_empty(),
-            "big miner should have snapshot entries (amount >= min_payout_sat)");
-        assert!(!small_snaps.is_empty(),
-            "small miner should have snapshot entries even though payout was dusted");
+        assert!(
+            !big_snaps.is_empty(),
+            "big miner should have snapshot entries (amount >= min_payout_sat)"
+        );
+        assert!(
+            !small_snaps.is_empty(),
+            "small miner should have snapshot entries even though payout was dusted"
+        );
 
         // Verify the payouts show the dusted amount correctly
         let payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
-        let small_payout = payouts.iter().find(|p| p.payout_address == "small_addr").unwrap();
-        assert_eq!(small_payout.amount, 0, "dusted miner's payout amount should be 0");
-        assert!(small_payout.dust_carried_forward > 0, "dusted miner should have dust carried forward");
+        let small_payout = payouts
+            .iter()
+            .find(|p| p.payout_address == "small_addr")
+            .unwrap();
+        assert_eq!(
+            small_payout.amount, 0,
+            "dusted miner's payout amount should be 0"
+        );
+        assert!(
+            small_payout.dust_carried_forward > 0,
+            "dusted miner should have dust carried forward"
+        );
     }
 
     #[test]
@@ -1416,16 +1624,20 @@ mod tests {
             init_schema(&setup).unwrap();
 
             // Workers
-            setup.execute_batch(
-                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
-                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');"
-            ).unwrap();
+            setup
+                .execute_batch(
+                    "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');",
+                )
+                .unwrap();
 
             // Round
-            setup.execute(
-                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
-                [],
-            ).unwrap();
+            setup
+                .execute(
+                    "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                    [],
+                )
+                .unwrap();
 
             // Alice: diff 300 (75% of work)
             setup.execute(
@@ -1471,10 +1683,12 @@ mod tests {
             ).unwrap();
 
             // Pre-existing dust for Alice (50 sat carried from previous round)
-            setup.execute(
-                "INSERT INTO dust_balances (payout_address, balance) VALUES ('alice', 50)",
-                [],
-            ).unwrap();
+            setup
+                .execute(
+                    "INSERT INTO dust_balances (payout_address, balance) VALUES ('alice', 50)",
+                    [],
+                )
+                .unwrap();
         }
 
         // Create the service on a fresh connection
@@ -1482,24 +1696,35 @@ mod tests {
         let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
 
         let block_hash = "00000000cafebabe00000000000000000000000000000000000000000000000000";
-        let found_block = svc.record_found_block(
-            1, block_hash,
-            9999, Some(1), Some(200), Some("json-rpc"),
-            10000,  // coinbase_value = 10000 sat
-            "0000ffff0000000000000000000000000000000000000000000000000000000000",
-        ).unwrap();
+        let found_block = svc
+            .record_found_block(
+                1,
+                block_hash,
+                9999,
+                Some(1),
+                Some(200),
+                Some("json-rpc"),
+                10000, // coinbase_value = 10000 sat
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
 
         // Payout: 200 bps (2%) fee, n_multiplier covers all shares
-        let batch_id = svc.create_payout_for_found_block(
-            &found_block,
-            200,                       // 2% fee
-            Some("fee_pool"),          // fee address
-            1,                         // min_payout_sat = 1 (no dust)
-            10.0,                      // window covers everything
-        ).unwrap();
+        let batch_id = svc
+            .create_payout_for_found_block(
+                &found_block,
+                200,              // 2% fee
+                Some("fee_pool"), // fee address
+                1,                // min_payout_sat = 1 (no dust)
+                10.0,             // window covers everything
+            )
+            .unwrap();
 
         let batch = svc.payout_repo.get_batch_by_id(batch_id).unwrap().unwrap();
-        assert_eq!(batch.status, "pending", "fresh payout batch should be pending");
+        assert_eq!(
+            batch.status, "pending",
+            "fresh payout batch should be pending"
+        );
         assert_eq!(batch.round_id, 1);
 
         // Fee = 10000 * 200 / 10000 = 200 sat
@@ -1524,8 +1749,14 @@ mod tests {
         assert_eq!(batch.pool_fee_address.as_deref(), Some("fee_pool"));
 
         // Verify Alice (worker 1) and Bob (worker 2) each have a payout
-        assert!(payouts.iter().any(|p| p.worker_id == 1), "Alice should have a payout");
-        assert!(payouts.iter().any(|p| p.worker_id == 2), "Bob should have a payout");
+        assert!(
+            payouts.iter().any(|p| p.worker_id == 1),
+            "Alice should have a payout"
+        );
+        assert!(
+            payouts.iter().any(|p| p.worker_id == 2),
+            "Bob should have a payout"
+        );
 
         // Snapshots cover all shares
         let snapshots = svc.payout_repo.get_snapshots_by_batch(batch_id).unwrap();
@@ -1535,7 +1766,11 @@ mod tests {
 
         // Retry_key format: "{block_hash}:{num_outputs}"
         assert!(
-            batch.retry_key.as_deref().unwrap().starts_with("00000000cafebabe00000000000000000000000000000000000000000000000000:"),
+            batch
+                .retry_key
+                .as_deref()
+                .unwrap()
+                .starts_with("00000000cafebabe00000000000000000000000000000000000000000000000000:"),
             "retry_key should start with block_hash, got: {:?}",
             batch.retry_key,
         );
@@ -1554,7 +1789,10 @@ mod tests {
         // weight in the payout calculation but is NOT decremented in the DB — the dust
         // ledger is additive only (dust is never removed, only accumulated).
         let (alice_dust, _) = svc.payout_repo.get_or_create_dust_balance("alice").unwrap();
-        assert_eq!(alice_dust, 50, "Alice's pre-existing dust remains in balance (additive-only ledger)");
+        assert_eq!(
+            alice_dust, 50,
+            "Alice's pre-existing dust remains in balance (additive-only ledger)"
+        );
     }
 
     #[test]
@@ -1569,16 +1807,20 @@ mod tests {
             init_schema(&setup).unwrap();
 
             // Workers
-            setup.execute_batch(
-                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
-                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');"
-            ).unwrap();
+            setup
+                .execute_batch(
+                    "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');",
+                )
+                .unwrap();
 
             // Round
-            setup.execute(
-                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
-                [],
-            ).unwrap();
+            setup
+                .execute(
+                    "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                    [],
+                )
+                .unwrap();
 
             // Alice: diff 300 (75% of work)
             setup.execute(
@@ -1628,22 +1870,28 @@ mod tests {
         let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
 
         let block_hash = "0000deadbeef000000000000000000000000000000000000000000000000000000";
-        let found_block = svc.record_found_block(
-            1, block_hash,
-            10000, Some(1), Some(200), Some("json-rpc"),
-            10000,
-            "0000ffff0000000000000000000000000000000000000000000000000000000000",
-        ).unwrap();
+        let found_block = svc
+            .record_found_block(
+                1,
+                block_hash,
+                10000,
+                Some(1),
+                Some(200),
+                Some("json-rpc"),
+                10000,
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
 
         // First call — succeeds
-        let _batch_id = svc.create_payout_for_found_block(
-            &found_block, 200, Some("fee_pool"), 1, 10.0,
-        ).unwrap();
+        let _batch_id = svc
+            .create_payout_for_found_block(&found_block, 200, Some("fee_pool"), 1, 10.0)
+            .unwrap();
 
         // Second call with same block — fails
-        let err = svc.create_payout_for_found_block(
-            &found_block, 200, Some("fee_pool"), 1, 10.0,
-        ).unwrap_err();
+        let err = svc
+            .create_payout_for_found_block(&found_block, 200, Some("fee_pool"), 1, 10.0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("already exists"),
             "should reject duplicate block, got: {err}",
@@ -1662,16 +1910,20 @@ mod tests {
             init_schema(&setup).unwrap();
 
             // Workers
-            setup.execute_batch(
-                "INSERT INTO workers (id, payout_address) VALUES (1, 'big_miner');
-                 INSERT INTO workers (id, payout_address) VALUES (2, 'small_miner');"
-            ).unwrap();
+            setup
+                .execute_batch(
+                    "INSERT INTO workers (id, payout_address) VALUES (1, 'big_miner');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'small_miner');",
+                )
+                .unwrap();
 
             // Two rounds
-            setup.execute_batch(
-                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open');
-                 INSERT INTO rounds (id, start_template_id, status) VALUES (2, 200, 'open');"
-            ).unwrap();
+            setup
+                .execute_batch(
+                    "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open');
+                 INSERT INTO rounds (id, start_template_id, status) VALUES (2, 200, 'open');",
+                )
+                .unwrap();
 
             // === Round 1 shares ===
             // Big miner: diff 8.0 (80%)
@@ -1769,43 +2021,60 @@ mod tests {
         let r2_hash = "00000000000000000000000000000000000000000000000000000000000000bb";
 
         // Record both found blocks
-        let found_block_1 = svc.record_found_block(
-            1, r1_hash,
-            10000, Some(1), Some(100), Some("json-rpc"),
-            1000,
-            "0000ffff0000000000000000000000000000000000000000000000000000000000",
-        ).unwrap();
-        let found_block_2 = svc.record_found_block(
-            2, r2_hash,
-            10001, Some(1), Some(200), Some("json-rpc"),
-            1000,
-            "0000ffff0000000000000000000000000000000000000000000000000000000000",
-        ).unwrap();
+        let found_block_1 = svc
+            .record_found_block(
+                1,
+                r1_hash,
+                10000,
+                Some(1),
+                Some(100),
+                Some("json-rpc"),
+                1000,
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+        let found_block_2 = svc
+            .record_found_block(
+                2,
+                r2_hash,
+                10001,
+                Some(1),
+                Some(200),
+                Some("json-rpc"),
+                1000,
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
 
         // Round 1 payout: small_miner gets < 500 sat → dusted
-        let _batch_1 = svc.create_payout_for_found_block(
-            &found_block_1,
-            0,        // no fee
-            None,     // no fee address
-            500,      // min_payout_sat
-            10.0,     // large n_multiplier ensures all shares in window
-        ).unwrap();
+        let _batch_1 = svc
+            .create_payout_for_found_block(
+                &found_block_1,
+                0,    // no fee
+                None, // no fee address
+                500,  // min_payout_sat
+                10.0, // large n_multiplier ensures all shares in window
+            )
+            .unwrap();
 
-        let (dust_after_1, _) = svc.payout_repo
-            .get_or_create_dust_balance("small_miner").unwrap();
+        let (dust_after_1, _) = svc
+            .payout_repo
+            .get_or_create_dust_balance("small_miner")
+            .unwrap();
         assert!(
             dust_after_1 > 0,
             "small_miner should have dust after round 1, got: {dust_after_1}",
         );
 
         // Round 2 payout: small_miner's dust balance grows (additive-only)
-        let _batch_2 = svc.create_payout_for_found_block(
-            &found_block_2,
-            0, None, 500, 10.0,
-        ).unwrap();
+        let _batch_2 = svc
+            .create_payout_for_found_block(&found_block_2, 0, None, 500, 10.0)
+            .unwrap();
 
-        let (dust_after_2, _) = svc.payout_repo
-            .get_or_create_dust_balance("small_miner").unwrap();
+        let (dust_after_2, _) = svc
+            .payout_repo
+            .get_or_create_dust_balance("small_miner")
+            .unwrap();
         assert!(
             dust_after_2 > dust_after_1,
             "dust should grow across rounds (additive-only): after_1={dust_after_1}, after_2={dust_after_2}",

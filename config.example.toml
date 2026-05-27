@@ -21,6 +21,11 @@
 # Default: false (production). Set to true when debugging pool issues.
 debug = false
 
+# Log output format: "plain" (default, human-readable with colors) or "json" (structured, for log aggregators).
+# JSON format enables automatic field indexing in log shipping pipelines (Loki, Splunk, etc.).
+# Not yet implemented — tracked in TODO.md.
+# log_format = "plain"
+
 # -----------------------------------------------------------------------------
 # Network Configuration
 # -----------------------------------------------------------------------------

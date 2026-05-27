@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+use std::sync::Arc;
 
 /// A share entry within the PPLNS payout window.
 /// Returned by `calculate_pplns_window` and used by `plan::build_payout_plan`.
@@ -97,8 +97,9 @@ mod tests {
             "INSERT INTO workers (id, payout_address) VALUES (1, 'addr1');
              INSERT INTO workers (id, payout_address) VALUES (2, 'addr2');
              INSERT INTO rounds (id, start_template_id, status) VALUES (1, 100, 'open');
-             INSERT INTO rounds (id, start_template_id, status) VALUES (2, 200, 'orphaned');"
-        ).unwrap();
+             INSERT INTO rounds (id, start_template_id, status) VALUES (2, 200, 'orphaned');",
+        )
+        .unwrap();
 
         // Shares and outcomes with explicit created_at for deterministic order
         // Share 3 (latest, diff 4.0)
@@ -169,7 +170,11 @@ mod tests {
         // Threshold = 3.0 * 2.0 = 6.0
         // Cumulative: 999.0 >= 6.0 => cutoff at index 0 (orphaned-round share alone meets threshold)
         let result = calculate_pplns_window(&conn, "9999-12-31", 3.0, 2.0).unwrap();
-        assert_eq!(result.len(), 1, "orphaned-round share (999.0) alone meets threshold");
+        assert_eq!(
+            result.len(),
+            1,
+            "orphaned-round share (999.0) alone meets threshold"
+        );
         assert!(
             (result[0].difficulty - 999.0).abs() < f64::EPSILON,
             "first share should be the orphaned-round share (999.0), got: {}",
@@ -186,9 +191,15 @@ mod tests {
 
         // Very high threshold that no amount of shares can meet
         let result = calculate_pplns_window(&conn, "9999-12-31", 9999.0, 1.0).unwrap();
-        assert_eq!(result.len(), 4, "should return all 4 shares including orphaned-round share");
+        assert_eq!(
+            result.len(),
+            4,
+            "should return all 4 shares including orphaned-round share"
+        );
         // Verify the orphaned-round share (diff 999.0) is among them
-        assert!(result.iter().any(|e| (e.difficulty - 999.0).abs() < f64::EPSILON));
+        assert!(result
+            .iter()
+            .any(|e| (e.difficulty - 999.0).abs() < f64::EPSILON));
     }
 
     #[test]
@@ -202,7 +213,11 @@ mod tests {
         // meets it. This share belongs to orphaned round 2. Under PPLNS design
         // orphaned-round shares remain in the window.
         let result = calculate_pplns_window(&conn, "9999-12-31", 0.5, 1.0).unwrap();
-        assert_eq!(result.len(), 1, "orphaned-round share should be included and meet threshold alone");
+        assert_eq!(
+            result.len(),
+            1,
+            "orphaned-round share should be included and meet threshold alone"
+        );
         assert!(
             (result[0].difficulty - 999.0).abs() < f64::EPSILON,
             "orphaned-round share should be the 999.0-difficulty share, got: {}",
@@ -231,7 +246,11 @@ mod tests {
 
         // Threshold = 5.5 -> cumulative: 999.0 >= 5.5 => orphaned-round share alone meets threshold
         let result = calculate_pplns_window(&conn, "9999-12-31", 2.75, 2.0).unwrap();
-        assert_eq!(result.len(), 1, "threshold=5.5 met by orphaned-round share alone");
+        assert_eq!(
+            result.len(),
+            1,
+            "threshold=5.5 met by orphaned-round share alone"
+        );
         assert!(
             (result[0].difficulty - 999.0).abs() < f64::EPSILON,
             "first (and only) share should be orphaned-round share (999.0), got: {}",

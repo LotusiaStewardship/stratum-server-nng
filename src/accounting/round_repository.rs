@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+use std::sync::Arc;
 
 /// A payout round during which shares accumulate toward the next pool-found block.
 #[derive(Debug, Clone)]
@@ -50,17 +50,20 @@ impl RoundRepository {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // No open round exists — create one
                 let mut stmt = conn.prepare(
-                    "INSERT INTO rounds (start_template_id, status) VALUES (?1, 'open')"
+                    "INSERT INTO rounds (start_template_id, status) VALUES (?1, 'open')",
                 )?;
                 stmt.execute([start_template_id])?;
                 let id = conn.last_insert_rowid();
-                Ok((Round {
-                    id,
-                    start_template_id,
-                    end_template_id: None,
-                    status: "open".to_string(),
-                    found_block_hash: None,
-                }, true))
+                Ok((
+                    Round {
+                        id,
+                        start_template_id,
+                        end_template_id: None,
+                        status: "open".to_string(),
+                        found_block_hash: None,
+                    },
+                    true,
+                ))
             }
             Err(e) => Err(e.into()),
         }
@@ -70,9 +73,8 @@ impl RoundRepository {
     /// After closing, the round is no longer returned by `get_or_create_current_round`.
     pub fn close_round(&self, id: i64, end_template_id: u64, status: &str) -> Result<()> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "UPDATE rounds SET end_template_id = ?1, status = ?2 WHERE id = ?3"
-        )?;
+        let mut stmt =
+            conn.prepare("UPDATE rounds SET end_template_id = ?1, status = ?2 WHERE id = ?3")?;
         stmt.execute(params![end_template_id, status, id])?;
         Ok(())
     }
@@ -122,7 +124,7 @@ impl RoundRepository {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, start_template_id, end_template_id, status, found_block_hash 
-             FROM rounds WHERE id = ?1"
+             FROM rounds WHERE id = ?1",
         )?;
         let round = stmt.query_row([id], |row| {
             Ok(Round {
@@ -143,22 +145,26 @@ impl RoundRepository {
     /// List rounds, optionally filtered by status.
     pub fn list(&self, status_filter: Option<&str>) -> Result<Vec<Round>> {
         let conn = self.conn.lock();
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(status) = status_filter {
-            (
-                "SELECT id, start_template_id, end_template_id, status, found_block_hash 
-                 FROM rounds WHERE status = ?1 ORDER BY id DESC".to_string(),
-                vec![Box::new(status.to_string())],
-            )
-        } else {
-            (
-                "SELECT id, start_template_id, end_template_id, status, found_block_hash 
-                 FROM rounds ORDER BY id DESC".to_string(),
-                vec![],
-            )
-        };
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(status) = status_filter {
+                (
+                    "SELECT id, start_template_id, end_template_id, status, found_block_hash 
+                 FROM rounds WHERE status = ?1 ORDER BY id DESC"
+                        .to_string(),
+                    vec![Box::new(status.to_string())],
+                )
+            } else {
+                (
+                    "SELECT id, start_template_id, end_template_id, status, found_block_hash 
+                 FROM rounds ORDER BY id DESC"
+                        .to_string(),
+                    vec![],
+                )
+            };
 
         let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(Round {
                 id: row.get(0)?,

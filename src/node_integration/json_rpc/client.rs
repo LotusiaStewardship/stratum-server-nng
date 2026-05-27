@@ -36,7 +36,12 @@ impl JsonRpcClient {
     /// `mined_block_hex` is the raw serialized block in hex encoding.
     /// Returns the result indicating whether the block was accepted.
     pub async fn submitblock(&self, mined_block_hex: &str) -> Result<SubmitBlockResult> {
-        let response = self.call("submitblock", vec![Value::String(mined_block_hex.to_string())]).await?;
+        let response = self
+            .call(
+                "submitblock",
+                vec![Value::String(mined_block_hex.to_string())],
+            )
+            .await?;
 
         // lotusd's submitblock returns null on success, or an error object on failure
         match response {
@@ -76,7 +81,9 @@ impl JsonRpcClient {
     /// Get the block hash at a given height via `getblockhash`.
     /// Returns `Ok(None)` if the height is above the chain tip (error code -8).
     pub async fn getblockhash(&self, height: i32) -> Result<Option<String>> {
-        let response = self.call("getblockhash", vec![serde_json::json!(height)]).await;
+        let response = self
+            .call("getblockhash", vec![serde_json::json!(height)])
+            .await;
 
         match response {
             Ok(val) => {
@@ -106,10 +113,7 @@ impl JsonRpcClient {
     pub async fn get_block(&self, block_hash: &str) -> Result<Value> {
         self.call(
             "getblock",
-            vec![
-                Value::String(block_hash.to_string()),
-                serde_json::json!(2),
-            ],
+            vec![Value::String(block_hash.to_string()), serde_json::json!(2)],
         )
         .await
     }
@@ -121,10 +125,7 @@ impl JsonRpcClient {
     pub async fn get_raw_transaction(&self, txid: &str) -> Result<Value> {
         self.call(
             "getrawtransaction",
-            vec![
-                Value::String(txid.to_string()),
-                serde_json::json!(true),
-            ],
+            vec![Value::String(txid.to_string()), serde_json::json!(true)],
         )
         .await
     }
@@ -147,10 +148,7 @@ impl JsonRpcClient {
                 anyhow::bail!("sendrawtransaction returned null")
             }
             other => {
-                anyhow::bail!(
-                    "sendrawtransaction: unexpected response type: {}",
-                    other
-                )
+                anyhow::bail!("sendrawtransaction: unexpected response type: {}", other)
             }
         }
     }
@@ -208,14 +206,12 @@ impl JsonRpcClient {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     /// Helper: spawn a mock JSON-RPC server that returns a canned response.
     /// Returns the URL for the client to connect to.
-    async fn spawn_mock_server(
-        response: serde_json::Value,
-    ) -> String {
+    async fn spawn_mock_server(response: serde_json::Value) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);

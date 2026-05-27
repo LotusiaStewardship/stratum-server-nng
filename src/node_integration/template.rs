@@ -21,11 +21,13 @@ fn compute_block_size_with_extranonce(
     coinbase2: &str,
 ) -> anyhow::Result<u64> {
     // Deserialize the template block to access the template's coinbase
-    let block = LotusBlock::deser(&mut Bytes::from_slice(template_block))
-        .map_err(|e| anyhow::anyhow!(
+    let block = LotusBlock::deser(&mut Bytes::from_slice(template_block)).map_err(|e| {
+        anyhow::anyhow!(
             "failed to deserialize template block ({} bytes): {}",
-            template_block.len(), e,
-        ))?;
+            template_block.len(),
+            e,
+        )
+    })?;
 
     // Get Rust-serialized size of the template's coinbase
     let template_coinbase_size = match block.txs.first() {
@@ -39,22 +41,27 @@ fn compute_block_size_with_extranonce(
                 "template block has no transactions ({} bytes)",
                 template_block.len(),
             ));
-        },
+        }
     };
 
     // Build a sample coinbase with dummy extranonce (total_extranonce_size zero bytes)
     let dummy_extranonce = hex::encode([0u8; params::EXTRANONCE_TOTAL_SIZE as usize]);
     let sample_hex = format!("{}{}{}", coinbase1, dummy_extranonce, coinbase2);
-    let sample_bytes = hex::decode(&sample_hex)
-        .map_err(|e| anyhow::anyhow!(
+    let sample_bytes = hex::decode(&sample_hex).map_err(|e| {
+        anyhow::anyhow!(
             "failed to hex-decode sample coinbase: {} (coinbase1={}B, coinbase2={}B)",
-            e, coinbase1.len(), coinbase2.len(),
-        ))?;
-    let sample_tx = Tx::deser(&mut Bytes::from_slice(&sample_bytes))
-        .map_err(|e| anyhow::anyhow!(
+            e,
+            coinbase1.len(),
+            coinbase2.len(),
+        )
+    })?;
+    let sample_tx = Tx::deser(&mut Bytes::from_slice(&sample_bytes)).map_err(|e| {
+        anyhow::anyhow!(
             "failed to deserialize sample coinbase tx ({} bytes): {}",
-            sample_bytes.len(), e,
-        ))?;
+            sample_bytes.len(),
+            e,
+        )
+    })?;
 
     // Get Rust-serialized size of the candidate coinbase
     let candidate_coinbase_size = {
@@ -69,7 +76,7 @@ fn compute_block_size_with_extranonce(
 }
 
 /// Convert a MiningTemplate from lotusd into a MiningJob for stratum protocol.
-/// 
+///
 /// The coinbase1/coinbase2 from the template are used as-is. Each miner session
 /// has its own extranonce1 which the miner inserts between coinbase1 and coinbase2.
 ///
@@ -155,8 +162,8 @@ pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> 
         .map_err(|e| format!("failed to hex-decode reconstructed coinbase: {}", e))?;
 
     let mut buf = Bytes::from_slice(&coinbase_bytes);
-    let coinbase_tx = Tx::deser(&mut buf)
-        .map_err(|e| format!("failed to deserialize coinbase tx: {}", e))?;
+    let coinbase_tx =
+        Tx::deser(&mut buf).map_err(|e| format!("failed to deserialize coinbase tx: {}", e))?;
 
     let outputs = coinbase_tx.outputs();
     if outputs.is_empty() {
@@ -184,7 +191,7 @@ pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> 
 mod tests {
     use super::*;
     use crate::stratum_protocol::params;
-    use bitcoinsuite_core::{Sha256d, LotusBlock, LotusHeader, Tx, BitcoinCode, Bytes, BytesMut};
+    use bitcoinsuite_core::{BitcoinCode, Bytes, BytesMut, LotusBlock, LotusHeader, Sha256d, Tx};
 
     fn create_test_template() -> MiningTemplate {
         // Build a minimal serialized LotusBlock from the template's coinbase parts.
@@ -254,7 +261,8 @@ mod tests {
                 "4b0ce2ddbf0f5352b721b7688109a1e1007722f96fa07f61ea8e655ac804964f".to_string(),
                 "c3899f315bc3b284015819a8d77404b4e179528d62559886babf89884966a172".to_string(),
             ],
-            prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            prev_hash_stratum: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000"
+                .to_string(),
             nbits_stratum: "10d0091c".to_string(),
             ntime_stratum: "6adc0c6a0000".to_string(),
         }
@@ -283,7 +291,8 @@ mod tests {
     fn test_template_to_job_clean_jobs_false_explicit() {
         let template = create_test_template();
         let job = template_to_job(&template, false).unwrap();
-        assert_eq!(job.clean_jobs, false,
+        assert_eq!(
+            job.clean_jobs, false,
             "initial template should have clean_jobs=false"
         );
     }
@@ -292,7 +301,8 @@ mod tests {
     fn test_template_to_job_clean_jobs_true() {
         let template = create_test_template();
         let job = template_to_job(&template, true).unwrap();
-        assert_eq!(job.clean_jobs, true,
+        assert_eq!(
+            job.clean_jobs, true,
             "miningwrkchg-triggered job should have clean_jobs=true"
         );
     }
@@ -510,7 +520,7 @@ mod tests {
         // If the template block is empty (corrupt), template_to_job must return Err
         // so the operator sees a hard stop, not a silent fallback.
         let mut template = create_test_template();
-        template.block = vec![];  // empty — LotusBlock::deser will fail
+        template.block = vec![]; // empty — LotusBlock::deser will fail
 
         let err = template_to_job(&template, false).unwrap_err();
         let msg = err.to_string();
@@ -538,12 +548,13 @@ mod tests {
                 height: 1292529,
                 epoch_hash: Sha256d::from_hex_be(
                     "00000000061fb84d2a1d30d8767f629a08904b0e70f84587008fd9e91f1583f7",
-                ).unwrap(),
+                )
+                .unwrap(),
                 merkle_root: Sha256d::new([0u8; 32]),
                 extended_metadata_hash: Sha256d::new([0u8; 32]),
             },
             metadata: vec![],
-            txs: vec![],  // no coinbase
+            txs: vec![], // no coinbase
         };
         let block_bytes = {
             let mut buf = BytesMut::new();
@@ -600,8 +611,10 @@ mod tests {
         // Real-world values from lotusd template
         let coinbase2 = "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000";
         let template = template_with_coinbase2(coinbase2);
-        assert!(verify_coinbase_outputs(&template).is_ok(),
-            "template with P2PKH outputs should pass");
+        assert!(
+            verify_coinbase_outputs(&template).is_ok(),
+            "template with P2PKH outputs should pass"
+        );
     }
 
     #[test]
@@ -612,8 +625,11 @@ mod tests {
         let coinbase2 = "ffffffff010000000000000000076a056c6f676f7300000000";
         let template = template_with_coinbase2(coinbase2);
         let err = verify_coinbase_outputs(&template).unwrap_err();
-        assert!(err.contains("BURNED"),
-            "OP_RETURN-only template should report BURNED, got: {}", err);
+        assert!(
+            err.contains("BURNED"),
+            "OP_RETURN-only template should report BURNED, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -622,8 +638,11 @@ mod tests {
         let coinbase2 = "ffffffff0000000000";
         let template = template_with_coinbase2(coinbase2);
         let err = verify_coinbase_outputs(&template).unwrap_err();
-        assert!(err.contains("empty") || err.contains("zero"),
-            "zero-output template should report error, got: {}", err);
+        assert!(
+            err.contains("empty") || err.contains("zero"),
+            "zero-output template should report error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -639,7 +658,9 @@ mod tests {
         //   Output 2: P2PKH (value=221695870, script=76a914...88ac, 25 bytes)
         let coinbase2 = "ffffffff020000000000000000076a056c6f676f737ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac00000000";
         let template = template_with_coinbase2(coinbase2);
-        assert!(verify_coinbase_outputs(&template).is_ok(),
-            "template with at least one P2PKH output should pass");
+        assert!(
+            verify_coinbase_outputs(&template).is_ok(),
+            "template with at least one P2PKH output should pass"
+        );
     }
 }

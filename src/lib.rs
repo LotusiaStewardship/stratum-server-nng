@@ -1,8 +1,9 @@
-pub mod config;
-pub mod stratum_protocol;
-pub mod share_processing;
 pub mod accounting;
+pub mod config;
 pub mod http_api;
-pub mod shutdown;
+pub mod logging;
 pub mod node_integration;
 pub mod payout;
+pub mod share_processing;
+pub mod shutdown;
+pub mod stratum_protocol;

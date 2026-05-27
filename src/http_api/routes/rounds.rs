@@ -1,9 +1,9 @@
+use crate::http_api::server::AppState;
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
 pub struct RoundSummary {
@@ -58,18 +58,21 @@ pub async fn get_round(
         let rows = share_repo
             .count_outcomes_by_round_with_workers(id)
             .unwrap_or_default();
-        let breakdown: Vec<WorkerShareBreakdown> = rows.into_iter().map(
-            |(worker_id, payout_address, worker_suffix, total, accepted, rejected)| {
-                WorkerShareBreakdown {
-                    worker_id,
-                    payout_address,
-                    worker_suffix,
-                    total_shares: total,
-                    accepted_shares: accepted,
-                    rejected_shares: rejected,
-                }
-            },
-        ).collect();
+        let breakdown: Vec<WorkerShareBreakdown> = rows
+            .into_iter()
+            .map(
+                |(worker_id, payout_address, worker_suffix, total, accepted, rejected)| {
+                    WorkerShareBreakdown {
+                        worker_id,
+                        payout_address,
+                        worker_suffix,
+                        total_shares: total,
+                        accepted_shares: accepted,
+                        rejected_shares: rejected,
+                    }
+                },
+            )
+            .collect();
         let total: i64 = breakdown.iter().map(|w| w.total_shares).sum();
         (breakdown, total)
     } else {
@@ -125,17 +128,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_round_not_found() {
         let stats = ServerStats::default();
-        let response = get_round(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Path(999))
+        let response = get_round(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Path(999),
+        )
         .await;
 
         assert!(response.0.is_none());
@@ -189,17 +195,20 @@ mod tests {
         ).unwrap();
 
         let stats = ServerStats::default();
-        let response = get_round(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: Some(share_repo),
-            worker_repo: Some(worker_repo),
-            round_repo: Some(round_repo),
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Path(round.id))
+        let response = get_round(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: Some(share_repo),
+                worker_repo: Some(worker_repo),
+                round_repo: Some(round_repo),
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Path(round.id),
+        )
         .await;
 
         let detail = match &response.0 {
@@ -211,13 +220,21 @@ mod tests {
         assert_eq!(detail.share_breakdown.len(), 2);
 
         // w1 has 3 accepted
-        let w1_row = detail.share_breakdown.iter().find(|w| w.worker_id == w1.id).unwrap();
+        let w1_row = detail
+            .share_breakdown
+            .iter()
+            .find(|w| w.worker_id == w1.id)
+            .unwrap();
         assert_eq!(w1_row.total_shares, 3);
         assert_eq!(w1_row.accepted_shares, 3);
         assert_eq!(w1_row.rejected_shares, 0);
 
         // w2 has 1 rejected
-        let w2_row = detail.share_breakdown.iter().find(|w| w.worker_id == w2.id).unwrap();
+        let w2_row = detail
+            .share_breakdown
+            .iter()
+            .find(|w| w.worker_id == w2.id)
+            .unwrap();
         assert_eq!(w2_row.total_shares, 1);
         assert_eq!(w2_row.accepted_shares, 0);
         assert_eq!(w2_row.rejected_shares, 1);
@@ -227,17 +244,20 @@ mod tests {
     async fn test_list_rounds_empty() {
         let stats = ServerStats::default();
         let params = ListRoundsParams { status: None };
-        let response = list_rounds(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: None,
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Query(params))
+        let response = list_rounds(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: None,
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Query(params),
+        )
         .await;
 
         assert!(response.is_empty());
@@ -255,17 +275,20 @@ mod tests {
 
         let stats = ServerStats::default();
         let params = ListRoundsParams { status: None };
-        let response = list_rounds(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: Some(round_repo),
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Query(params))
+        let response = list_rounds(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: Some(round_repo),
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Query(params),
+        )
         .await;
 
         assert_eq!(response.len(), 1);
@@ -286,35 +309,45 @@ mod tests {
         let stats = ServerStats::default();
 
         // Filter by 'open'
-        let params = ListRoundsParams { status: Some("open".to_string()) };
-        let open_rounds = list_rounds(State(AppState {
-            stats: Arc::new(RwLock::new(stats.clone())),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: Some(round_repo.clone()),
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Query(params))
+        let params = ListRoundsParams {
+            status: Some("open".to_string()),
+        };
+        let open_rounds = list_rounds(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats.clone())),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: Some(round_repo.clone()),
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Query(params),
+        )
         .await;
         assert_eq!(open_rounds.len(), 1);
         assert_eq!(open_rounds[0].start_template_id, "6");
 
         // Filter by 'found'
-        let params = ListRoundsParams { status: Some("found".to_string()) };
-        let found_rounds = list_rounds(State(AppState {
-            stats: Arc::new(RwLock::new(stats)),
-            share_repo: None,
-            worker_repo: None,
-            round_repo: Some(round_repo),
-            found_block_repo: None,
-            payout_repo: None,
-            accounting_service: None,
-            payout_config: None,
-            api_token: "test".to_string(),
-        }), Query(params))
+        let params = ListRoundsParams {
+            status: Some("found".to_string()),
+        };
+        let found_rounds = list_rounds(
+            State(AppState {
+                stats: Arc::new(RwLock::new(stats)),
+                share_repo: None,
+                worker_repo: None,
+                round_repo: Some(round_repo),
+                found_block_repo: None,
+                payout_repo: None,
+                accounting_service: None,
+                payout_config: None,
+                api_token: "test".to_string(),
+            }),
+            Query(params),
+        )
         .await;
         assert_eq!(found_rounds.len(), 1);
         assert_eq!(found_rounds[0].start_template_id, "1");

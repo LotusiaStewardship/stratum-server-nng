@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use rusqlite::{params, Connection};
+use std::sync::Arc;
 
 /// A block found by the pool, submitted to lotusd and tracked through its lifecycle.
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl FoundBlockRepository {
             "INSERT INTO found_blocks
              (round_id, block_hash, height, worker_id, template_id, persist_source, status,
               coinbase_value, network_target_hex)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'immature', ?7, ?8)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'immature', ?7, ?8)",
         )?;
         stmt.execute(params![
             round_id,
@@ -89,7 +89,7 @@ impl FoundBlockRepository {
     pub fn mark_orphaned(&self, block_hash: &str, reason: &str) -> Result<()> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "UPDATE found_blocks SET status = 'orphaned', orphan_reason = ?1 WHERE block_hash = ?2"
+            "UPDATE found_blocks SET status = 'orphaned', orphan_reason = ?1 WHERE block_hash = ?2",
         )?;
         stmt.execute(params![reason, block_hash])?;
         Ok(())
@@ -102,7 +102,7 @@ impl FoundBlockRepository {
             "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                     persist_source, orphan_reason, matured_at,
                     coinbase_value, coinbase_txid, network_target_hex
-             FROM found_blocks WHERE block_hash = ?1"
+             FROM found_blocks WHERE block_hash = ?1",
         )?;
         let block = stmt.query_row(params![block_hash], |row| {
             Ok(FoundBlock {
@@ -114,7 +114,10 @@ impl FoundBlockRepository {
                 worker_id: row.get(5)?,
                 template_id: {
                     let tid: Option<i64> = row.get(6)?;
-                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    debug_assert!(
+                        tid.map_or(true, |v| v >= 0),
+                        "template_id must be non-negative"
+                    );
                     tid.map(|v| v as u64)
                 },
                 persist_source: row.get(7)?,
@@ -156,7 +159,10 @@ impl FoundBlockRepository {
                 worker_id: row.get(5)?,
                 template_id: {
                     let tid: Option<i64> = row.get(6)?;
-                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    assert!(
+                        tid.map_or(true, |v| v >= 0),
+                        "template_id must be non-negative"
+                    );
                     tid.map(|v| v as u64)
                 },
                 persist_source: row.get(7)?,
@@ -164,7 +170,7 @@ impl FoundBlockRepository {
                 matured_at: row.get(9)?,
                 coinbase_value: {
                     let cv: i64 = row.get(10)?;
-                    debug_assert!(cv >= 0, "coinbase_value must be non-negative");
+                    assert!(cv >= 0, "coinbase_value must be non-negative");
                     cv as u64
                 },
                 coinbase_txid: row.get(11)?,
@@ -181,8 +187,7 @@ impl FoundBlockRepository {
     /// Update the status of a found block.
     pub fn update_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("UPDATE found_blocks SET status = ?1 WHERE id = ?2")?;
+        let mut stmt = conn.prepare("UPDATE found_blocks SET status = ?1 WHERE id = ?2")?;
         stmt.execute(params![status, id])?;
         Ok(())
     }
@@ -190,8 +195,7 @@ impl FoundBlockRepository {
     /// Set the coinbase transaction ID for a found block.
     pub fn update_coinbase_txid(&self, id: i64, coinbase_txid: &str) -> Result<()> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("UPDATE found_blocks SET coinbase_txid = ?1 WHERE id = ?2")?;
+        let mut stmt = conn.prepare("UPDATE found_blocks SET coinbase_txid = ?1 WHERE id = ?2")?;
         stmt.execute(params![coinbase_txid, id])?;
         Ok(())
     }
@@ -218,7 +222,8 @@ impl FoundBlockRepository {
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                             persist_source, orphan_reason, matured_at,
                             coinbase_value, coinbase_txid, network_target_hex
-                     FROM found_blocks WHERE status = ?1 ORDER BY id DESC".to_string(),
+                     FROM found_blocks WHERE status = ?1 ORDER BY id DESC"
+                        .to_string(),
                     vec![Box::new(status.to_string())],
                 )
             } else {
@@ -226,7 +231,8 @@ impl FoundBlockRepository {
                     "SELECT id, round_id, block_hash, height, status, worker_id, template_id,
                             persist_source, orphan_reason, matured_at,
                             coinbase_value, coinbase_txid, network_target_hex
-                     FROM found_blocks ORDER BY id DESC".to_string(),
+                     FROM found_blocks ORDER BY id DESC"
+                        .to_string(),
                     vec![],
                 )
             };
@@ -244,7 +250,10 @@ impl FoundBlockRepository {
                 worker_id: row.get(5)?,
                 template_id: {
                     let tid: Option<i64> = row.get(6)?;
-                    debug_assert!(tid.map_or(true, |v| v >= 0), "template_id must be non-negative");
+                    assert!(
+                        tid.map_or(true, |v| v >= 0),
+                        "template_id must be non-negative"
+                    );
                     tid.map(|v| v as u64)
                 },
                 persist_source: row.get(7)?,
@@ -252,7 +261,7 @@ impl FoundBlockRepository {
                 matured_at: row.get(9)?,
                 coinbase_value: {
                     let cv: i64 = row.get(10)?;
-                    debug_assert!(cv >= 0, "coinbase_value must be non-negative");
+                    assert!(cv >= 0, "coinbase_value must be non-negative");
                     cv as u64
                 },
                 coinbase_txid: row.get(11)?,
@@ -301,7 +310,16 @@ mod tests {
         let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
 
         let block = repo
-            .record_found_block(1, "0000abc", 1292529, Some(42), Some(100), Some("json-rpc"), 5000000000, "0000000009d01000000000000000000000000000000000000000000000000000")
+            .record_found_block(
+                1,
+                "0000abc",
+                1292529,
+                Some(42),
+                Some(100),
+                Some("json-rpc"),
+                5000000000,
+                "0000000009d01000000000000000000000000000000000000000000000000000",
+            )
             .unwrap();
 
         assert_eq!(block.block_hash, "0000abc");

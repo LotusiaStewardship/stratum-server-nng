@@ -3,15 +3,15 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use bitcoinsuite_core::{
-    ecc::{Ecc, SecKey, PubKey},
-    BitcoinCode, BytesMut, Hashed, LotusAddress, OutPoint, Script, SequenceNo, Sha256d, SigHashType,
-    TxInput, TxOutput,
-    P2PKHSignatory, SignData, SignField, TxBuilder, TxBuilderInput, TxBuilderOutput,
+    ecc::{Ecc, PubKey, SecKey},
+    BitcoinCode, BytesMut, Hashed, LotusAddress, OutPoint, P2PKHSignatory, Script, SequenceNo,
+    Sha256d, SigHashType, SignData, SignField, TxBuilder, TxBuilderInput, TxBuilderOutput, TxInput,
+    TxOutput,
 };
 use bitcoinsuite_ecc_secp256k1::EccSecp256k1;
 
-use crate::node_integration::JsonRpcClient;
 use super::{SignedBatchData, Signer};
+use crate::node_integration::JsonRpcClient;
 
 /// Signer that builds, signs, and broadcasts payout transactions using an
 /// in-process private key.
@@ -33,7 +33,9 @@ impl InternalSigner {
     pub fn new(private_key: &str, rpc_client: Arc<JsonRpcClient>) -> Result<Self> {
         let parsed = SecKey::from_hex_or_wif(private_key)
             .map_err(|e| anyhow::anyhow!("invalid private key: {}", e))?;
-        let arr: [u8; 32] = parsed.as_slice().try_into()
+        let arr: [u8; 32] = parsed
+            .as_slice()
+            .try_into()
             .expect("SecKey::from_hex_or_wif always returns 32 bytes");
 
         let ecc = EccSecp256k1::default();
@@ -111,24 +113,20 @@ impl InternalSigner {
         // -- Miner payout outputs --
         for output in &data.plan.outputs {
             let addr_script = address_to_script(&output.payout_address)?;
-            builder
-                .outputs
-                .push(TxBuilderOutput::Fixed(TxOutput {
-                    value: output.amount,
-                    script: addr_script,
-                }));
+            builder.outputs.push(TxBuilderOutput::Fixed(TxOutput {
+                value: output.amount,
+                script: addr_script,
+            }));
         }
 
         // -- Pool fee output (if configured) --
         if let Some(ref fee_address) = data.plan.pool_fee_address {
             if data.plan.pool_fee_amount > 0 {
                 let fee_script = address_to_script(fee_address)?;
-                builder
-                    .outputs
-                    .push(TxBuilderOutput::Fixed(TxOutput {
-                        value: data.plan.pool_fee_amount,
-                        script: fee_script,
-                    }));
+                builder.outputs.push(TxBuilderOutput::Fixed(TxOutput {
+                    value: data.plan.pool_fee_amount,
+                    script: fee_script,
+                }));
             }
         }
 
@@ -150,8 +148,8 @@ mod tests {
     use crate::node_integration::JsonRpcClient;
     use crate::payout::plan::PayoutPlan;
     use serde_json::json;
-    use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     /// Helper: spawn a mock JSON-RPC server that returns a canned response.
     /// Returns the URL and a shared buffer capturing the request body.
@@ -249,11 +247,7 @@ mod tests {
         }))
         .await;
 
-        let rpc_client = Arc::new(JsonRpcClient::new(
-            &url,
-            "lotus",
-            "lotus",
-        ));
+        let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
 
         let signer = InternalSigner::new(
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -262,32 +256,34 @@ mod tests {
         .expect("InternalSigner construction should succeed");
 
         let data = test_signed_batch_data();
-        let txid = signer.sign_and_submit(&data).await
+        let txid = signer
+            .sign_and_submit(&data)
+            .await
             .expect("sign_and_submit should succeed");
 
         assert_eq!(txid, expected_txid, "should return txid from RPC response");
 
         // Verify the mock RPC received a sendrawtransaction call with valid hex
-        let captured_body = captured.lock().unwrap().take()
+        let captured_body = captured
+            .lock()
+            .unwrap()
+            .take()
             .expect("mock RPC should have received a request");
         assert!(
             captured_body.contains("sendrawtransaction"),
             "RPC call should be sendrawtransaction"
         );
-        assert!(
-            captured_body.contains("params"),
-            "should have params"
-        );
+        assert!(captured_body.contains("params"), "should have params");
 
         // Verify the sent hex is a valid serialized transaction by checking
         // it starts with the version field (02000000 for version 2)
-        let captured_json: serde_json::Value = serde_json::from_str(
-            extract_json_body(&captured_body).unwrap_or("{}")
-        ).unwrap_or_default();
-        let params = captured_json["params"].as_array()
+        let captured_json: serde_json::Value =
+            serde_json::from_str(extract_json_body(&captured_body).unwrap_or("{}"))
+                .unwrap_or_default();
+        let params = captured_json["params"]
+            .as_array()
             .expect("params should be an array");
-        let tx_hex = params[0].as_str()
-            .expect("first param should be tx hex");
+        let tx_hex = params[0].as_str().expect("first param should be tx hex");
         assert!(!tx_hex.is_empty(), "tx hex should not be empty");
         // Version 2 serialized in little-endian = "02000000"
         assert!(
@@ -315,11 +311,7 @@ mod tests {
         }))
         .await;
 
-        let rpc_client = Arc::new(JsonRpcClient::new(
-            &url,
-            "lotus",
-            "lotus",
-        ));
+        let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
 
         // Testnet WIF private key (from bitcoinsuite-core test fixture)
         let wif_key = "cPymiBZp9Ak8aVAmrnh8TL8E4yoibD61KE7weuhXNbaMsJt2murF";
@@ -327,31 +319,33 @@ mod tests {
             .expect("InternalSigner construction should succeed with WIF key");
 
         let data = test_signed_batch_data();
-        let txid = signer.sign_and_submit(&data).await
+        let txid = signer
+            .sign_and_submit(&data)
+            .await
             .expect("sign_and_submit should succeed with WIF-derived key");
 
         assert_eq!(txid, expected_txid, "should return txid from RPC response");
 
         // Verify the mock RPC received a sendrawtransaction call
-        let captured_body = captured.lock().unwrap().take()
+        let captured_body = captured
+            .lock()
+            .unwrap()
+            .take()
             .expect("mock RPC should have received a request");
         assert!(
             captured_body.contains("sendrawtransaction"),
             "RPC call should be sendrawtransaction"
         );
-        assert!(
-            captured_body.contains("params"),
-            "should have params"
-        );
+        assert!(captured_body.contains("params"), "should have params");
 
         // Verify the tx hex is valid
-        let captured_json: serde_json::Value = serde_json::from_str(
-            extract_json_body(&captured_body).unwrap_or("{}")
-        ).unwrap_or_default();
-        let params = captured_json["params"].as_array()
+        let captured_json: serde_json::Value =
+            serde_json::from_str(extract_json_body(&captured_body).unwrap_or("{}"))
+                .unwrap_or_default();
+        let params = captured_json["params"]
+            .as_array()
             .expect("params should be an array");
-        let tx_hex = params[0].as_str()
-            .expect("first param should be tx hex");
+        let tx_hex = params[0].as_str().expect("first param should be tx hex");
         assert!(
             tx_hex.starts_with("02000000"),
             "tx hex should start with version=2 (02000000), got: {}...",

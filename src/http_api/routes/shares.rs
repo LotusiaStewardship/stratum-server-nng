@@ -1,11 +1,11 @@
+use crate::http_api::pagination::{PaginatedResponse, PaginationParams};
+use crate::http_api::server::AppError;
+use crate::http_api::server::AppState;
 use axum::{
     extract::{Query, State},
     response::Json,
 };
 use serde::Serialize;
-use crate::http_api::pagination::{PaginationParams, PaginatedResponse};
-use crate::http_api::server::AppError;
-use crate::http_api::server::AppState;
 
 #[derive(Serialize)]
 pub struct ShareResponse {
@@ -93,7 +93,12 @@ pub async fn list_shares(
         .collect();
 
     let total = repo
-        .count_shares(params.worker_id, params.status.as_deref(), params.from.as_deref(), params.to.as_deref())
+        .count_shares(
+            params.worker_id,
+            params.status.as_deref(),
+            params.from.as_deref(),
+            params.to.as_deref(),
+        )
         .unwrap_or(all.len() as i64);
 
     Ok(Json(PaginatedResponse::new(all, total, &pagination)))
@@ -135,7 +140,12 @@ pub async fn list_share_outcomes(
         .collect();
 
     let total = repo
-        .count_outcomes(params.worker_id, params.status.as_deref(), params.from.as_deref(), params.to.as_deref())
+        .count_outcomes(
+            params.worker_id,
+            params.status.as_deref(),
+            params.from.as_deref(),
+            params.to.as_deref(),
+        )
         .unwrap_or(all.len() as i64);
 
     Ok(Json(PaginatedResponse::new(all, total, &pagination)))
@@ -184,9 +194,7 @@ mod tests {
             limit: None,
             offset: None,
         };
-        let response = list_shares(State(state), Query(params))
-            .await
-            .unwrap();
+        let response = list_shares(State(state), Query(params)).await.unwrap();
         assert!(response.data.is_empty());
         assert_eq!(response.total, 0);
     }

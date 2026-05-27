@@ -68,14 +68,17 @@ pub fn build_payout_plan(
     let mut work_by_addr: std::collections::BTreeMap<String, (i64, f64)> = BTreeMap::new();
     // worker_id is the first share's worker_id for this address (they should all be the same)
     for share in shares {
-        let entry = work_by_addr.entry(share.payout_address.clone()).or_insert_with(|| {
-            (share.worker_id, 0.0)
-        });
+        let entry = work_by_addr
+            .entry(share.payout_address.clone())
+            .or_insert_with(|| (share.worker_id, 0.0));
         entry.1 += share.difficulty;
     }
 
     // 2. Add existing dust as bonus weight
-    let dust_map: std::collections::HashMap<&str, i64> = dust_balances.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+    let dust_map: std::collections::HashMap<&str, i64> = dust_balances
+        .iter()
+        .map(|(a, b)| (a.as_str(), *b))
+        .collect();
     for (addr, (_worker_id, work_units)) in work_by_addr.iter_mut() {
         if let Some(dust) = dust_map.get(addr.as_str()) {
             // Dust is converted to fractional work units proportional to the gross_reward.
@@ -131,7 +134,11 @@ pub fn build_payout_plan(
         let mut remainder = net_reward - allocated_sum;
 
         // Sort by fractional part descending for remainder distribution
-        allocs.sort_by(|a, b| b.fractional.partial_cmp(&a.fractional).unwrap_or(std::cmp::Ordering::Equal));
+        allocs.sort_by(|a, b| {
+            b.fractional
+                .partial_cmp(&a.fractional)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for alloc in &mut allocs {
             if remainder <= 0 {
                 break;
@@ -209,10 +216,16 @@ mod tests {
     fn test_simple_50_50_split_no_fee() {
         let shares = vec![make_share(1, "addr1", 10.0), make_share(2, "addr2", 10.0)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
+            1,
+            1000,
+            "blockhash",
+            100.0,
             100000, // 1000 sat gross
             0,      // 0 bps fee
-            None, 546, &[], &shares,
+            None,
+            546,
+            &[],
+            &shares,
         );
         assert_eq!(plan.pool_fee_amount, 0);
         assert_eq!(plan.outputs.len(), 2);
@@ -225,10 +238,16 @@ mod tests {
     fn test_fee_deduction_100_bps() {
         let shares = vec![make_share(1, "addr1", 10.0)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
+            1,
+            1000,
+            "blockhash",
+            100.0,
             100000, // 1000 sat gross
             100,    // 1% fee
-            None, 546, &[], &shares,
+            None,
+            546,
+            &[],
+            &shares,
         );
         assert_eq!(plan.pool_fee_amount, 1000); // 100000 * 100 / 10000 = 1000
         assert_eq!(plan.outputs.len(), 1);
@@ -239,14 +258,25 @@ mod tests {
     fn test_fee_output_with_fee_address() {
         let shares = vec![make_share(1, "addr1", 10.0)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            100000, 100,
-            Some("fee_addr"), 546, &[], &shares,
+            1,
+            1000,
+            "blockhash",
+            100.0,
+            100000,
+            100,
+            Some("fee_addr"),
+            546,
+            &[],
+            &shares,
         );
         // Fee is tracked on the plan, not in outputs
         assert_eq!(plan.pool_fee_amount, 1000);
         assert_eq!(plan.pool_fee_address.as_deref(), Some("fee_addr"));
-        assert_eq!(plan.outputs.len(), 1, "outputs should contain only the miner payout");
+        assert_eq!(
+            plan.outputs.len(),
+            1,
+            "outputs should contain only the miner payout"
+        );
     }
 
     #[test]
@@ -259,10 +289,7 @@ mod tests {
             make_share(2, "addr2", 3.0),
             make_share(3, "addr3", 2.0),
         ];
-        let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            11, 0, None, 1, &[], &shares,
-        );
+        let plan = build_payout_plan(1, 1000, "blockhash", 100.0, 11, 0, None, 1, &[], &shares);
         assert_eq!(plan.outputs.len(), 3);
         let total: i64 = plan.outputs.iter().map(|o| o.amount).sum();
         assert_eq!(total, 11, "remainder satoshis must sum to gross");
@@ -276,15 +303,25 @@ mod tests {
     fn test_dust_filtering_below_min_payout() {
         let shares = vec![make_share(1, "addr1", 10.0), make_share(2, "addr2", 0.1)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            1000, 0, None,
+            1,
+            1000,
+            "blockhash",
+            100.0,
+            1000,
+            0,
+            None,
             500, // min payout = 500 sat
-            &[], &shares,
+            &[],
+            &shares,
         );
         // addr1 gets most (should be >= 500)
         // addr2 gets very little (< 500) -> becomes dust
         assert!(plan.dust_carried_forward_total > 0);
-        let addr2_output = plan.outputs.iter().find(|o| o.payout_address == "addr2").unwrap();
+        let addr2_output = plan
+            .outputs
+            .iter()
+            .find(|o| o.payout_address == "addr2")
+            .unwrap();
         assert_eq!(addr2_output.amount, 0, "addr2 output should be dusted to 0");
         assert!(addr2_output.dust_carried_forward > 0);
     }
@@ -294,9 +331,16 @@ mod tests {
         let shares = vec![make_share(1, "addr1", 10.0)];
         let dust = vec![("addr1".to_string(), 500)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            10000, 0, None, 1,
-            &dust, &shares,
+            1,
+            1000,
+            "blockhash",
+            100.0,
+            10000,
+            0,
+            None,
+            1,
+            &dust,
+            &shares,
         );
         // Dust carry-forward should affect the plan but total should still sum to gross
         // Dust weight gives a tiny bonus but should not break total
@@ -306,10 +350,7 @@ mod tests {
 
     #[test]
     fn test_zero_work_units_returns_empty_outputs() {
-        let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            100000, 0, None, 546, &[], &[],
-        );
+        let plan = build_payout_plan(1, 1000, "blockhash", 100.0, 100000, 0, None, 546, &[], &[]);
         assert!(plan.outputs.is_empty());
         assert_eq!(plan.total_work_units, 0.0);
     }
@@ -318,9 +359,16 @@ mod tests {
     fn test_single_miner_gets_all_net() {
         let shares = vec![make_share(1, "addr1", 42.0)];
         let plan = build_payout_plan(
-            1, 1000, "blockhash", 100.0,
-            50000, 200, // 2% fee
-            None, 546, &[], &shares,
+            1,
+            1000,
+            "blockhash",
+            100.0,
+            50000,
+            200, // 2% fee
+            None,
+            546,
+            &[],
+            &shares,
         );
         assert_eq!(plan.pool_fee_amount, 1000); // 50000 * 200 / 10000 = 1000
         assert_eq!(plan.outputs[0].amount, 49000); // 50000 - 1000
