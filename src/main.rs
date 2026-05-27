@@ -18,6 +18,7 @@ use stratum_server_nng::payout::handler::PayoutHandler;
 use stratum_server_nng::payout::signer::{
     external::ExternalSigner, internal::InternalSigner, Signer,
 };
+use stratum_server_nng::payout::PayoutEvent;
 use stratum_server_nng::shutdown::ShutdownCoordinator;
 use stratum_server_nng::stratum_protocol::server::StratumServer;
 
@@ -235,7 +236,7 @@ async fn main() -> Result<()> {
 
     // Create shared chain tip tracker and maturation event channel
     let chain_tip = ChainTip::new(0);
-    let (maturation_tx, maturation_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (maturation_tx, maturation_rx) = tokio::sync::mpsc::unbounded_channel::<PayoutEvent>();
 
     // Start NNG pub/sub event consumer (template refresh, reorg detection, maturation)
     let consumer_shutdown_rx = shutdown_tx.subscribe();
@@ -282,7 +283,7 @@ async fn main() -> Result<()> {
                                 height = block.height,
                                 "block matured during startup reconciliation",
                             );
-                            let _ = maturation_tx.send(block.block_hash.clone());
+                            let _ = maturation_tx.send(PayoutEvent::BlockMatured(block.block_hash.clone()));
                         }
                     }
                     Err(e) => {

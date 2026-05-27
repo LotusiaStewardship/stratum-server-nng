@@ -3,6 +3,19 @@ pub mod plan;
 pub mod pplns;
 pub mod signer;
 
+/// Events delivered from the Node Integration context to the Payout context
+/// through the maturation channel.
+///
+/// - `BlockMatured(hash)`: a pool block reached maturity depth — create
+///   a payout batch for it.
+/// - `BlockConnected`: a new block arrived on the chain — retry any
+///   pending (failed) payout submissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayoutEvent {
+    BlockMatured(String),
+    BlockConnected,
+}
+
 /// Given the total coinbase value (subsidy + fees), compute the pool's
 /// actual spendable reward after minerfund deduction.
 ///

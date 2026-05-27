@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::accounting::{AccountingEvent, AccountingService, ChainTip};
 use crate::node_integration::{template_to_job, JobCache, NngRpcClient};
+use crate::payout::PayoutEvent;
 use crate::stratum_protocol::job::MiningJob;
 use bitcoinsuite_core::{BitcoinCode, Bytes, Hashed, LotusHeader};
 
@@ -23,7 +24,7 @@ pub struct NngEventConsumer {
     accounting: Option<AccountingService>,
     job_tx: broadcast::Sender<Arc<MiningJob>>,
     chain_tip: ChainTip,
-    maturation_tx: mpsc::UnboundedSender<String>,
+    maturation_tx: mpsc::UnboundedSender<PayoutEvent>,
     min_confirmations: u64,
 }
 
@@ -36,7 +37,7 @@ impl NngEventConsumer {
         accounting: Option<AccountingService>,
         job_tx: broadcast::Sender<Arc<MiningJob>>,
         chain_tip: ChainTip,
-        maturation_tx: mpsc::UnboundedSender<String>,
+        maturation_tx: mpsc::UnboundedSender<PayoutEvent>,
         min_confirmations: u64,
     ) -> Result<Self> {
         let interface = PubInterface::open(pub_url)
@@ -298,7 +299,7 @@ pub(crate) async fn handle_block_connected(
     event: bitcoinsuite_bitcoind_nng::BlockConnected,
     accounting: &AccountingService,
     chain_tip: &ChainTip,
-    maturation_tx: &mpsc::UnboundedSender<String>,
+    maturation_tx: &mpsc::UnboundedSender<PayoutEvent>,
     min_confirmations: u64,
 ) {
     // Decode height from the serialized Lotus header
@@ -325,7 +326,7 @@ pub(crate) async fn handle_block_connected(
                     height = matured.height,
                     "block matured via blkconnected event",
                 );
-                let _ = maturation_tx.send(matured.block_hash.clone());
+                let _ = maturation_tx.send(PayoutEvent::BlockMatured(matured.block_hash.clone()));
             }
         }
         Err(e) => {
@@ -335,6 +336,10 @@ pub(crate) async fn handle_block_connected(
             );
         }
     }
+
+    // Always send a BlockConnected signal so the payout handler retries
+    // any pending (failed) payout submissions on every new block.
+    let _ = maturation_tx.send(PayoutEvent::BlockConnected);
 }
 
 /// Coalesce rapid miningwrkchg events.
@@ -692,7 +697,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
         let chain_tip = ChainTip::new(0);
-        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<String>();
+        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
 
         let event = make_block_connected(500);
         handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
@@ -707,7 +712,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
         let chain_tip = ChainTip::new(0);
-        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<String>();
+        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
 
         // Record a found_block at height 100 (immature)
         let round = accounting.resolve_round_for_template(42).unwrap();
@@ -728,7 +733,51 @@ mod tests {
             .await
             .expect("should receive maturation event")
             .expect("channel should not be closed");
-        assert_eq!(received, "block1");
+        assert_eq!(received, PayoutEvent::BlockMatured("block1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_sends_both_matured_and_connected() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
+
+        // Record a found_block at height 100 (immature)
+        let round = accounting.resolve_round_for_template(42).unwrap();
+        accounting
+            .record_found_block(
+                round.id, "block1", 100, None, Some(42), Some("json-rpc"), 50000,
+                "00000000ffff0000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+        // BlockConnected at height 200 → 101 confirmations → matures block1
+        let event = make_block_connected(200);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        // Should receive BlockMatured first, then BlockConnected
+        let first = tokio::time::timeout(Duration::from_millis(100), maturation_rx.recv())
+            .await
+            .expect("should receive first event")
+            .expect("channel should not be closed");
+        assert!(
+            matches!(&first, PayoutEvent::BlockMatured(h) if h == "block1"),
+            "expected BlockMatured first, got: {:?}",
+            first,
+        );
+
+        let second = tokio::time::timeout(Duration::from_millis(100), maturation_rx.recv())
+            .await
+            .expect("should receive second event")
+            .expect("channel should not be closed");
+        assert!(
+            matches!(second, PayoutEvent::BlockConnected),
+            "expected BlockConnected second, got: {:?}",
+            second,
+        );
     }
 
     #[tokio::test]
@@ -743,7 +792,7 @@ mod tests {
         );
         let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
         let chain_tip = ChainTip::new(0);
-        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<String>();
+        let (maturation_tx, mut maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
 
         // BlockConnected at a high height with no pool blocks in DB
         let event = make_block_connected(99999);
@@ -752,8 +801,14 @@ mod tests {
         // Chain tip should still advance
         assert_eq!(chain_tip.get(), 99999);
 
-        // No maturation events should be sent
+        // Should receive a BlockConnected signal (every blkconnected triggers retry)
         let result = tokio::time::timeout(Duration::from_millis(50), maturation_rx.recv()).await;
-        assert!(result.is_err(), "no maturation event should be sent for non-pool blocks");
+        match result {
+            Ok(Some(PayoutEvent::BlockConnected)) => { /* expected */ }
+            other => panic!(
+                "expected BlockConnected signal, got: {:?}",
+                other,
+            ),
+        }
     }
 }
