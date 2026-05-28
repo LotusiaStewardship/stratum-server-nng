@@ -307,7 +307,11 @@ async fn main() -> Result<()> {
                 let key = config.pool.signing.private_key.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("pool.signing.private_key required for internal signing mode")
                 })?;
-                Arc::new(InternalSigner::new(key, json_rpc_client.clone())?)
+                Arc::new(InternalSigner::new(
+                    key,
+                    json_rpc_client.clone(),
+                    config.pool.signing.tx_fee_per_kb,
+     )?)
             }
             "external" => {
                 let url = config.pool.signing.webhook_url.as_deref().ok_or_else(|| {

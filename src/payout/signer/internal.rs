@@ -23,6 +23,7 @@ pub struct InternalSigner {
     seckey: SecKey,
     pubkey: PubKey,
     rpc_client: Arc<JsonRpcClient>,
+    tx_fee_per_kb: i64,
 }
 
 impl InternalSigner {
@@ -30,7 +31,12 @@ impl InternalSigner {
     ///
     /// `private_key` — 32-byte hex string (64 chars) or WIF-encoded secret key.
     /// `rpc_client` — shared JSON-RPC client for broadcasting.
-    pub fn new(private_key: &str, rpc_client: Arc<JsonRpcClient>) -> Result<Self> {
+    /// `tx_fee_per_kb` — fee rate in sat/kB for payout transactions.
+    pub fn new(
+        private_key: &str,
+        rpc_client: Arc<JsonRpcClient>,
+        tx_fee_per_kb: i64,
+    ) -> Result<Self> {
         let parsed = SecKey::from_hex_or_wif(private_key)
             .map_err(|e| anyhow::anyhow!("invalid private key: {}", e))?;
         let arr: [u8; 32] = parsed
@@ -47,6 +53,7 @@ impl InternalSigner {
             seckey,
             pubkey,
             rpc_client,
+            tx_fee_per_kb,
         })
     }
 }
@@ -59,7 +66,7 @@ impl Signer for InternalSigner {
         // Build and sign the payout transaction
         let tx_builder = self.build_payout_tx(data)?;
         let signed_tx = tx_builder
-            .sign(&ecc, 0, 546)
+            .sign(&ecc, self.tx_fee_per_kb, 546)
             .map_err(|e| anyhow::anyhow!("transaction signing failed: {}", e))?;
 
         // Serialize to hex
@@ -119,14 +126,12 @@ impl InternalSigner {
             }));
         }
 
-        // -- Pool fee output (if configured) --
+        // -- Pool fee output (if configured) — use Leftover so TxBuilder
+        // deducts the transaction fee from the pool's share.
         if let Some(ref fee_address) = data.plan.pool_fee_address {
             if data.plan.pool_fee_amount > 0 {
                 let fee_script = address_to_script(fee_address)?;
-                builder.outputs.push(TxBuilderOutput::Fixed(TxOutput {
-                    value: data.plan.pool_fee_amount,
-                    script: fee_script,
-                }));
+                builder.outputs.push(TxBuilderOutput::Leftover(fee_script));
             }
         }
 
@@ -252,6 +257,7 @@ mod tests {
         let signer = InternalSigner::new(
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             rpc_client,
+            1000,
         )
         .expect("InternalSigner construction should succeed");
 
@@ -315,7 +321,7 @@ mod tests {
 
         // Testnet WIF private key (from bitcoinsuite-core test fixture)
         let wif_key = "cPymiBZp9Ak8aVAmrnh8TL8E4yoibD61KE7weuhXNbaMsJt2murF";
-        let signer = InternalSigner::new(wif_key, rpc_client)
+        let signer = InternalSigner::new(wif_key, rpc_client, 1000)
             .expect("InternalSigner construction should succeed with WIF key");
 
         let data = test_signed_batch_data();
@@ -364,7 +370,7 @@ mod tests {
         let (url, _captured) = spawn_mock_rpc(json!(null)).await;
         let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
 
-        let result = InternalSigner::new("not-a-valid-key", rpc_client);
+        let result = InternalSigner::new("not-a-valid-key", rpc_client, 1000);
         match result {
             Ok(_) => panic!("InternalSigner should reject garbage input"),
             Err(err) => {

@@ -179,6 +179,10 @@ pub struct SigningSettings {
     /// Webhook URL for external signing mode.
     /// Required when mode = "external".
     pub webhook_url: Option<String>,
+    /// Transaction fee rate in satoshis per kilobyte for payout txs.
+    /// Default: 1000 (1 sat/vByte, standard relay minimum).
+    #[serde(default = "default_tx_fee_per_kb")]
+    pub tx_fee_per_kb: i64,
 }
 
 impl Default for SigningSettings {
@@ -187,6 +191,7 @@ impl Default for SigningSettings {
             mode: default_signing_mode(),
             private_key: None,
             webhook_url: None,
+            tx_fee_per_kb: default_tx_fee_per_kb(),
         }
     }
 }
@@ -353,6 +358,10 @@ fn default_banning_invalid_percent() -> f64 {
 
 fn default_signing_mode() -> String {
     "internal".to_string()
+}
+
+fn default_tx_fee_per_kb() -> i64 {
+    1000
 }
 
 impl Config {
