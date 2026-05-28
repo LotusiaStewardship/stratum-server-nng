@@ -66,7 +66,7 @@ impl Signer for InternalSigner {
         // Build and sign the payout transaction
         let tx_builder = self.build_payout_tx(data)?;
         let signed_tx = tx_builder
-            .sign(&ecc, self.tx_fee_per_kb, 546)
+            .sign(&ecc, self.tx_fee_per_kb, crate::constants::DUST_LIMIT)
             .map_err(|e| anyhow::anyhow!("transaction signing failed: {}", e))?;
 
         // Serialize to hex

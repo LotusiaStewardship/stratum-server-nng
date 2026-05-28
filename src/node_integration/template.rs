@@ -180,7 +180,7 @@ pub fn verify_coinbase_outputs(template: &MiningTemplate) -> Result<(), String> 
         Err(format!(
             "all {} output(s) ({:.8} total) are OP_RETURN or zero-valued — block reward will be BURNED",
             outputs.len(),
-            total_output_value as f64 / 1e8,
+            total_output_value as f64 / crate::constants::SATS_PER_XPI_F64,
         ))
     } else {
         Ok(())

@@ -337,7 +337,7 @@ fn default_pplns_n_multiplier() -> f64 {
     2.0
 }
 fn default_pplns_min_payout_sat() -> i64 {
-    546
+    crate::constants::DUST_LIMIT
 }
 fn default_pplns_payout_enabled() -> bool {
     true
@@ -361,7 +361,7 @@ fn default_signing_mode() -> String {
 }
 
 fn default_tx_fee_per_kb() -> i64 {
-    1000
+    crate::constants::DEFAULT_TX_FEE_PER_KB
 }
 
 impl Config {

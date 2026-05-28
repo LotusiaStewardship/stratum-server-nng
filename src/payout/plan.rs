@@ -366,7 +366,7 @@ mod tests {
             50000,
             200, // 2% fee
             None,
-            546,
+            crate::constants::DUST_LIMIT,
             &[],
             &shares,
         );

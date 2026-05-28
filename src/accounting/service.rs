@@ -310,7 +310,8 @@ impl AccountingService {
         use crate::payout::pplns::calculate_pplns_window;
         use crate::share_processing::network_target_hex_to_difficulty;
 
-        // 1. Read the coinbase_value and network difficulty from the found_block
+        // NNG raw coinbase_value (u64) → CAmount/i64 (lotusd monetary domain).
+        // Safety: Lotus coinbase values are < 10^12 satoshis, well below i64::MAX.
         // The coinbase_value is the total block reward (subsidy + fees), but the
         // miner only receives the portion remaining after minerfund deduction.
         // See payout::reward_from_coinbase for the mirror of lotusd's split logic.
@@ -605,12 +606,12 @@ impl AccountingService {
                             continue;
                         }
                     };
-                    let value_btc = vout["value"].as_f64().unwrap_or(0.0);
+                    let value_xpi = vout["value"].as_f64().unwrap_or(0.0);
                     let script = vout["scriptPubKey"]["hex"]
                         .as_str()
                         .unwrap_or("")
                         .to_string();
-                    let amount_sat = (value_btc * 100_000_000.0) as i64;
+                    let amount_sat = (value_xpi * crate::constants::SATS_PER_XPI_F64) as i64;
                     (amount_sat, vout_idx as u32, script)
                 }
                 Err(e) => {
