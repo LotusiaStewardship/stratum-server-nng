@@ -316,6 +316,23 @@ impl PayoutRepository {
         Ok(count)
     }
 
+    /// Delete all payouts for a batch (used before rebuilding).
+    pub fn delete_payouts_by_batch(&self, batch_id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM payouts WHERE batch_id = ?1", params![batch_id])?;
+        Ok(())
+    }
+
+    /// Delete all share snapshots for a batch (used before rebuilding).
+    pub fn delete_snapshots_by_batch(&self, batch_id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM payout_share_snapshots WHERE batch_id = ?1",
+            params![batch_id],
+        )?;
+        Ok(())
+    }
+
     /// Get share snapshots for a payout batch.
     pub fn get_snapshots_by_batch(&self, batch_id: i64) -> Result<Vec<PayoutShareSnapshot>> {
         let conn = self.conn.lock();
@@ -470,6 +487,58 @@ mod tests {
         assert_eq!(payouts.len(), 2);
         assert_eq!(payouts[0].amount, 60000);
         assert_eq!(payouts[1].amount, 39000);
+    }
+
+    #[test]
+    fn test_delete_payouts_and_snapshots_by_batch() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 42);
+        create_worker(&conn, 10, "addr1");
+        // Create share and share_outcome rows for snapshot FK
+        conn.execute(
+            "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                 extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+             VALUES (1, 10, 's1', 'j1', 1, 1, 'e1', 'e2', 'ntime', 'nonce', 1.0, 'dk1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id,
+                                          dedupe_key, status, low_diff_ok, network_target_ok)
+             VALUES (1, 1, 's1', 10, 'j1', 1, 'dk1', 'accepted', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
+
+        let batch = repo
+            .create_payout_batch(1, 100000, 1000, None, 1, "hash:1")
+            .unwrap();
+
+        // Record a payout and a snapshot
+        repo.record_payout(batch.id, 10, "addr1", 50000, 0).unwrap();
+        repo.snapshot_shares(&[PayoutShareSnapshot {
+            id: 0,
+            batch_id: batch.id,
+            share_id: 1,
+            share_outcome_id: 1,
+            payout_address: "addr1".to_string(),
+            work_units: 10.0,
+            share_created_at: "2026-01-01T00:00:00".to_string(),
+        }])
+        .unwrap();
+
+        assert_eq!(repo.get_payouts_by_batch(batch.id).unwrap().len(), 1);
+        assert_eq!(repo.get_snapshots_by_batch(batch.id).unwrap().len(), 1);
+
+        // Delete and verify
+        repo.delete_payouts_by_batch(batch.id).unwrap();
+        repo.delete_snapshots_by_batch(batch.id).unwrap();
+
+        assert_eq!(repo.get_payouts_by_batch(batch.id).unwrap().len(), 0);
+        assert_eq!(repo.get_snapshots_by_batch(batch.id).unwrap().len(), 0);
     }
 
     #[test]

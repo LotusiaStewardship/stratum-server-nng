@@ -1,6 +1,7 @@
 use crate::accounting_error;
 use crate::accounting_info;
 use crate::accounting_warn;
+use crate::payout_info;
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -522,11 +523,229 @@ impl AccountingService {
         }
     }
 
+    /// Rebuild a payout batch's miner payouts and share snapshots from the
+    /// original PPLNS window data. This is a recovery path for cases where
+    /// payouts were accidentally deleted from the DB.
+    ///
+    /// The rebuild re-runs `calculate_pplns_window` and `build_payout_plan`,
+    /// then atomically replaces the batch's payouts and snapshots with fresh
+    /// data. The batch status must be `pending` — already-submitted batches
+    /// cannot be rebuilt (their tx is on-chain).
+    ///
+    /// Uses current `dust_balances`, which may include dust carried forward
+    /// from the original plan. This means the miner receives a negligibly
+    /// larger weight (a few extra satoshis) — an acceptable overpayment.
+    pub fn rebuild_payout_plan_for_batch(
+        &self,
+        batch_id: i64,
+        fee_bps: u32,
+        fee_address: Option<&str>,
+        min_payout_sat: i64,
+        n_multiplier: f64,
+    ) -> Result<Vec<crate::payout::plan::PayoutOutput>> {
+        use crate::payout::plan::build_payout_plan;
+        use crate::payout::pplns::calculate_pplns_window;
+        use crate::share_processing::network_target_hex_to_difficulty;
+
+        // 1. Load batch — verify status
+        let batch = self
+            .payout_repo
+            .get_batch_by_id(batch_id)?
+            .ok_or_else(|| anyhow::anyhow!("batch {} not found", batch_id))?;
+        if batch.status != "pending" {
+            anyhow::bail!(
+                "batch {} status is '{}', only pending batches can be rebuilt",
+                batch_id,
+                batch.status,
+            );
+        }
+
+        // 2. Load found_block
+        let found_block = self
+            .found_block_repo
+            .get_by_round_id(batch.round_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no found_block for round {}",
+                    batch.round_id
+                )
+            })?;
+
+        // 3. Compute gross_reward and network_difficulty
+        let gross_reward = crate::payout::reward_from_coinbase(found_block.coinbase_value);
+        let network_difficulty =
+            network_target_hex_to_difficulty(&found_block.network_target_hex).unwrap_or(1.0);
+
+        let conn = self.conn.lock();
+
+        // 4. Find the found_at timestamp
+        let found_at: String = {
+            let mut stmt = conn.prepare(
+                "SELECT so.created_at
+                 FROM share_outcomes so
+                 WHERE so.block_hash = ?1
+                   AND so.status = 'accepted'
+                   AND so.network_target_ok = 1
+                 LIMIT 1",
+            )?;
+            stmt.query_row(rusqlite::params![&found_block.block_hash], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "no accepted share_outcome with network_target_ok=1 for block hash {}: {}",
+                    found_block.block_hash,
+                    e,
+                )
+            })?
+        };
+
+        // 5. Recalculate PPLNS window
+        let shares = calculate_pplns_window(&conn, &found_at, n_multiplier, network_difficulty)?;
+        if shares.is_empty() {
+            anyhow::bail!(
+                "PPLNS window is empty for round {} — cannot rebuild payout plan",
+                found_block.round_id,
+            );
+        }
+
+        // 6. Read dust balances
+        let dust_balances: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT payout_address, balance FROM dust_balances",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        // 7. Build plan
+        let plan = build_payout_plan(
+            found_block.round_id,
+            found_block.height,
+            &found_block.block_hash,
+            network_difficulty,
+            gross_reward,
+            fee_bps,
+            fee_address,
+            min_payout_sat,
+            &dust_balances,
+            &shares,
+        );
+
+        if plan.outputs.is_empty() {
+            anyhow::bail!(
+                "rebuild produced empty outputs for batch {} — cannot proceed",
+                batch_id,
+            );
+        }
+
+        // 8. Atomically: delete old + insert new
+        conn.execute_batch("BEGIN TRANSACTION")?;
+        let result = (|| -> Result<Vec<crate::payout::plan::PayoutOutput>> {
+            // Delete old payouts and snapshots
+            conn.execute(
+                "DELETE FROM payouts WHERE batch_id = ?1",
+                rusqlite::params![batch_id],
+            )?;
+            conn.execute(
+                "DELETE FROM payout_share_snapshots WHERE batch_id = ?1",
+                rusqlite::params![batch_id],
+            )?;
+
+            // Re-insert payouts and build snapshots
+            let mut snapshots = Vec::new();
+            let mut payout_stmt = conn.prepare(
+                "INSERT INTO payouts (batch_id, worker_id, payout_address, amount, dust_carried_forward)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for output in &plan.outputs {
+                payout_stmt.execute(rusqlite::params![
+                    batch_id,
+                    output.worker_id,
+                    &output.payout_address,
+                    output.amount,
+                    output.dust_carried_forward,
+                ])?;
+
+                for share in &shares {
+                    if share.payout_address == output.payout_address {
+                        snapshots.push(crate::accounting::PayoutShareSnapshot {
+                            id: 0,
+                            batch_id,
+                            share_id: share.share_id,
+                            share_outcome_id: share.share_outcome_id,
+                            payout_address: share.payout_address.clone(),
+                            work_units: share.difficulty,
+                            share_created_at: share.created_at.clone(),
+                        });
+                    }
+                }
+            }
+
+            // Insert snapshots
+            if !snapshots.is_empty() {
+                let mut snap_stmt = conn.prepare(
+                    "INSERT INTO payout_share_snapshots
+                     (batch_id, share_id, share_outcome_id, payout_address, work_units, share_created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for snap in &snapshots {
+                    snap_stmt.execute(rusqlite::params![
+                        snap.batch_id,
+                        snap.share_id,
+                        snap.share_outcome_id,
+                        &snap.payout_address,
+                        snap.work_units,
+                        &snap.share_created_at,
+                    ])?;
+                }
+            }
+
+            // Update dust balances (same ON CONFLICT pattern as create_payout_for_found_block)
+            let outputs_by_addr: std::collections::BTreeMap<&str, i64> = plan
+                .outputs
+                .iter()
+                .map(|o| (o.payout_address.as_str(), o.dust_carried_forward))
+                .collect();
+            let mut dust_upsert = conn.prepare(
+                "INSERT INTO dust_balances (payout_address, balance)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(payout_address) DO UPDATE SET balance = balance + ?2, updated_at = CURRENT_TIMESTAMP",
+            )?;
+            for (addr, dust) in &outputs_by_addr {
+                if *dust > 0 {
+                    dust_upsert.execute(rusqlite::params![addr, dust])?;
+                }
+            }
+
+            Ok(plan.outputs)
+        })();
+
+        match result {
+            Ok(outputs) => {
+                conn.execute_batch("COMMIT")?;
+                payout_info!(batch_id = batch_id, "rebuilt payout plan with {} outputs", outputs.len());
+                Ok(outputs)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
+    }
+
     /// Process pending payout batches through the configured signer.
     pub async fn process_pending_payouts(
         &self,
         signer: &dyn crate::payout::signer::Signer,
         rpc_client: &crate::node_integration::JsonRpcClient,
+        // Payout config params needed for auto-rebuild when payouts are missing:
+        fee_bps: u32,
+        fee_address: Option<String>,
+        min_payout_sat: i64,
+        n_multiplier: f64,
     ) -> Result<()> {
         use crate::payout::plan::PayoutOutput;
         use crate::payout::signer::SignedBatchData;
@@ -628,6 +847,40 @@ impl AccountingService {
                 }
             };
 
+            let outputs: Vec<PayoutOutput> = if payouts.is_empty() {
+                payout_info!(
+                    batch_id = batch.id,
+                    "payouts table empty for batch — rebuilding from PPLNS window",
+                );
+                match self.rebuild_payout_plan_for_batch(
+                    batch.id,
+                    fee_bps,
+                    fee_address.as_deref(),
+                    min_payout_sat,
+                    n_multiplier,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        accounting_warn!(
+                            batch_id = batch.id,
+                            error = %e,
+                            "rebuild failed — skipping batch",
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                payouts
+                    .iter()
+                    .map(|p| PayoutOutput {
+                        payout_address: p.payout_address.clone(),
+                        worker_id: p.worker_id,
+                        amount: p.amount,
+                        dust_carried_forward: p.dust_carried_forward,
+                    })
+                    .collect()
+            };
+
             let plan = crate::payout::plan::PayoutPlan {
                 round_id: batch.round_id,
                 block_height: found_block.height,
@@ -637,15 +890,7 @@ impl AccountingService {
                 gross_reward: batch.total_amount,
                 pool_fee_amount: batch.pool_fee_amount,
                 pool_fee_address: batch.pool_fee_address.clone(),
-                outputs: payouts
-                    .iter()
-                    .map(|p| PayoutOutput {
-                        payout_address: p.payout_address.clone(),
-                        worker_id: p.worker_id,
-                        amount: p.amount,
-                        dust_carried_forward: p.dust_carried_forward,
-                    })
-                    .collect(),
+                outputs,
                 dust_carried_forward_total: 0,
                 retry_key: batch.retry_key.clone().unwrap_or_default(),
             };
@@ -2081,5 +2326,135 @@ mod tests {
             dust_after_2 > dust_after_1,
             "dust should grow across rounds (additive-only): after_1={dust_after_1}, after_2={dust_after_2}",
         );
+    }
+
+    #[test]
+    fn test_rebuild_payout_plan_repopulates_payouts_and_snapshots() {
+        let f = NamedTempFile::new().unwrap();
+        let db_path = f.path().to_path_buf();
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            init_schema(&setup).unwrap();
+            setup.execute_batch(
+                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+                 INSERT INTO workers (id, payout_address) VALUES (2, 'bob');",
+            )
+            .unwrap();
+            setup.execute(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                [],
+            )
+            .unwrap();
+            // Alice: diff 300
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (1, 1, 's1', 'j1', 200, 1, 'e1', 'en2', 'ntime', 'nonce', 300.0, 'dk1')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (1, 1, 's1', 1, 'j1', 1, 'dk1', 'accepted', 1, 0, '2026-06-01T12:00:01')",
+                [],
+            ).unwrap();
+            // Bob: diff 100
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (2, 2, 's2', 'j2', 200, 2, 'e1', 'en2', 'ntime', 'nonce', 100.0, 'dk2')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, created_at)
+                 VALUES (2, 2, 's2', 2, 'j2', 1, 'dk2', 'accepted', 1, 0, '2026-06-01T12:00:02')",
+                [],
+            ).unwrap();
+            // Block-finding share (Alice, network_target_ok=1)
+            let block_hash = "00000000aaaa000000000000000000000000000000000000000000000000000000";
+            setup.execute(
+                "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
+                                     extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key)
+                 VALUES (3, 1, 's1', 'j3', 200, 3, 'e1', 'en2', 'ntime', 'nonce', 1.0, 'dk3')",
+                [],
+            ).unwrap();
+            setup.execute(
+                "INSERT INTO share_outcomes (id, share_id, session_id, worker_id, job_id, round_id, dedupe_key,
+                                             status, low_diff_ok, network_target_ok, block_hash, created_at)
+                 VALUES (3, 3, 's1', 1, 'j3', 1, 'dk3', 'accepted', 1, 1, ?1, '2026-06-01T12:00:03')",
+                rusqlite::params![block_hash],
+            ).unwrap();
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let block_hash = "00000000aaaa000000000000000000000000000000000000000000000000000000";
+        let found_block = svc
+            .record_found_block(
+                1,
+                block_hash,
+                10000,
+                Some(1),
+                Some(200),
+                Some("json-rpc"),
+                10000,
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+        let batch_id = svc
+            .create_payout_for_found_block(
+                &found_block,
+                200,
+                Some("fee_pool"),
+                1,
+                10.0,
+            )
+            .unwrap();
+
+        // Verify original payouts exist
+        let original_payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
+        assert_eq!(original_payouts.len(), 2, "should have 2 miner payouts originally");
+        let original_total: i64 = original_payouts.iter().map(|p| p.amount).sum();
+
+        // Simulate user accidentally deleting payouts (not snapshots)
+        svc.payout_repo.delete_payouts_by_batch(batch_id).unwrap();
+        let deleted = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
+        assert!(deleted.is_empty(), "payouts should be empty after delete");
+
+        // Rebuild
+        let outputs = svc
+            .rebuild_payout_plan_for_batch(batch_id, 200, Some("fee_pool"), 1, 10.0)
+            .unwrap();
+
+        // Verify payouts re-created
+        let rebuilt_payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
+        assert_eq!(rebuilt_payouts.len(), 2, "rebuild should recreate 2 miner payouts");
+        let rebuilt_total: i64 = rebuilt_payouts.iter().map(|p| p.amount).sum();
+        assert_eq!(
+            rebuilt_total, original_total,
+            "rebuilt payout total should match original"
+        );
+        assert_eq!(outputs.len(), rebuilt_payouts.len());
+
+        // Verify snapshots re-created
+        let snapshots = svc.payout_repo.get_snapshots_by_batch(batch_id).unwrap();
+        assert!(!snapshots.is_empty(), "snapshots should be re-created");
+
+        // Verify each miner got a payout and total sums match gross - fee
+        let batch = svc.payout_repo.get_batch_by_id(batch_id).unwrap().unwrap();
+        let total_payouts: i64 = rebuilt_payouts.iter().map(|p| p.amount).sum();
+        let total_dust: i64 = rebuilt_payouts.iter().map(|p| p.dust_carried_forward).sum();
+        // gross = 5000 (after minerfund), fee = 100, net = 4900 to miners
+        assert_eq!(
+            total_payouts + batch.pool_fee_amount + total_dust,
+            5000,
+            "gross reward = payouts + fee + dust"
+        );
+        assert!(rebuilt_payouts.iter().any(|p| p.worker_id == 1), "alice payout");
+        assert!(rebuilt_payouts.iter().any(|p| p.worker_id == 2), "bob payout");
     }
 }

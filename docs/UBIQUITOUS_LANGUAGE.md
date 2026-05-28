@@ -256,6 +256,34 @@ A fault-tolerance mechanism for payout creation and submission. Each payout batc
 
 **Key invariant:** The retry_key ensures idempotent batch creation. If the scheduler crashes mid-payout and restarts, it will find the existing batch instead of creating a duplicate.
 
+### Empty-Output Guard
+A safety check in `InternalSigner::build_payout_tx` that refuses to sign a payout transaction with zero miner outputs. Without this guard, a `Leftover`-only transaction would send the entire coinbase value to the pool fee address.
+
+**Triggered when:** `PayoutPlan.outputs` is empty at signing time.
+
+**Effect:** `sign_and_submit` returns an error with `"refusing to build payout tx with zero miner outputs"`. The batch stays `pending` and is retried on the next `BlockConnected` event.
+
+**Coverage:** The auto-rebuild path in `process_pending_payouts` should intercept empty-output batches before they reach the signer. The guard in `build_payout_tx` is a defense-in-depth layer.
+
+### Payout Rebuild
+A recovery mechanism in `AccountingService::rebuild_payout_plan_for_batch` that recalculates a payout plan from scratch when the `payouts` table is empty for a pending batch.
+
+**Trigger:** `process_pending_payouts` loads a batch with no payouts.
+
+**Process:**
+1. Verifies batch status is `pending` (not already submitted).
+2. Loads the associated `FoundBlock` and its `coinbase_value`.
+3. Queries `share_outcomes` for the block-finding share to get `found_at` timestamp.
+4. Re-runs `calculate_pplns_window` to find shares in the window.
+5. Reads current `dust_balances`.
+6. Re-runs `build_payout_plan` with the original fee config params.
+7. Atomically deletes old payouts + snapshots and inserts fresh ones.
+8. Returns the rebuilt outputs for tx construction.
+
+**Key invariant:** Rebuild uses current `dust_balances`, which may include carried-forward dust from the original plan. This means the miner receives a negligibly larger weight (a few extra satoshis) — an acceptable overpayment documented in ADR 007.
+
+**Safety:** If any step fails (no share_outcome, empty PPLNS window, rebuild produces empty outputs), the batch is skipped with a warning. The empty-output guard in `build_payout_tx` prevents the worst case from reaching the network.
+
 ## Node Integration Terms
 
 ### Mining Template

@@ -148,7 +148,14 @@ impl PayoutHandler {
         let _guard = self.pending_payouts_lock.lock().await;
         if let Err(e) = self
             .accounting
-            .process_pending_payouts(self.signer.as_ref(), &self.rpc_client)
+            .process_pending_payouts(
+                self.signer.as_ref(),
+                &self.rpc_client,
+                self.fee_bps,
+                self.fee_address.clone(),
+                self.min_payout_sat,
+                self.n_multiplier,
+            )
             .await
         {
             payout_warn!(error = %e, "process_pending_payouts failed");

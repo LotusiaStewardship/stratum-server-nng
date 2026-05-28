@@ -83,6 +83,17 @@ impl Signer for InternalSigner {
 impl InternalSigner {
     /// Build an unsigned payout transaction with signatories attached.
     fn build_payout_tx(&self, data: &SignedBatchData) -> Result<TxBuilder> {
+        // Safety guard: refuse to build a tx with zero miner outputs.
+        // Without this, a Leftover-only fee output would absorb the entire
+        // coinbase value, sending the full block reward to the pool fee address.
+        if data.plan.outputs.is_empty() {
+            anyhow::bail!(
+                "refusing to build payout tx with zero miner outputs (batch has {} payees? pool_fee={})",
+                data.plan.outputs.len(),
+                data.plan.pool_fee_amount,
+            );
+        }
+
         // -- Coinbase input --
         let coinbase_txid = Sha256d::from_hex_be(&data.coinbase_txid)
             .map_err(|e| anyhow::anyhow!("invalid coinbase txid: {}", e))?;
@@ -361,6 +372,37 @@ mod tests {
             tx_hex.len() > 200,
             "tx hex should be substantial (got {} chars)",
             tx_hex.len()
+        );
+    }
+
+    /// InternalSigner rejects a payout plan with zero miner outputs — prevents
+    /// accidentally sending the entire block reward to the pool fee address.
+    #[tokio::test]
+    async fn test_internal_signer_rejects_empty_outputs() {
+        let expected_txid = "deadbeef00000000000000000000000000000000000000000000000000000000";
+        let (url, _captured) = spawn_mock_rpc(json!({
+            "result": expected_txid,
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
+        let signer = InternalSigner::new(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            rpc_client,
+            1000,
+        )
+        .expect("InternalSigner construction should succeed");
+
+        let mut data = test_signed_batch_data();
+        data.plan.outputs = vec![];
+        let err = signer.sign_and_submit(&data).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zero miner outputs"),
+            "error should mention 'zero miner outputs', got: {}",
+            msg,
         );
     }
 
