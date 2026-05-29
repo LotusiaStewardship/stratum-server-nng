@@ -163,6 +163,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_payout_batches_round ON payout_batches(round_id);
         CREATE INDEX IF NOT EXISTS idx_payout_batches_status ON payout_batches(status);
+        CREATE INDEX IF NOT EXISTS idx_payout_batches_submitted_txid ON payout_batches(submitted_txid);
 
         -- payouts table (individual miner payment within a batch)
         CREATE TABLE IF NOT EXISTS payouts (

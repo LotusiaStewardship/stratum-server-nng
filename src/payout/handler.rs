@@ -130,8 +130,32 @@ impl PayoutHandler {
 
                     self.process_pending_payouts_locked().await;
                 }
-                PayoutEvent::BlockConnected => {
-                    payout_debug!("payout handler: block connected — retrying pending payouts");
+                PayoutEvent::BlockConnected(txids) => {
+                    payout_debug!("payout handler: block connected — checking confirmations");
+
+                    // Scan submitted batches for on-chain confirmation
+                    if let Ok(submitted) = self.accounting.payout_repo.list_batches(Some("submitted")) {
+                        for batch in &submitted {
+                            if let Some(ref submitted_txid) = batch.submitted_txid {
+                                if txids.contains(submitted_txid) {
+                                    payout_info!(
+                                        batch_id = batch.id,
+                                        txid = %submitted_txid,
+                                        "payout confirmed on-chain",
+                                    );
+                                    let _ = self.accounting.payout_repo
+                                        .update_batch_status(batch.id, "confirmed");
+                                    if let Ok(Some(fb)) = self.accounting.found_block_repo
+                                        .get_by_round_id(batch.round_id)
+                                    {
+                                        let _ = self.accounting.found_block_repo
+                                            .update_status(fb.id, "paid");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     self.process_pending_payouts_locked().await;
                 }
             }
@@ -167,6 +191,12 @@ impl PayoutHandler {
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+    use rusqlite::Connection;
+    use tempfile::NamedTempFile;
+
+    use crate::accounting::{init_schema, AccountingService};
 
     #[tokio::test]
     async fn test_pending_payouts_lock_serializes_concurrent_calls() {
@@ -206,5 +236,117 @@ mod tests {
             acquired_at - start >= Duration::from_millis(50),
             "task should have waited for the lock to be released",
         );
+    }
+
+    #[tokio::test]
+    async fn test_block_connected_confirms_matching_payout() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        // Create round + found_block
+        conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO found_blocks (id, round_id, block_hash, height, status, coinbase_value, network_target_hex)
+             VALUES (1, 1, 'abc', 100, 'matured', 50000, '')",
+            [],
+        )
+        .unwrap();
+
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        // Create a submitted payout batch with a known txid
+        let batch = accounting
+            .payout_repo
+            .create_payout_batch(1, 100000, 1000, None, 1, "hash:abc")
+            .unwrap();
+        accounting
+            .payout_repo
+            .mark_batch_submitted(
+                batch.id,
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+            )
+            .unwrap();
+
+        // Simulate what PayoutHandler does on BlockConnected(txids)
+        let txids = vec![
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2".to_string(),
+        ];
+
+        let submitted = accounting.payout_repo.list_batches(Some("submitted")).unwrap();
+        for batch in &submitted {
+            if let Some(ref submitted_txid) = batch.submitted_txid {
+                if txids.contains(submitted_txid) {
+                    accounting
+                        .payout_repo
+                        .update_batch_status(batch.id, "confirmed")
+                        .unwrap();
+                    if let Some(fb) = accounting
+                        .found_block_repo
+                        .get_by_round_id(batch.round_id)
+                        .unwrap()
+                    {
+                        accounting
+                            .found_block_repo
+                            .update_status(fb.id, "paid")
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        // Verify batch transitioned to 'confirmed'
+        let updated_batch = accounting.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
+        assert_eq!(updated_batch.status, "confirmed", "matching batch should be confirmed");
+
+        // Verify found_block transitioned to 'paid'
+        let fb = accounting.found_block_repo.get_by_hash("abc").unwrap().unwrap();
+        assert_eq!(fb.status, "paid", "found_block should become paid after on-chain confirmation");
+    }
+
+    #[tokio::test]
+    async fn test_block_connected_does_not_confirm_non_matching_txid() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+            [],
+        )
+        .unwrap();
+
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let batch = accounting
+            .payout_repo
+            .create_payout_batch(1, 100000, 1000, None, 1, "hash:abc")
+            .unwrap();
+        accounting
+            .payout_repo
+            .mark_batch_submitted(
+                batch.id,
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+            )
+            .unwrap();
+
+        // Different txid in the block — should NOT match
+        let txids = vec!["0000000000000000000000000000000000000000000000000000000000000000".to_string()];
+
+        let submitted = accounting.payout_repo.list_batches(Some("submitted")).unwrap();
+        for batch in &submitted {
+            if let Some(ref submitted_txid) = batch.submitted_txid {
+                if txids.contains(submitted_txid) {
+                    accounting.payout_repo.update_batch_status(batch.id, "confirmed").unwrap();
+                }
+            }
+        }
+
+        let updated_batch = accounting.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
+        assert_eq!(updated_batch.status, "submitted", "batch should stay submitted when txid doesn't match");
     }
 }

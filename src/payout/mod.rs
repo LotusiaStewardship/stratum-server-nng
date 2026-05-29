@@ -8,12 +8,13 @@ pub mod signer;
 ///
 /// - `BlockMatured(hash)`: a pool block reached maturity depth — create
 ///   a payout batch for it.
-/// - `BlockConnected`: a new block arrived on the chain — retry any
-///   pending (failed) payout submissions.
+/// - `BlockConnected(txids)`: a new block arrived on the chain — retry any
+///   pending (failed) payout submissions and check for on-chain confirmation
+///   of submitted payouts against the block's transaction IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayoutEvent {
     BlockMatured(String),
-    BlockConnected,
+    BlockConnected(Vec<String>),
 }
 
 /// Given the total coinbase value (subsidy + fees), compute the pool's

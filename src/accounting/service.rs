@@ -906,7 +906,6 @@ impl AccountingService {
             match signer.sign_and_submit(&signed_data).await {
                 Ok(txid) => {
                     let _ = self.payout_repo.mark_batch_submitted(batch.id, &txid);
-                    let _ = self.found_block_repo.update_status(found_block.id, "paid");
                     accounting_info!(batch_id = batch.id, txid = %txid, "payout submitted");
                 }
                 Err(e) => {

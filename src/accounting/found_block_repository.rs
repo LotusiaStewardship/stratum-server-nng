@@ -95,6 +95,17 @@ impl FoundBlockRepository {
         Ok(())
     }
 
+    /// Restore an orphaned block to 'immature' status and clear the orphan reason.
+    /// Only affects blocks whose status is 'orphaned'.
+    pub fn un_orphan(&self, block_hash: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE found_blocks SET status = 'immature', orphan_reason = NULL WHERE block_hash = ?1 AND status = 'orphaned'",
+            params![block_hash],
+        )?;
+        Ok(())
+    }
+
     /// Get a found block by its block hash.
     pub fn get_by_hash(&self, block_hash: &str) -> Result<Option<FoundBlock>> {
         let conn = self.conn.lock();
@@ -359,6 +370,58 @@ mod tests {
         let block = repo.get_by_hash("0000abc").unwrap().unwrap();
         assert_eq!(block.status, "orphaned");
         assert_eq!(block.orphan_reason, Some("reorg_detected".to_string()));
+    }
+
+    #[test]
+    fn test_un_orphan_restores_status_and_clears_reason() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 42);
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
+            .unwrap();
+        repo.mark_orphaned("block1", "reorg").unwrap();
+
+        let block = repo.get_by_hash("block1").unwrap().unwrap();
+        assert_eq!(block.status, "orphaned");
+        assert_eq!(block.orphan_reason, Some("reorg".to_string()));
+
+        repo.un_orphan("block1").unwrap();
+
+        let block = repo.get_by_hash("block1").unwrap().unwrap();
+        assert_eq!(block.status, "immature");
+        assert_eq!(block.orphan_reason, None);
+    }
+
+    #[test]
+    fn test_un_orphan_noop_for_non_orphaned() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 42);
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+
+        // Block starts as 'immature' — un_orphan should leave it unchanged
+        repo.record_found_block(1, "block1", 100, None, None, None, 0, "")
+            .unwrap();
+        repo.un_orphan("block1").unwrap();
+
+        let block = repo.get_by_hash("block1").unwrap().unwrap();
+        assert_eq!(block.status, "immature");
+        assert_eq!(block.orphan_reason, None);
+    }
+
+    #[test]
+    fn test_un_orphan_noop_for_nonexistent() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let repo = FoundBlockRepository::new(Arc::new(Mutex::new(conn)));
+
+        // Calling un_orphan on a non-existent hash should not error
+        repo.un_orphan("nonexistent").unwrap();
     }
 
     #[test]

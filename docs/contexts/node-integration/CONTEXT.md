@@ -50,7 +50,7 @@ src/node_integration/
 - **`verify_coinbase_outputs(template)`** — Checks that the template coinbase has at least one non-OP_RETURN output. Warns at startup if all outputs are OP_RETURN (would burn block rewards).
 - **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms), `blkconnected` (immediate), and `blkdisconctd` (immediate) events.
   - `miningwrkchg` → template fetch, job conversion, broadcast via `broadcast::Sender` to all sessions. Injects the reason code into `MiningJob.reason` for miner-facing explanations. **No chain state or payout logic.**
-  - `blkconnected` → decodes block height from Lotus header bytes via `LotusHeader::deser()`, updates `ChainTip`, calls `check_maturation()`, and sends matured block hashes through the payout maturation channel. **Sole driver of runtime chain-state tracking and payout triggers.**
+  - `blkconnected` → decodes block height from Lotus header bytes via `LotusHeader::deser()`, updates `ChainTip`. Before maturation, checks if the arriving block hash belongs to an orphaned pool block and un-orphans it if safe (no submitted payout). Then calls `check_maturation()` and sends matured block hashes + transaction IDs through the payout maturation channel. **Sole driver of runtime chain-state tracking, reorg recovery, and payout triggers.**
   - `blkdisconctd` → records orphaned found_blocks via AccountingService on matched block hash.
 
 ### Reorg Detection
@@ -59,6 +59,14 @@ Two complementary paths:
 
 1. **Runtime (NNG pub/sub):** `BlockDisconnected` events from lotusd trigger immediate orphan status updates on matched found_blocks via `found_block_repo.mark_orphaned()`.
 2. **Startup (JSON-RPC):** On server start, `getblockcount` + `getblockhash` are used to reconcile found_blocks against current chain tip. Missing blocks are marked orphaned.
+
+### Reorg Recovery (Un-Orphan)
+
+When a `blkconnected` event matches an orphaned pool block, `handle_block_connected` runs an orphan check before the maturation check:
+
+- **No payout batch:** un-orphans to `immature` → maturation check promotes immediately if depth ≥ min_confirmations.
+- **Pending payout batch:** un-orphans to `matured` (block was previously matured before the reorg).
+- **Submitted payout batch:** stays orphaned with a warning — payout was already sent, cannot reclaim.
 
 ### Shutdown
 

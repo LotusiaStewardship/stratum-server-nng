@@ -92,11 +92,19 @@ Payout automation is event-driven, replacing the old timer-based scheduler:
 4. Fetches coinbase output details via `getrawtransaction`
 5. Finds the first spendable (non-OP_RETURN) vout (Lotus: vout[0] is OP_RETURN metadata)
 6. Reconstructs `SignedBatchData` from DB data
-7. Calls the configured `Signer` impl
-8. On success: marks batch `submitted` with txid, transitions `found_block.status` to `paid`
-6. If the `payouts` table has no rows for this batch (e.g., accidentally deleted), calls `rebuild_payout_plan_for_batch` to recalculate the PPLNS window from scratch and re-insert payouts + snapshots + dust balances atomically. If rebuild fails (no share_outcome, empty PPLNS window, rebuild produces empty outputs), the batch is skipped with a warning.
-7. Reconstructs `SignedBatchData` from DB data (or rebuilt outputs).
-8. Calls the configured `Signer` impl.
-9. The `InternalSigner::build_payout_tx` guards against empty `plan.outputs` — if zero miner outputs somehow reach this point, signing fails with a descriptive error.
-10. On success: marks batch `submitted` with txid, transitions `found_block.status` to `paid`.
-11. On failure: batch stays `pending` for retry (errors logged per-batch).
+7. Calls the configured `Signer` impl.
+8. On success: marks batch `submitted` with txid. `found_block.status` stays `matured` (no longer prematurely transitioned to `paid`).
+9. If the `payouts` table has no rows for this batch (e.g., accidentally deleted), calls `rebuild_payout_plan_for_batch` to recalculate the PPLNS window from scratch and re-insert payouts + snapshots + dust balances atomically. If rebuild fails (no share_outcome, empty PPLNS window, rebuild produces empty outputs), the batch is skipped with a warning.
+10. Reconstructs `SignedBatchData` from DB data (or rebuilt outputs).
+11. Calls the configured `Signer` impl.
+12. The `InternalSigner::build_payout_tx` guards against empty `plan.outputs` — if zero miner outputs somehow reach this point, signing fails with a descriptive error.
+13. On success: marks batch `submitted` with txid.
+14. On failure: batch stays `pending` for retry (errors logged per-batch).
+
+### On-chain confirmation (Phase 3)
+
+When the PayoutHandler receives a `BlockConnected(txids)` event, it scans all submitted batches for a matching `submitted_txid`. If a match is found:
+- The batch transitions to `confirmed`
+- The associated `found_block` transitions to `paid`
+
+This ensures `found_block.status = 'paid'` is only set after real on-chain confirmation, not at submission time.

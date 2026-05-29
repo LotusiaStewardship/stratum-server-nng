@@ -182,6 +182,41 @@ impl PayoutRepository {
         Ok(batches)
     }
 
+    /// Get payout batches for a given block hash via JOIN on found_blocks.round_id.
+    pub fn get_batches_by_block_hash(&self, block_hash: &str) -> Result<Vec<PayoutBatch>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT pb.id, pb.round_id, pb.status, pb.total_amount, pb.pool_fee_amount,
+                    pb.pool_fee_address, pb.miner_count, pb.retry_key, pb.last_error,
+                    pb.next_retry_at, pb.attempt_count, pb.signed_payload_ref, pb.submitted_txid
+             FROM payout_batches pb
+             JOIN found_blocks fb ON fb.round_id = pb.round_id
+             WHERE fb.block_hash = ?1",
+        )?;
+        let rows = stmt.query_map(params![block_hash], |row| {
+            Ok(PayoutBatch {
+                id: row.get(0)?,
+                round_id: row.get(1)?,
+                status: row.get(2)?,
+                total_amount: row.get(3)?,
+                pool_fee_amount: row.get(4)?,
+                pool_fee_address: row.get(5)?,
+                miner_count: row.get(6)?,
+                retry_key: row.get(7)?,
+                last_error: row.get(8)?,
+                next_retry_at: row.get(9)?,
+                attempt_count: row.get(10)?,
+                signed_payload_ref: row.get(11)?,
+                submitted_txid: row.get(12)?,
+            })
+        })?;
+        let mut batches = Vec::new();
+        for row in rows {
+            batches.push(row?);
+        }
+        Ok(batches)
+    }
+
     /// Update a payout batch's status.
     pub fn update_batch_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock();
@@ -556,5 +591,83 @@ mod tests {
         let (bal2, is_new2) = repo.get_or_create_dust_balance("addr1").unwrap();
         assert_eq!(bal2, 500);
         assert!(!is_new2);
+    }
+
+    #[test]
+    fn test_get_batches_by_block_hash_found() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 42);
+        create_worker(&conn, 1, "miner1");
+
+        // Create a found_block with block_hash "abc"
+        conn.execute(
+            "INSERT INTO found_blocks (round_id, block_hash, height, status, coinbase_value, network_target_hex)
+             VALUES (1, 'abc', 100, 'immature', 50000, '')",
+            [],
+        )
+        .unwrap();
+
+        let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
+
+        // Create a payout batch linked to the same round
+        let batch = repo
+            .create_payout_batch(1, 100000, 1000, None, 1, "hash:abc")
+            .unwrap();
+
+        let batches = repo.get_batches_by_block_hash("abc").unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].id, batch.id);
+        assert_eq!(batches[0].round_id, 1);
+        assert_eq!(batches[0].status, "pending");
+    }
+
+    #[test]
+    fn test_get_batches_by_block_hash_not_found() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
+
+        let batches = repo.get_batches_by_block_hash("nonexistent").unwrap();
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_get_batches_by_block_hash_multiple_batches_different_rounds() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        create_round(&conn, 1, 42);
+        create_round(&conn, 2, 43);
+
+        // Two found_blocks in different rounds
+        conn.execute(
+            "INSERT INTO found_blocks (round_id, block_hash, height, status, coinbase_value, network_target_hex)
+             VALUES (1, 'hash1', 100, 'immature', 50000, '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO found_blocks (round_id, block_hash, height, status, coinbase_value, network_target_hex)
+             VALUES (2, 'hash2', 200, 'immature', 60000, '')",
+            [],
+        )
+        .unwrap();
+
+        let repo = PayoutRepository::new(Arc::new(Mutex::new(conn)));
+        repo.create_payout_batch(1, 100000, 1000, None, 1, "key1")
+            .unwrap();
+        repo.create_payout_batch(2, 200000, 2000, None, 1, "key2")
+            .unwrap();
+
+        let batches = repo.get_batches_by_block_hash("hash1").unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].round_id, 1);
+
+        let batches = repo.get_batches_by_block_hash("hash2").unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].round_id, 2);
     }
 }

@@ -318,6 +318,46 @@ pub(crate) async fn handle_block_connected(
     chain_tip.update_block_connected(height);
     let tip = chain_tip.get();
 
+    // Check if this block reconnects an orphaned pool block (reorg reversal).
+    let block_hash = event.block.header.hash.to_hex_be();
+    if let Ok(Some(fb)) = accounting.found_block_repo.get_by_hash(&block_hash) {
+        if fb.status == "orphaned" {
+            match accounting.payout_repo.get_batches_by_block_hash(&block_hash) {
+                Ok(batches) => {
+                    let has_submitted = batches.iter().any(|b| b.status == "submitted");
+                    if has_submitted {
+                        node_int_warn!(
+                            hash = %block_hash,
+                            "orphaned block reconnected but has submitted payout — cannot un-orphan",
+                        );
+                    } else {
+                        let has_pending = batches.iter().any(|b| b.status == "pending");
+                        if let Err(e) = accounting.found_block_repo.un_orphan(&block_hash) {
+                            node_int_error!(hash = %block_hash, error = %e, "failed to un-orphan block");
+                        } else {
+                            if has_pending {
+                                // Block was already matured with a payout batch — restore to matured
+                                let _ = accounting.found_block_repo.mark_matured(fb.id);
+                            }
+                            node_int_info!(
+                                hash = %block_hash,
+                                unorphaned_to = if has_pending { "matured" } else { "immature" },
+                                "reconnected orphaned block",
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    node_int_error!(
+                        hash = %block_hash,
+                        error = %e,
+                        "failed to query batches for orphan check",
+                    );
+                }
+            }
+        }
+    }
+
     match accounting.check_maturation(tip, min_confirmations) {
         Ok(matured_blocks) => {
             for matured in &matured_blocks {
@@ -337,9 +377,14 @@ pub(crate) async fn handle_block_connected(
         }
     }
 
-    // Always send a BlockConnected signal so the payout handler retries
-    // any pending (failed) payout submissions on every new block.
-    let _ = maturation_tx.send(PayoutEvent::BlockConnected);
+    // Extract transaction IDs from the connected block for payout confirmation scanning.
+    let txids: Vec<String> = event.block.txs.iter()
+        .map(|bt| bt.tx.txid.to_hex_be())
+        .collect();
+
+    // Send BlockConnected with txids so the payout handler can check for on-chain
+    // confirmation of submitted payouts and retry any pending submissions.
+    let _ = maturation_tx.send(PayoutEvent::BlockConnected(txids));
 }
 
 /// Coalesce rapid miningwrkchg events.
@@ -774,7 +819,7 @@ mod tests {
             .expect("should receive second event")
             .expect("channel should not be closed");
         assert!(
-            matches!(second, PayoutEvent::BlockConnected),
+            matches!(second, PayoutEvent::BlockConnected(_)),
             "expected BlockConnected second, got: {:?}",
             second,
         );
@@ -804,11 +849,153 @@ mod tests {
         // Should receive a BlockConnected signal (every blkconnected triggers retry)
         let result = tokio::time::timeout(Duration::from_millis(50), maturation_rx.recv()).await;
         match result {
-            Ok(Some(PayoutEvent::BlockConnected)) => { /* expected */ }
+            Ok(Some(PayoutEvent::BlockConnected(_))) => { /* expected */ }
             other => panic!(
                 "expected BlockConnected signal, got: {:?}",
                 other,
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_un_orphans_block_without_batch() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+            [],
+        )
+        .unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
+
+        // Create a found_block with the same hash the default make_block_connected produces
+        let zero_hash = Sha256d::new([0u8; 32]).to_hex_be();
+        accounting
+            .found_block_repo
+            .record_found_block(1, &zero_hash, 100, None, None, None, 50000, "")
+            .unwrap();
+        accounting
+            .found_block_repo
+            .mark_orphaned(&zero_hash, "reorg_detected")
+            .unwrap();
+
+        let event = make_block_connected(200);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        let fb = accounting
+            .found_block_repo
+            .get_by_hash(&zero_hash)
+            .unwrap()
+            .unwrap();
+        // The orphan check restores to immature, then the maturation check immediately
+        // promotes it because it already meets maturity depth (100+100 <= 200).
+        assert_eq!(fb.status, "matured", "orphaned block should be restored and matured in same event");
+        assert_eq!(fb.orphan_reason, None, "orphan_reason should be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_un_orphans_block_with_pending_batch() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+            [],
+        )
+        .unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
+
+        // Create a found_block and mature it
+        let zero_hash = Sha256d::new([0u8; 32]).to_hex_be();
+        let fb = accounting
+            .found_block_repo
+            .record_found_block(1, &zero_hash, 100, None, None, None, 50000, "")
+            .unwrap();
+        accounting.found_block_repo.mark_matured(fb.id).unwrap();
+
+        // Create a pending payout batch
+        accounting
+            .payout_repo
+            .create_payout_batch(1, 100000, 1000, None, 1, &format!("hash:{}", &zero_hash))
+            .unwrap();
+
+        // Now orphan the block
+        accounting
+            .found_block_repo
+            .mark_orphaned(&zero_hash, "reorg_detected")
+            .unwrap();
+
+        let event = make_block_connected(200);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        let fb = accounting
+            .found_block_repo
+            .get_by_hash(&zero_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb.status, "matured", "orphaned block with pending batch should be restored to matured");
+        assert_eq!(fb.orphan_reason, None, "orphan_reason should be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_blkconnected_does_not_un_orphan_with_submitted_batch() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+            [],
+        )
+        .unwrap();
+        let accounting = AccountingService::new(Arc::new(Mutex::new(conn)));
+        let chain_tip = ChainTip::new(0);
+        let (maturation_tx, _maturation_rx) = mpsc::unbounded_channel::<PayoutEvent>();
+
+        // Create a found_block and mature it
+        let zero_hash = Sha256d::new([0u8; 32]).to_hex_be();
+        let fb = accounting
+            .found_block_repo
+            .record_found_block(1, &zero_hash, 100, None, None, None, 50000, "")
+            .unwrap();
+        accounting.found_block_repo.mark_matured(fb.id).unwrap();
+
+        // Create a submitted payout batch
+        let batch = accounting
+            .payout_repo
+            .create_payout_batch(1, 100000, 1000, None, 1, &format!("hash:{}", &zero_hash))
+            .unwrap();
+        accounting
+            .payout_repo
+            .mark_batch_submitted(batch.id, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2")
+            .unwrap();
+
+        // Now orphan the block
+        accounting
+            .found_block_repo
+            .mark_orphaned(&zero_hash, "reorg_detected")
+            .unwrap();
+
+        let event = make_block_connected(200);
+        handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
+
+        let fb = accounting
+            .found_block_repo
+            .get_by_hash(&zero_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fb.status, "orphaned",
+            "orphaned block with submitted payout should stay orphaned"
+        );
+        assert_eq!(
+            fb.orphan_reason,
+            Some("reorg_detected".to_string()),
+            "orphan_reason should be preserved"
+        );
     }
 }
