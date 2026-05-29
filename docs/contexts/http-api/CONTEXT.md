@@ -1,6 +1,6 @@
 # HTTP API Context
 
-**Last updated:** 2026-05-25  
+**Last updated:** 2026-05-29  
 **Related spec:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -48,7 +48,7 @@ src/http_api/
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/api/v1/health` | No | Server status, uptime, connected miners |
-| GET | `/api/v1/stats` | Yes | Share counts, acceptance rate, rejection breakdown |
+| GET | `/api/v1/stats` | Yes | Share counts, acceptance rate, rejection breakdown, pool hashrate (5-min rolling window) |
 | GET | `/api/v1/workers` | Yes | List workers with share counts |
 | GET | `/api/v1/workers/{id}` | Yes | Worker details |
 | GET | `/api/v1/rounds` | Yes | List rounds with optional status filter |
@@ -87,5 +87,4 @@ All repository fields are `Option` — individual route handlers return `AppErro
 
 - Pagination (`limit`/`offset`) implemented on `GET /api/v1/workers`, `GET /api/v1/shares`, and `GET /api/v1/share-outcomes`; remaining list endpoints return full results
 - No `GET /api/v1/rounds/{id}/shares` endpoint
-- No hashrate endpoint (5-min rolling window)
 - No error correlation IDs on 4xx/5xx responses

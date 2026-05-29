@@ -20,3 +20,7 @@ pub const DUST_LIMIT: i64 = 546;
 /// Default transaction fee rate in satoshis per kilobyte.
 /// 1000 sat/kB = 1 sat/vByte (standard relay minimum).
 pub const DEFAULT_TX_FEE_PER_KB: i64 = 1000;
+
+/// Default time window for calculating pool hashrate in `/api/v1/stats`
+/// 1800 seconds = 30 minutes / 2-minute block time = 15 block window average
+pub const DEFAULT_POOL_HASHRATE_WINDOW_SECS: i64 = 1800;

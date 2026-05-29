@@ -1,5 +1,7 @@
 use crate::http_api::server::AppState;
+use crate::constants::DEFAULT_POOL_HASHRATE_WINDOW_SECS;
 use axum::{extract::State, response::Json};
+use chrono::{Duration, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -11,21 +13,30 @@ pub struct StatsResponse {
     pub accepted_pct: f64,
     pub rejection_breakdown: HashMap<String, i64>,
     pub network_difficulty: Option<String>,
+    pub pool_hashrate: u64,
 }
 
 pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse> {
     let stats = state.stats.read().await;
 
     // Query share outcome counts from repository
-    let (total_shares, accepted_shares, rejected_shares, rejection_breakdown) =
+    let (total_shares, accepted_shares, rejected_shares, rejection_breakdown, pool_hashrate) =
         if let Some(ref share_repo) = state.share_repo {
             let total = share_repo.total_count().unwrap_or(0);
             let accepted = share_repo.count_outcomes_by_status("accepted").unwrap_or(0);
             let rejected = share_repo.count_outcomes_by_status("rejected").unwrap_or(0);
             let reasons = share_repo.count_rejected_by_reason().unwrap_or_default();
-            (total, accepted, rejected, reasons)
+            let now = Utc::now().naive_utc();
+            let five_min_ago = (now - Duration::seconds(DEFAULT_POOL_HASHRATE_WINDOW_SECS))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            let sum_diff = share_repo
+                .sum_difficulty_since(&five_min_ago)
+                .unwrap_or(0.0);
+            let pool_hashrate = (sum_diff * 4_294_967_296.0 / DEFAULT_POOL_HASHRATE_WINDOW_SECS as f64) as u64;
+            (total, accepted, rejected, reasons, pool_hashrate)
         } else {
-            (0, 0, 0, HashMap::new())
+            (0, 0, 0, HashMap::new(), 0)
         };
 
     let accepted_pct = if total_shares > 0 {
@@ -41,6 +52,7 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
         accepted_pct,
         rejection_breakdown,
         network_difficulty: stats.network_difficulty.clone(),
+        pool_hashrate,
     })
 }
 
@@ -78,6 +90,7 @@ mod tests {
         assert_eq!(response.rejected_shares, 0);
         assert_eq!(response.accepted_pct, 0.0);
         assert!(response.rejection_breakdown.is_empty());
+        assert_eq!(response.pool_hashrate, 0);
     }
 
     #[tokio::test]
@@ -175,5 +188,7 @@ mod tests {
             response.rejection_breakdown.get("low-difficulty-share"),
             Some(&1)
         );
+        // pool_hashrate: 2 accepted shares × 1.0 diff × 2^32 / 1800 ≈ 4,772,185 H/s
+        assert_eq!(response.pool_hashrate, 4_772_185);
     }
 }

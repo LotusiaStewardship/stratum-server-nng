@@ -183,6 +183,21 @@ impl ShareRepository {
         Ok(count)
     }
 
+    /// Sum accepted share difficulty submitted since the given timestamp.
+    /// Used to compute pool hashrate: sum_difficulty × 2^32 / window_seconds.
+    pub fn sum_difficulty_since(&self, since: &str) -> Result<f64> {
+        let conn = self.conn.lock();
+        let sql = "
+            SELECT COALESCE(SUM(s.difficulty), 0.0)
+            FROM shares s
+            JOIN share_outcomes so ON s.id = so.share_id
+            WHERE so.status = 'accepted'
+              AND so.created_at >= ?1
+        ";
+        conn.query_row(sql, rusqlite::params![since], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     /// Update the node_result field on a share_outcome after block submission to lotusd.
     /// Returns the number of rows updated (should be 0 or 1).
     pub fn update_outcome_node_result(&self, dedupe_key: &str, node_result: &str) -> Result<usize> {
@@ -1191,5 +1206,61 @@ mod tests {
             .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, "accepted");
+    }
+
+    #[test]
+    fn test_sum_difficulty_since() {
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        setup_worker(&conn, 1, "test_addr", None);
+
+        // Insert shares with explicit timestamps
+        // 3 accepted shares at 2.0 difficulty within window (1 min ago)
+        // 1 rejected share at 2.0 difficulty within window
+        // 1 accepted share at 1.0 difficulty outside window (10 min ago)
+        conn.execute_batch("
+            INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key, created_at)
+            VALUES (1, 1, 'sess-1', 'job-1', 1, 100, '00000001', '11000001', '110000000001', '1100000000000001', 2.0, 'dk1', datetime('now', '-1 minutes'));
+            INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key, created_at)
+            VALUES (2, 1, 'sess-1', 'job-1', 1, 100, '00000001', '11000002', '110000000002', '1100000000000002', 2.0, 'dk2', datetime('now', '-1 minutes'));
+            INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key, created_at)
+            VALUES (3, 1, 'sess-1', 'job-1', 1, 100, '00000001', '11000003', '110000000003', '1100000000000003', 2.0, 'dk3', datetime('now', '-1 minutes'));
+            INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key, created_at)
+            VALUES (4, 1, 'sess-1', 'job-1', 1, 100, '00000001', '11000004', '110000000004', '1100000000000004', 2.0, 'dk4', datetime('now', '-1 minutes'));
+            INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch, extranonce1, extranonce2, ntime_hex_6b, nonce_hex_8b, difficulty, dedupe_key, created_at)
+            VALUES (5, 1, 'sess-1', 'job-1', 1, 100, '00000001', '11000005', '110000000005', '1100000000000005', 1.0, 'dk5', datetime('now', '-10 minutes'));
+        ").unwrap();
+
+        // Insert share outcomes: dk1/dk2/dk5 = accepted, dk3 = stale, dk4 = rejected
+        conn.execute_batch("
+            INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, created_at)
+            VALUES (1, 'sess-1', 1, 'job-1', 'dk1', 'accepted', datetime('now', '-1 minutes'));
+            INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, created_at)
+            VALUES (2, 'sess-1', 1, 'job-1', 'dk2', 'accepted', datetime('now', '-1 minutes'));
+            INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, created_at)
+            VALUES (3, 'sess-1', 1, 'job-1', 'dk3', 'stale', datetime('now', '-1 minutes'));
+            INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, created_at)
+            VALUES (4, 'sess-1', 1, 'job-1', 'dk4', 'rejected', datetime('now', '-1 minutes'));
+            INSERT INTO share_outcomes (share_id, session_id, worker_id, job_id, dedupe_key, status, created_at)
+            VALUES (5, 'sess-1', 1, 'job-1', 'dk5', 'accepted', datetime('now', '-10 minutes'));
+        ").unwrap();
+
+        let repo = ShareRepository::new(Arc::new(Mutex::new(conn)));
+
+        // Sum all accepted shares regardless of timestamp = dk1 (2.0) + dk2 (2.0) + dk5 (1.0) = 5.0
+        let sum = repo.sum_difficulty_since("1970-01-01 00:00:00").unwrap();
+        let expected_within = 2.0 + 2.0 + 1.0; // only accepted: dk1 + dk2 + dk5
+        assert!(
+            (sum - expected_within).abs() < f64::EPSILON,
+            "expected {expected_within}, got {sum}"
+        );
+
+        // A future timestamp should return 0.0
+        let sum_future = repo.sum_difficulty_since("2099-01-01 00:00:00").unwrap();
+        assert!(
+            (sum_future - 0.0).abs() < f64::EPSILON,
+            "expected 0.0 for future timestamp, got {sum_future}"
+        );
     }
 }

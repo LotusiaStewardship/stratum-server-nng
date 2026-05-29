@@ -36,7 +36,7 @@ src/accounting/
 ├── schema.rs                     # init_schema(): PRAGMA config + all CREATE TABLE statements
 ├── service.rs                    # AccountingService facade (share recording, payout creation, reconciliation)
 ├── worker_repository.rs          # Worker upsert/query
-├── share_repository.rs           # Share + ShareOutcome insert with dedupe, stats queries
+├── share_repository.rs           # Share + ShareOutcome insert with dedupe, stats queries, sum_difficulty_since()
 ├── round_repository.rs           # Round get_or_create, close, resolve_for_template, list
 ├── found_block_repository.rs     # Found block record, list by status, update status
 ├── payout_repository.rs          # Payout batch CRUD, individual payouts, dust balance, share snapshot
