@@ -564,12 +564,7 @@ impl AccountingService {
         let found_block = self
             .found_block_repo
             .get_by_round_id(batch.round_id)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no found_block for round {}",
-                    batch.round_id
-                )
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("no found_block for round {}", batch.round_id))?;
 
         // 3. Compute gross_reward and network_difficulty
         let gross_reward = crate::payout::reward_from_coinbase(found_block.coinbase_value);
@@ -611,9 +606,7 @@ impl AccountingService {
 
         // 6. Read dust balances
         let dust_balances: Vec<(String, i64)> = {
-            let mut stmt = conn.prepare(
-                "SELECT payout_address, balance FROM dust_balances",
-            )?;
+            let mut stmt = conn.prepare("SELECT payout_address, balance FROM dust_balances")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -726,7 +719,11 @@ impl AccountingService {
         match result {
             Ok(outputs) => {
                 conn.execute_batch("COMMIT")?;
-                payout_info!(batch_id = batch_id, "rebuilt payout plan with {} outputs", outputs.len());
+                payout_info!(
+                    batch_id = batch_id,
+                    "rebuilt payout plan with {} outputs",
+                    outputs.len()
+                );
                 Ok(outputs)
             }
             Err(e) => {
@@ -2335,16 +2332,18 @@ mod tests {
         {
             let setup = Connection::open(&db_path).unwrap();
             init_schema(&setup).unwrap();
-            setup.execute_batch(
-                "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
+            setup
+                .execute_batch(
+                    "INSERT INTO workers (id, payout_address) VALUES (1, 'alice');
                  INSERT INTO workers (id, payout_address) VALUES (2, 'bob');",
-            )
-            .unwrap();
-            setup.execute(
-                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
-                [],
-            )
-            .unwrap();
+                )
+                .unwrap();
+            setup
+                .execute(
+                    "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 200, 'open')",
+                    [],
+                )
+                .unwrap();
             // Alice: diff 300
             setup.execute(
                 "INSERT INTO shares (id, worker_id, session_id, job_id, template_id, template_epoch,
@@ -2405,18 +2404,16 @@ mod tests {
             .unwrap();
 
         let batch_id = svc
-            .create_payout_for_found_block(
-                &found_block,
-                200,
-                Some("fee_pool"),
-                1,
-                10.0,
-            )
+            .create_payout_for_found_block(&found_block, 200, Some("fee_pool"), 1, 10.0)
             .unwrap();
 
         // Verify original payouts exist
         let original_payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
-        assert_eq!(original_payouts.len(), 2, "should have 2 miner payouts originally");
+        assert_eq!(
+            original_payouts.len(),
+            2,
+            "should have 2 miner payouts originally"
+        );
         let original_total: i64 = original_payouts.iter().map(|p| p.amount).sum();
 
         // Simulate user accidentally deleting payouts (not snapshots)
@@ -2431,7 +2428,11 @@ mod tests {
 
         // Verify payouts re-created
         let rebuilt_payouts = svc.payout_repo.get_payouts_by_batch(batch_id).unwrap();
-        assert_eq!(rebuilt_payouts.len(), 2, "rebuild should recreate 2 miner payouts");
+        assert_eq!(
+            rebuilt_payouts.len(),
+            2,
+            "rebuild should recreate 2 miner payouts"
+        );
         let rebuilt_total: i64 = rebuilt_payouts.iter().map(|p| p.amount).sum();
         assert_eq!(
             rebuilt_total, original_total,
@@ -2453,7 +2454,13 @@ mod tests {
             5000,
             "gross reward = payouts + fee + dust"
         );
-        assert!(rebuilt_payouts.iter().any(|p| p.worker_id == 1), "alice payout");
-        assert!(rebuilt_payouts.iter().any(|p| p.worker_id == 2), "bob payout");
+        assert!(
+            rebuilt_payouts.iter().any(|p| p.worker_id == 1),
+            "alice payout"
+        );
+        assert!(
+            rebuilt_payouts.iter().any(|p| p.worker_id == 2),
+            "bob payout"
+        );
     }
 }

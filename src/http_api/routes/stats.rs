@@ -1,5 +1,5 @@
-use crate::http_api::server::AppState;
 use crate::constants::DEFAULT_POOL_HASHRATE_WINDOW_SECS;
+use crate::http_api::server::AppState;
 use axum::{extract::State, response::Json};
 use chrono::{Duration, Utc};
 use serde::Serialize;
@@ -33,7 +33,8 @@ pub async fn stats_handler(State(state): State<AppState>) -> Json<StatsResponse>
             let sum_diff = share_repo
                 .sum_difficulty_since(&five_min_ago)
                 .unwrap_or(0.0);
-            let pool_hashrate = (sum_diff * 4_294_967_296.0 / DEFAULT_POOL_HASHRATE_WINDOW_SECS as f64) as u64;
+            let pool_hashrate =
+                (sum_diff * 4_294_967_296.0 / DEFAULT_POOL_HASHRATE_WINDOW_SECS as f64) as u64;
             (total, accepted, rejected, reasons, pool_hashrate)
         } else {
             (0, 0, 0, HashMap::new(), 0)

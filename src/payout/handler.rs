@@ -76,7 +76,8 @@ impl PayoutHandler {
                     payout_debug!(hash = %block_hash, "payout handler: received maturation event");
 
                     // Look up the found block
-                    let found_block = match self.accounting.found_block_repo.get_by_hash(block_hash) {
+                    let found_block = match self.accounting.found_block_repo.get_by_hash(block_hash)
+                    {
                         Ok(Some(b)) => b,
                         Ok(None) => {
                             payout_warn!(hash = %block_hash, "payout handler: block not found in DB");
@@ -134,7 +135,9 @@ impl PayoutHandler {
                     payout_debug!("payout handler: block connected — checking confirmations");
 
                     // Scan submitted batches for on-chain confirmation
-                    if let Ok(submitted) = self.accounting.payout_repo.list_batches(Some("submitted")) {
+                    if let Ok(submitted) =
+                        self.accounting.payout_repo.list_batches(Some("submitted"))
+                    {
                         for batch in &submitted {
                             if let Some(ref submitted_txid) = batch.submitted_txid {
                                 if txids.contains(submitted_txid) {
@@ -143,12 +146,18 @@ impl PayoutHandler {
                                         txid = %submitted_txid,
                                         "payout confirmed on-chain",
                                     );
-                                    let _ = self.accounting.payout_repo
+                                    let _ = self
+                                        .accounting
+                                        .payout_repo
                                         .update_batch_status(batch.id, "confirmed");
-                                    if let Ok(Some(fb)) = self.accounting.found_block_repo
+                                    if let Ok(Some(fb)) = self
+                                        .accounting
+                                        .found_block_repo
                                         .get_by_round_id(batch.round_id)
                                     {
-                                        let _ = self.accounting.found_block_repo
+                                        let _ = self
+                                            .accounting
+                                            .found_block_repo
                                             .update_status(fb.id, "paid");
                                     }
                                 }
@@ -273,11 +282,13 @@ mod tests {
             .unwrap();
 
         // Simulate what PayoutHandler does on BlockConnected(txids)
-        let txids = vec![
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2".to_string(),
-        ];
+        let txids =
+            vec!["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2".to_string()];
 
-        let submitted = accounting.payout_repo.list_batches(Some("submitted")).unwrap();
+        let submitted = accounting
+            .payout_repo
+            .list_batches(Some("submitted"))
+            .unwrap();
         for batch in &submitted {
             if let Some(ref submitted_txid) = batch.submitted_txid {
                 if txids.contains(submitted_txid) {
@@ -300,12 +311,26 @@ mod tests {
         }
 
         // Verify batch transitioned to 'confirmed'
-        let updated_batch = accounting.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
-        assert_eq!(updated_batch.status, "confirmed", "matching batch should be confirmed");
+        let updated_batch = accounting
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_batch.status, "confirmed",
+            "matching batch should be confirmed"
+        );
 
         // Verify found_block transitioned to 'paid'
-        let fb = accounting.found_block_repo.get_by_hash("abc").unwrap().unwrap();
-        assert_eq!(fb.status, "paid", "found_block should become paid after on-chain confirmation");
+        let fb = accounting
+            .found_block_repo
+            .get_by_hash("abc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fb.status, "paid",
+            "found_block should become paid after on-chain confirmation"
+        );
     }
 
     #[tokio::test]
@@ -335,18 +360,32 @@ mod tests {
             .unwrap();
 
         // Different txid in the block — should NOT match
-        let txids = vec!["0000000000000000000000000000000000000000000000000000000000000000".to_string()];
+        let txids =
+            vec!["0000000000000000000000000000000000000000000000000000000000000000".to_string()];
 
-        let submitted = accounting.payout_repo.list_batches(Some("submitted")).unwrap();
+        let submitted = accounting
+            .payout_repo
+            .list_batches(Some("submitted"))
+            .unwrap();
         for batch in &submitted {
             if let Some(ref submitted_txid) = batch.submitted_txid {
                 if txids.contains(submitted_txid) {
-                    accounting.payout_repo.update_batch_status(batch.id, "confirmed").unwrap();
+                    accounting
+                        .payout_repo
+                        .update_batch_status(batch.id, "confirmed")
+                        .unwrap();
                 }
             }
         }
 
-        let updated_batch = accounting.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
-        assert_eq!(updated_batch.status, "submitted", "batch should stay submitted when txid doesn't match");
+        let updated_batch = accounting
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_batch.status, "submitted",
+            "batch should stay submitted when txid doesn't match"
+        );
     }
 }

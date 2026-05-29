@@ -204,8 +204,6 @@ impl NngEventConsumer {
         if self.job_tx.send(job).is_err() {
             node_int_warn!("no active session consumers for new job broadcast");
         }
-
-
     }
 }
 
@@ -322,7 +320,10 @@ pub(crate) async fn handle_block_connected(
     let block_hash = event.block.header.hash.to_hex_be();
     if let Ok(Some(fb)) = accounting.found_block_repo.get_by_hash(&block_hash) {
         if fb.status == "orphaned" {
-            match accounting.payout_repo.get_batches_by_block_hash(&block_hash) {
+            match accounting
+                .payout_repo
+                .get_batches_by_block_hash(&block_hash)
+            {
                 Ok(batches) => {
                     let has_submitted = batches.iter().any(|b| b.status == "submitted");
                     if has_submitted {
@@ -378,7 +379,10 @@ pub(crate) async fn handle_block_connected(
     }
 
     // Extract transaction IDs from the connected block for payout confirmation scanning.
-    let txids: Vec<String> = event.block.txs.iter()
+    let txids: Vec<String> = event
+        .block
+        .txs
+        .iter()
         .map(|bt| bt.tx.txid.to_hex_be())
         .collect();
 
@@ -762,7 +766,16 @@ mod tests {
         // Record a found_block at height 100 (immature)
         let round = accounting.resolve_round_for_template(42).unwrap();
         accounting
-            .record_found_block(round.id, "block1", 100, None, Some(42), Some("json-rpc"), 50000, "00000000ffff0000000000000000000000000000000000000000000000000000")
+            .record_found_block(
+                round.id,
+                "block1",
+                100,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                50000,
+                "00000000ffff0000000000000000000000000000000000000000000000000000",
+            )
             .unwrap();
 
         // BlockConnected at height 200 → confirmations = 200 - 100 + 1 = 101 >= 100
@@ -770,7 +783,11 @@ mod tests {
         handle_block_connected(event, &accounting, &chain_tip, &maturation_tx, 100).await;
 
         // The immature block should be matured
-        let found = accounting.found_block_repo.get_by_hash("block1").unwrap().unwrap();
+        let found = accounting
+            .found_block_repo
+            .get_by_hash("block1")
+            .unwrap()
+            .unwrap();
         assert_eq!(found.status, "matured");
 
         // The hash should appear on the maturation channel
@@ -794,7 +811,13 @@ mod tests {
         let round = accounting.resolve_round_for_template(42).unwrap();
         accounting
             .record_found_block(
-                round.id, "block1", 100, None, Some(42), Some("json-rpc"), 50000,
+                round.id,
+                "block1",
+                100,
+                None,
+                Some(42),
+                Some("json-rpc"),
+                50000,
                 "00000000ffff0000000000000000000000000000000000000000000000000000",
             )
             .unwrap();
@@ -850,10 +873,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(50), maturation_rx.recv()).await;
         match result {
             Ok(Some(PayoutEvent::BlockConnected(_))) => { /* expected */ }
-            other => panic!(
-                "expected BlockConnected signal, got: {:?}",
-                other,
-            ),
+            other => panic!("expected BlockConnected signal, got: {:?}", other,),
         }
     }
 
@@ -892,7 +912,10 @@ mod tests {
             .unwrap();
         // The orphan check restores to immature, then the maturation check immediately
         // promotes it because it already meets maturity depth (100+100 <= 200).
-        assert_eq!(fb.status, "matured", "orphaned block should be restored and matured in same event");
+        assert_eq!(
+            fb.status, "matured",
+            "orphaned block should be restored and matured in same event"
+        );
         assert_eq!(fb.orphan_reason, None, "orphan_reason should be cleared");
     }
 
@@ -938,7 +961,10 @@ mod tests {
             .get_by_hash(&zero_hash)
             .unwrap()
             .unwrap();
-        assert_eq!(fb.status, "matured", "orphaned block with pending batch should be restored to matured");
+        assert_eq!(
+            fb.status, "matured",
+            "orphaned block with pending batch should be restored to matured"
+        );
         assert_eq!(fb.orphan_reason, None, "orphan_reason should be cleared");
     }
 
@@ -971,7 +997,10 @@ mod tests {
             .unwrap();
         accounting
             .payout_repo
-            .mark_batch_submitted(batch.id, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2")
+            .mark_batch_submitted(
+                batch.id,
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+            )
             .unwrap();
 
         // Now orphan the block

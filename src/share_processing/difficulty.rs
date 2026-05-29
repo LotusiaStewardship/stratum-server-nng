@@ -480,7 +480,10 @@ mod tests {
         vardiff.record_share(now + Duration::from_secs(40));
         vardiff.record_share(now + Duration::from_secs(50));
         let result = vardiff.maybe_retarget(now + Duration::from_secs(62));
-        assert!(result.is_some(), "should retarget when ratio=2.0 (outside deadband)");
+        assert!(
+            result.is_some(),
+            "should retarget when ratio=2.0 (outside deadband)"
+        );
         let new_diff = result.unwrap();
         // ratio≈1.97, capped at 1.5x → diff = 2.0 * 1.5 = 3.0
         assert!(

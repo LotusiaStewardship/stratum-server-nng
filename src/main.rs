@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
         shutdown_tx.clone(),
         Some(accounting_service),
         Some(json_rpc_client.clone()),
-        config.vardiff.into()
+        config.vardiff.into(),
     ));
     // Notify server of the new job, broadcasting N_diff to all sessions.
     // Validates the integration path for future template refreshes (Slice 6).
@@ -283,7 +283,8 @@ async fn main() -> Result<()> {
                                 height = block.height,
                                 "block matured during startup reconciliation",
                             );
-                            let _ = maturation_tx.send(PayoutEvent::BlockMatured(block.block_hash.clone()));
+                            let _ = maturation_tx
+                                .send(PayoutEvent::BlockMatured(block.block_hash.clone()));
                         }
                     }
                     Err(e) => {
@@ -311,7 +312,7 @@ async fn main() -> Result<()> {
                     key,
                     json_rpc_client.clone(),
                     config.pool.signing.tx_fee_per_kb,
-     )?)
+                )?)
             }
             "external" => {
                 let url = config.pool.signing.webhook_url.as_deref().ok_or_else(|| {
