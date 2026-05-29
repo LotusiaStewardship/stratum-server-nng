@@ -19,21 +19,25 @@ pub fn network_target_hex_to_difficulty(hex: &str) -> Option<f64> {
 pub struct VarDiffConfig {
     /// Absolute minimum P_diff floor (default 0.001).
     pub min_floor: f64,
-    /// Initial P_diff as a percentage of N_diff (default 0.01 = 1%).
+    /// Initial P_diff as a percentage of N_diff (default 0.02 = 2%).
     pub initial_pct: f64,
     /// Target time between shares in seconds (default 20.0).
     pub target_secs: f64,
     /// Retarget interval in seconds (default 60.0).
     pub retarget_secs: f64,
+    /// Deadband: skip retarget when observed rate is within ±variance_percent
+    /// of target. Default 0.30 = ±30%. Set to 0.0 for the old behavior.
+    pub variance_percent: f64,
 }
 
 impl Default for VarDiffConfig {
     fn default() -> Self {
         Self {
             min_floor: 0.001,
-            initial_pct: 0.01,
+            initial_pct: 0.02,
             target_secs: 20.0,
             retarget_secs: 60.0,
+            variance_percent: 0.30,
         }
     }
 }
@@ -107,8 +111,9 @@ impl VarDiff {
     ///
     /// Retarget algorithm:
     /// - Window = time since last retarget
-    /// - Expected shares = retarget_secs / target_secs
+    /// - Expected shares = window_seconds / target_secs
     /// - Ratio = actual_shares / expected_shares
+    /// - If |ratio − 1| ≤ variance_percent: skip (inside deadband)
     /// - If ratio > 1.0 (too fast): new = current × min(ratio, 1.5)
     /// - If ratio < 1.0 (too slow): new = current × max(ratio, 0.67)
     /// - Clamp result to [min_floor, max]
@@ -129,8 +134,14 @@ impl VarDiff {
             return None;
         }
 
-        let expected = self.config.retarget_secs / self.config.target_secs;
+        let window_secs = window_duration.as_secs_f64();
+        let expected = window_secs / self.config.target_secs;
         let ratio = share_count / expected;
+
+        // Deadband: skip retarget if observed rate is within tolerance of target.
+        if (ratio - 1.0).abs() <= self.config.variance_percent {
+            return None;
+        }
 
         let new_diff = if ratio > 1.0 {
             (self.current * ratio.min(1.5)).clamp(self.config.min_floor, self.max)
@@ -161,11 +172,11 @@ mod tests {
     #[test]
     fn test_initial_difficulty_from_n_diff() {
         let now = Instant::now();
-        // N_diff = 100.0, initial_pct = 0.01 → expected P_diff = 1.0
+        // N_diff = 100.0, initial_pct = 0.02 → expected P_diff = 2.0
         let vardiff = VarDiff::new(default_config(), 100.0, now);
         assert!(
-            (vardiff.current() - 1.0).abs() < f64::EPSILON,
-            "expected P_diff = 1.0, got {}",
+            (vardiff.current() - 2.0).abs() < f64::EPSILON,
+            "expected P_diff = 2.0, got {}",
             vardiff.current()
         );
     }
@@ -175,7 +186,7 @@ mod tests {
         let now = Instant::now();
         let mut config = default_config();
         config.min_floor = 5.0;
-        // N_diff = 100.0, initial_pct = 0.01 → raw = 1.0, clamped to min_floor = 5.0
+        // N_diff = 100.0, initial_pct = 0.02 → raw = 2.0, clamped to min_floor = 5.0
         let vardiff = VarDiff::new(config, 100.0, now);
         assert!(
             (vardiff.current() - 5.0).abs() < f64::EPSILON,
@@ -230,14 +241,14 @@ mod tests {
             "expected retarget to fire for fast shares"
         );
         let new_diff = result.unwrap();
-        // Ratio = 6/3 = 2.0, capped at 1.5x → 1.0 * 1.5 = 1.5
+        // Ratio ≈ 1.97, capped at 1.5x → 2.0 * 1.5 = 3.0
         assert!(
-            (new_diff - 1.5).abs() < f64::EPSILON,
-            "expected P_diff = 1.5 (capped increase), got {}",
+            (new_diff - 3.0).abs() < f64::EPSILON,
+            "expected P_diff = 3.0 (capped increase), got {}",
             new_diff
         );
         assert!(
-            (vardiff.current() - 1.5).abs() < f64::EPSILON,
+            (vardiff.current() - 3.0).abs() < f64::EPSILON,
             "current P_diff should match retarget result"
         );
     }
@@ -257,14 +268,14 @@ mod tests {
             "expected retarget to fire for slow shares"
         );
         let new_diff = result.unwrap();
-        // Ratio = 1/3 ≈ 0.33, floored at 0.67x → 1.0 * 0.67 = 0.67
+        // Ratio ≈ 0.33, floored at 0.67x → 2.0 * 0.67 = 1.34
         assert!(
-            (new_diff - 0.67).abs() < 0.001,
-            "expected P_diff ≈ 0.67 (floored decrease), got {}",
+            (new_diff - 1.34).abs() < 0.001,
+            "expected P_diff ≈ 1.34 (floored decrease), got {}",
             new_diff
         );
         assert!(
-            (vardiff.current() - 0.67).abs() < 0.001,
+            (vardiff.current() - 1.34).abs() < 0.001,
             "current P_diff should match retarget result"
         );
     }
@@ -283,8 +294,8 @@ mod tests {
 
         assert!(result.is_none(), "expected no retarget when on target");
         assert!(
-            (vardiff.current() - 1.0).abs() < f64::EPSILON,
-            "P_diff should stay at 1.0"
+            (vardiff.current() - 2.0).abs() < f64::EPSILON,
+            "P_diff should stay at 2.0"
         );
     }
 
@@ -307,7 +318,7 @@ mod tests {
             "should not retarget before retarget_secs elapsed"
         );
         assert!(
-            (vardiff.current() - 1.0).abs() < f64::EPSILON,
+            (vardiff.current() - 2.0).abs() < f64::EPSILON,
             "P_diff should stay unchanged"
         );
     }
@@ -397,7 +408,7 @@ mod tests {
     fn test_update_max_higher_no_clamp() {
         let now = Instant::now();
         let mut vardiff = VarDiff::new(default_config(), 100.0, now);
-        // Current = 1.0, max = 100.0
+        // Current = 2.0 (initial_pct=0.02 × 100), max = 100.0
         // Update max to 200.0 (higher) — should not affect current
         let result = vardiff.update_max(200.0);
 
@@ -406,8 +417,8 @@ mod tests {
             "update_max should not signal when P_diff unchanged"
         );
         assert!(
-            (vardiff.current() - 1.0).abs() < f64::EPSILON,
-            "current should stay at 1.0 when max increases"
+            (vardiff.current() - 2.0).abs() < f64::EPSILON,
+            "current should stay at 2.0 when max increases"
         );
         assert!(
             (vardiff.max - 200.0).abs() < f64::EPSILON,
@@ -419,9 +430,9 @@ mod tests {
     fn test_update_max_no_clamp_when_at_or_below_max() {
         let now = Instant::now();
         let mut vardiff = VarDiff::new(default_config(), 100.0, now);
-        // Current = 1.0, max = 100.0
+        // Current = 2.0 (initial_pct=0.02 × 100), max = 100.0
 
-        // New max = 50.0 — current (1.0) is below max, no clamp needed
+        // New max = 50.0 — current (2.0) is below max, no clamp needed
         let result = vardiff.update_max(50.0);
 
         assert!(
@@ -429,10 +440,151 @@ mod tests {
             "update_max should not signal when current is already below new max"
         );
         assert!(
-            (vardiff.current() - 1.0).abs() < f64::EPSILON,
-            "current should stay at 1.0 when below new max"
+            (vardiff.current() - 2.0).abs() < f64::EPSILON,
+            "current should stay at 2.0 when below new max"
         );
         assert_eq!(vardiff.max, 50.0, "max should be updated regardless");
+    }
+
+    #[test]
+    fn test_deadband_skips_retarget_within_tolerance() {
+        let now = Instant::now();
+        let mut config = default_config();
+        config.variance_percent = 0.30;
+        // target_secs=20, retarget_secs=60 → expected=3 shares per window
+        // Fire exactly 3 shares in 62s → ratio = 3/3 = 1.0
+        // |1.0 - 1| = 0.00 ≤ 0.30 → must skip
+        let mut vardiff = VarDiff::new(config, 100.0, now);
+        vardiff.record_share(now + Duration::from_secs(5));
+        vardiff.record_share(now + Duration::from_secs(25));
+        vardiff.record_share(now + Duration::from_secs(45));
+        let result = vardiff.maybe_retarget(now + Duration::from_secs(62));
+        assert!(
+            result.is_none(),
+            "should skip retarget when ratio=1.0 (within deadband)"
+        );
+    }
+
+    #[test]
+    fn test_deadband_allows_retarget_outside_tolerance() {
+        let now = Instant::now();
+        let mut config = default_config();
+        config.variance_percent = 0.30;
+        // Fire 6 shares in 62s → ratio = 6/3 = 2.0
+        // |2.0 - 1| = 1.00 > 0.30 → must retarget
+        let mut vardiff = VarDiff::new(config, 100.0, now);
+        vardiff.record_share(now + Duration::from_secs(5));
+        vardiff.record_share(now + Duration::from_secs(10));
+        vardiff.record_share(now + Duration::from_secs(20));
+        vardiff.record_share(now + Duration::from_secs(30));
+        vardiff.record_share(now + Duration::from_secs(40));
+        vardiff.record_share(now + Duration::from_secs(50));
+        let result = vardiff.maybe_retarget(now + Duration::from_secs(62));
+        assert!(result.is_some(), "should retarget when ratio=2.0 (outside deadband)");
+        let new_diff = result.unwrap();
+        // ratio≈1.97, capped at 1.5x → diff = 2.0 * 1.5 = 3.0
+        assert!(
+            (new_diff - 3.0).abs() < f64::EPSILON,
+            "expected P_diff = 3.0, got {}",
+            new_diff
+        );
+    }
+
+    #[test]
+    fn test_expected_scales_with_window_duration() {
+        // target_secs=20, retarget_secs=60, variance_percent=0.30
+        // Step 1: 3 shares in 62s (equilibrium rate). Deadband skips retarget.
+        // Step 2: 3 more shares at t=65,85,105. Window extends to 106s, count=6.
+        //   OLD: expected=60/20=3 (constant), ratio=6/3=2.0 → FALSE RETARGET
+        //   NEW: expected=106/20=5.3, ratio=6/5.3≈1.13 → skip (within ±30%)
+        let now = Instant::now();
+        let mut config = default_config();
+        config.variance_percent = 0.30;
+        let mut vardiff = VarDiff::new(config, 100.0, now);
+
+        // Step 1: equilibrium rate (3 shares in first window)
+        vardiff.record_share(now + Duration::from_secs(5));
+        vardiff.record_share(now + Duration::from_secs(25));
+        vardiff.record_share(now + Duration::from_secs(45));
+        let r1 = vardiff.maybe_retarget(now + Duration::from_secs(62));
+        assert!(r1.is_none(), "equilibrium rate should be within deadband");
+
+        // Step 2: window extends, 3 more shares at equilibrium rhythm
+        vardiff.record_share(now + Duration::from_secs(65));
+        vardiff.record_share(now + Duration::from_secs(85));
+        vardiff.record_share(now + Duration::from_secs(105));
+        // Window = 106s, share_count = 6
+        // NEW: expected = 106/20 = 5.3, ratio = 6/5.3 ≈ 1.13
+        // |1.13 - 1| = 0.13 ≤ 0.30 → skip
+        let r2 = vardiff.maybe_retarget(now + Duration::from_secs(106));
+        assert!(
+            r2.is_none(),
+            "extended window at equilibrium must not produce false retarget"
+        );
+    }
+
+    #[test]
+    fn test_vardiff_converges_and_stabilizes() {
+        let now = Instant::now();
+        let config = VarDiffConfig {
+            target_secs: 20.0,
+            retarget_secs: 60.0,
+            variance_percent: 0.30,
+            min_floor: 0.001,
+            initial_pct: 0.10, // start at 10% for faster test convergence
+        };
+        let mut vardiff = VarDiff::new(config, 100.0, now);
+        // N_diff=100, initial_pct=0.10 → starts at P_diff=10.0
+        // Equilibrium: hashrate that would produce 1 share/20s at diff=100
+        // At diff D, shares per 60s window = 3 × 100 / D
+        assert!(
+            (vardiff.current() - 10.0).abs() < f64::EPSILON,
+            "initial diff should be 10.0"
+        );
+
+        let mut sim_time = now;
+        let mut retarget_count = 0u32;
+
+        // Run 12 retarget windows
+        for _ in 0..12 {
+            let exact = 3.0 * 100.0 / vardiff.current();
+            let count = exact.max(1.0).round() as u64;
+            let interval = 60.0 / count as f64;
+            for _ in 0..count {
+                sim_time += Duration::from_secs_f64(interval);
+                vardiff.record_share(sim_time);
+            }
+            if vardiff.maybe_retarget(sim_time).is_some() {
+                retarget_count += 1;
+            }
+        }
+
+        let final_diff = vardiff.current();
+        let deviation = (final_diff - 100.0).abs() / 100.0;
+        assert!(
+            deviation <= 0.30,
+            "final diff {final_diff} deviates {:.2}% from equilibrium (100.0) — should be ≤30%",
+            deviation * 100.0
+        );
+
+        // Verify stability: 5 more windows should produce zero retargets
+        let before = retarget_count;
+        for _ in 0..5 {
+            let exact = 3.0 * 100.0 / vardiff.current();
+            let count = exact.max(1.0).round() as u64;
+            let interval = 60.0 / count as f64;
+            for _ in 0..count {
+                sim_time += Duration::from_secs_f64(interval);
+                vardiff.record_share(sim_time);
+            }
+            if vardiff.maybe_retarget(sim_time).is_some() {
+                retarget_count += 1;
+            }
+        }
+        assert_eq!(
+            retarget_count, before,
+            "no retargets should fire after convergence (system stabilized)"
+        );
     }
 
     #[test]

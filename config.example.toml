@@ -179,6 +179,29 @@ vardiff_target_secs = 15.0
 # With target=15s and retarget=90s, you get ~6 samples per adjustment
 vardiff_retarget_secs = 90.0
 
+# Deadband tolerance for vardiff retargeting (fraction of target rate).
+#
+# When the observed share rate is within ±variance_percent of the target,
+# retarget is skipped entirely. This prevents Poisson noise in share arrivals
+# from causing unnecessary difficulty oscillation.
+# Default: 0.30 (±30%)
+#
+# Rationale:
+# - Share arrivals follow a Poisson process; at equilibrium, random variance
+#   produces apparent deviations from the target rate every window
+# - Without a deadband, every window retargets even when the miner is at
+#   their correct difficulty, causing perpetual oscillation
+# - With ±30%, the system skips retarget when e.g. 3–5 shares arrive in a
+#   60s window (target=4). Only persistent >30% deviations trigger adjustment
+# - Set to 0.0 for the old behavior (retarget on every window, high oscillation)
+#
+# Trade-offs:
+# - 0.0: Old behavior — retarget on every window (noisy)
+# - 0.10: Tight deadband, retargets on small deviations
+# - 0.30: Recommended — blocks most Poisson noise while still responsive
+# - 0.50: Loose deadband, fewer retargets but slower response to real changes
+vardiff_variance_percent = 0.30
+
 # -----------------------------------------------------------------------------
 # Example Scenarios
 # -----------------------------------------------------------------------------

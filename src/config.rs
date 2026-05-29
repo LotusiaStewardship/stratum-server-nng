@@ -52,6 +52,10 @@ pub struct VarDiffSettings {
     /// Retarget interval in seconds
     #[serde(default = "default_vardiff_retarget_secs")]
     pub retarget_secs: f64,
+    /// Deadband: skip retarget when observed rate is within ±variance_percent
+    /// of target. Default 0.30 = ±30%.
+    #[serde(default = "default_vardiff_variance_percent")]
+    pub variance_percent: f64,
 }
 
 impl Default for VarDiffSettings {
@@ -61,6 +65,7 @@ impl Default for VarDiffSettings {
             initial_pct: default_vardiff_initial_pct(),
             target_secs: default_vardiff_target_secs(),
             retarget_secs: default_vardiff_retarget_secs(),
+            variance_percent: default_vardiff_variance_percent(),
         }
     }
 }
@@ -273,6 +278,7 @@ impl From<VarDiffSettings> for crate::share_processing::VarDiffConfig {
             initial_pct: s.initial_pct,
             target_secs: s.target_secs,
             retarget_secs: s.retarget_secs,
+            variance_percent: s.variance_percent,
         }
     }
 }
@@ -316,6 +322,9 @@ fn default_vardiff_target_secs() -> f64 {
 }
 fn default_vardiff_retarget_secs() -> f64 {
     60.0
+}
+fn default_vardiff_variance_percent() -> f64 {
+    0.30
 }
 
 fn default_nng_pub_url() -> String {

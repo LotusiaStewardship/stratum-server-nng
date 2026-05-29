@@ -240,17 +240,17 @@ mod tests {
     #[test]
     fn test_current_difficulty() {
         let mut session = test_session("sess-10");
-        // Default: initial_pct (0.01) * N_diff (100.0) = 1.0
+        // Default: initial_pct (0.02) * N_diff (100.0) = 2.0
         assert!(
-            (session.current_difficulty() - 1.0).abs() < f64::EPSILON,
-            "expected default P_diff = 1.0, got {}",
+            (session.current_difficulty() - 2.0).abs() < f64::EPSILON,
+            "expected default P_diff = 2.0, got {}",
             session.current_difficulty()
         );
         // current_difficulty() comes from VarDiff, not from assigned_jobs
         session.record_assigned_job("job-1".to_string(), 512.0, "ntime".to_string());
         assert!(
-            (session.current_difficulty() - 1.0).abs() < f64::EPSILON,
-            "current_difficulty should still return VarDiff P_diff (1.0), got {}",
+            (session.current_difficulty() - 2.0).abs() < f64::EPSILON,
+            "current_difficulty should still return VarDiff P_diff (2.0), got {}",
             session.current_difficulty()
         );
     }

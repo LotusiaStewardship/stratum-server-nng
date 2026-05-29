@@ -77,6 +77,11 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 - Share difficulty = P_diff at assignment time (immutable)
 - VarDiff is per-session, not per-worker
 - `mining.set_difficulty` is sent on session start and after each retarget
+- Retarget algorithm includes a configurable deadband (`variance_percent`,
+  default ±30%): skips retarget when the observed share rate is within
+  tolerance of the target rate, preventing Poisson noise from causing
+  unnecessary oscillation. Expected share count uses actual window duration
+  so extended windows (from deadband skips) do not produce false retargets.
 
 ### Share Validation
 - Worker must be in session's authorized set
