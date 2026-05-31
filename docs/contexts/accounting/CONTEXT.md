@@ -1,6 +1,6 @@
 # Accounting Context
 
-**Last updated:** 2026-05-22  
+**Last updated:** 2026-05-31  
 **Related spec:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -42,6 +42,19 @@ src/accounting/
 ├── payout_repository.rs          # Payout batch CRUD, individual payouts, dust balance, share snapshot
 └── accounting_event_repository.rs # Append-only event recording and query
 ```
+
+### Methods on AccountingService
+
+| Method | Description | Async |
+|--------|-------------|-------|
+| `record_share` | Persist a share + outcome atomically, resolve round, record accounting event | No |
+| `record_found_block` | Record a found block, close current round | No |
+| `create_payout_for_found_block` | Build PPLNS payout plan, create batch + payouts + snapshots atomically | No |
+| `rebuild_payout_plan_for_batch` | Rebuild payouts from PPLNS window (recovery path) | No |
+| `process_pending_payouts` | Sign and submit pending payout batches | Yes |
+| `reconcile_found_blocks` | Validate immature blocks against chain state at startup | Yes |
+| `reconcile_submitted_payouts` | Check submitted payouts for on-chain confirmation at startup | Yes |
+| `check_maturation` | Promote immature blocks to matured based on tip height | No |
 
 ### Key Invariants
 

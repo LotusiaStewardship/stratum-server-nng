@@ -219,6 +219,54 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Payout reconciliation: check submitted payouts against on-chain state
+    main_info!("reconciling submitted payouts against chain state");
+    {
+        let rpc = json_rpc_client.clone();
+        match accounting_service
+            .reconcile_submitted_payouts(|txid: String| {
+                let rpc = rpc.clone();
+                async move {
+                    match rpc.get_raw_transaction(&txid).await {
+                        Ok(tx) => {
+                            let confirms = tx["confirmations"].as_i64().unwrap_or(0);
+                            Ok(Some(confirms))
+                        }
+                        Err(e) => {
+                            // "No such mempool or blockchain transaction" — not found
+                            let err_str = e.to_string();
+                            if err_str.contains("No such mempool")
+                                || err_str.contains("Invalid txid")
+                            {
+                                Ok(None)
+                            } else {
+                                Err(e)
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+        {
+            Ok(reconciled) => {
+                for (batch_id, txid, status) in &reconciled {
+                    main_info!(
+                        batch_id = batch_id,
+                        txid = %txid,
+                        status = %status,
+                        "payout reconciled at startup",
+                    );
+                }
+            }
+            Err(e) => {
+                main_warn!(
+                    error = %e,
+                    "payout reconciliation encountered errors",
+                );
+            }
+        }
+    }
+
     let nng_accounting = accounting_service.clone();
     let payout_accounting = accounting_service.clone();
 

@@ -1,3 +1,4 @@
+use crate::accounting_debug;
 use crate::accounting_error;
 use crate::accounting_info;
 use crate::accounting_warn;
@@ -996,6 +997,101 @@ impl AccountingService {
         }
 
         Ok(())
+    }
+
+    /// Reconcile submitted payout batches against on-chain transaction state at startup.
+    ///
+    /// For each batch with `status='submitted'` and a non-null `submitted_txid`:
+    /// 1. Call `check_tx(txid)` which returns:
+    ///    - `Ok(Some(n))` with `n > 0` → tx confirmed → batch → `confirmed`, found_block → `paid`
+    ///    - `Ok(Some(0))` → tx in mempool → leave as `submitted`
+    ///    - `Ok(None)` → tx not found by daemon → leave as `submitted`
+    ///    - `Err(e)` → RPC error → leave as `submitted`
+    ///
+    /// Returns the list of (batch_id, txid, new_status) for each reconciled batch
+    /// so the caller can log the results.
+    pub async fn reconcile_submitted_payouts<F, Fut>(
+        &self,
+        check_tx: F,
+    ) -> Result<Vec<(i64, String, String)>>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<i64>>>,
+    {
+        let submitted = self.payout_repo.list_batches(Some("submitted"))?;
+        let mut reconciled = Vec::new();
+
+        for batch in &submitted {
+            let Some(ref txid) = batch.submitted_txid else {
+                accounting_warn!(
+                    batch_id = batch.id,
+                    "submitted batch has no submitted_txid — skipping",
+                );
+                continue;
+            };
+
+            match check_tx(txid.clone()).await {
+                Ok(Some(confirmations)) => {
+                    if confirmations > 0 {
+                        // Tx is confirmed on-chain
+                        if let Err(e) = self.payout_repo.update_batch_status(batch.id, "confirmed") {
+                            accounting_error!(
+                                batch_id = batch.id,
+                                error = %e,
+                                "failed to mark batch confirmed",
+                            );
+                            continue;
+                        }
+
+                        // Also mark the found_block as paid
+                        if let Ok(Some(fb)) = self.found_block_repo.get_by_round_id(batch.round_id) {
+                            if let Err(e) = self.found_block_repo.update_status(fb.id, "paid") {
+                                accounting_error!(
+                                    batch_id = batch.id,
+                                    round_id = batch.round_id,
+                                    error = %e,
+                                    "failed to mark found_block paid",
+                                );
+                            }
+                        }
+
+                        accounting_info!(
+                            batch_id = batch.id,
+                            txid = %txid,
+                            confirmations = confirmations,
+                            "payout reconciled as confirmed at startup",
+                        );
+                        reconciled.push((batch.id, txid.clone(), "confirmed".to_string()));
+                    } else {
+                        // confirmations == 0: tx still in mempool
+                        accounting_debug!(
+                            batch_id = batch.id,
+                            txid = %txid,
+                            "payout tx in mempool, leaving as submitted",
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // Tx not found — leave as submitted (safe default)
+                    accounting_warn!(
+                        batch_id = batch.id,
+                        txid = %txid,
+                        "payout tx not found by node, leaving as submitted",
+                    );
+                }
+                Err(e) => {
+                    // RPC error — leave as submitted (retry next startup)
+                    accounting_warn!(
+                        batch_id = batch.id,
+                        txid = %txid,
+                        error = %e,
+                        "failed to check payout tx status, leaving as submitted",
+                    );
+                }
+            }
+        }
+
+        Ok(reconciled)
     }
 
     /// Check all immature found blocks for maturation.
@@ -2322,6 +2418,212 @@ mod tests {
             dust_after_2 > dust_after_1,
             "dust should grow across rounds (additive-only): after_1={dust_after_1}, after_2={dust_after_2}",
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_submitted_payouts_confirms_batch() {
+        // A submitted payout with a confirmed tx should be promoted to 'confirmed'
+        // and its found_block should become 'paid'.
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        // Round + found_block
+        let round = svc.get_or_create_current_round(42).unwrap();
+        svc.found_block_repo
+            .record_found_block(
+                round.id,
+                "00000000cafebabe00000000000000000000000000000000000000000000000000",
+                1000,
+                None,
+                None,
+                None,
+                5000,
+                "0000ffff0000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+        // Create a submitted batch
+        let batch = svc
+            .payout_repo
+            .create_payout_batch(
+                round.id,
+                4900,
+                100,
+                Some("fee_address"),
+                1,
+                "hash:1",
+            )
+            .unwrap();
+        let txid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
+        svc.payout_repo.mark_batch_submitted(batch.id, txid).unwrap();
+
+        // Mock: tx confirmed with 6 confirmations
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let cc = call_count.clone();
+        let check_tx = |txid: String| {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(txid, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2");
+                Ok(Some(6))
+            }
+        };
+
+        let reconciled = svc
+            .reconcile_submitted_payouts(check_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "check_tx should be called once"
+        );
+        assert_eq!(reconciled.len(), 1, "one batch should be reconciled");
+        assert_eq!(reconciled[0].0, batch.id, "batch id should match");
+        assert_eq!(reconciled[0].1, txid, "txid should match");
+        assert_eq!(
+            reconciled[0].2, "confirmed",
+            "status should be confirmed"
+        );
+
+        let updated_batch = svc
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_batch.status, "confirmed",
+            "batch should be confirmed"
+        );
+
+        let fb = svc
+            .found_block_repo
+            .get_by_hash("00000000cafebabe00000000000000000000000000000000000000000000000000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb.status, "paid", "found_block should be paid");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_submitted_payouts_leaves_unconfirmed_in_mempool() {
+        // A submitted payout whose tx is still in mempool (confirmations=0)
+        // should remain 'submitted'.
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let round = svc.get_or_create_current_round(42).unwrap();
+        svc.found_block_repo
+            .record_found_block(
+                round.id,
+                "00000000cafebabe00000000000000000000000000000000000000000000000000",
+                1000,
+                None,
+                None,
+                None,
+                5000,
+                "",
+            )
+            .unwrap();
+
+        let batch = svc
+            .payout_repo
+            .create_payout_batch(round.id, 4900, 100, None, 1, "hash:1")
+            .unwrap();
+        svc.payout_repo
+            .mark_batch_submitted(batch.id, "tx-in-mempool")
+            .unwrap();
+
+        let check_tx = |_txid: String| async { Ok(Some(0)) };
+        let reconciled = svc.reconcile_submitted_payouts(check_tx).await.unwrap();
+
+        assert!(
+            reconciled.is_empty(),
+            "unconfirmed tx should not be reconciled"
+        );
+
+        let updated = svc
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "submitted", "should stay submitted");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_submitted_payouts_leaves_on_not_found() {
+        // A submitted payout whose tx is not found by the daemon (mempool
+        // eviction, reorg) should remain 'submitted'.
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let round = svc.get_or_create_current_round(42).unwrap();
+        svc.found_block_repo
+            .record_found_block(round.id, "blockhash", 1000, None, None, None, 5000, "")
+            .unwrap();
+
+        let batch = svc
+            .payout_repo
+            .create_payout_batch(round.id, 4900, 100, None, 1, "hash:1")
+            .unwrap();
+        svc.payout_repo
+            .mark_batch_submitted(batch.id, "dropped-tx")
+            .unwrap();
+
+        let check_tx = |_txid: String| async { Ok(None) };
+        let reconciled = svc.reconcile_submitted_payouts(check_tx).await.unwrap();
+
+        assert!(reconciled.is_empty(), "not-found tx should stay submitted");
+
+        let updated = svc
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "submitted", "should stay submitted");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_submitted_payouts_leaves_on_rpc_error() {
+        // When the RPC call itself fails, submitted payouts should remain
+        // as-is (retry next startup).
+        let f = NamedTempFile::new().unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        init_schema(&conn).unwrap();
+        let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+
+        let round = svc.get_or_create_current_round(42).unwrap();
+        svc.found_block_repo
+            .record_found_block(round.id, "blockhash", 1000, None, None, None, 5000, "")
+            .unwrap();
+
+        let batch = svc
+            .payout_repo
+            .create_payout_batch(round.id, 4900, 100, None, 1, "hash:1")
+            .unwrap();
+        svc.payout_repo
+            .mark_batch_submitted(batch.id, "error-tx")
+            .unwrap();
+
+        let check_tx = |_txid: String| async {
+            Err(anyhow::anyhow!("connection refused"))
+        };
+        let reconciled = svc.reconcile_submitted_payouts(check_tx).await.unwrap();
+
+        assert!(reconciled.is_empty(), "RPC error should leave batch as-is");
+
+        let updated = svc
+            .payout_repo
+            .get_batch_by_id(batch.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "submitted", "should stay submitted");
     }
 
     #[test]

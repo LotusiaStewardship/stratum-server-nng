@@ -351,6 +351,17 @@ A message sent through an `mpsc::UnboundedSender<String>` channel when a block t
 ### matured_at
 A `DATETIME` column on the `found_blocks` table, set to `CURRENT_TIMESTAMP` by `FoundBlockRepository::mark_matured` when a block reaches `min_confirmations` confirmations. Null until the block matures.
 
+### Payout Reconciliation
+A startup-time procedure that validates the pool's `submitted` payout batches against the current on-chain transaction state. Queries `payout_batches` with `status='submitted'` and checks each batch's `submitted_txid` via `getrawtransaction` JSON-RPC. For each submitted batch:
+1. If tx is confirmed (`confirmations > 0`): mark batch as `confirmed`, mark associated `found_block` as `paid`
+2. If tx is in mempool (`confirmations == 0`): leave as `submitted`
+3. If tx not found by node: leave as `submitted` with a warning (safe default)
+4. If RPC error: leave as `submitted` (retries next startup)
+
+**Key invariant:** Reconciliation runs once at startup before accepting miner connections and before block maturation checks. It ensures submitted payouts are advanced to `confirmed` even if the pool missed the runtime `BlockConnected` event that would normally trigger this transition.
+
+**Key invariant:** A batch that stays `submitted` after reconciliation is left in a safe state — either its tx will confirm naturally (visible via future `BlockConnected` events at runtime) or requires operator investigation (tx dropped from mempool).
+
 ## Accounting Terms
 
 ### Orphaned

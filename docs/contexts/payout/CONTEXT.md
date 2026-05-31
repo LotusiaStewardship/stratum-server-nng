@@ -1,6 +1,6 @@
 # Payout Context
 
-**Last updated:** 2026-05-28  
+**Last updated:** 2026-05-31  
 **Related specs:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md), [Block Maturation Check](./specs/maturation-check.md), [ADR 007: Payout Empty-Output Guard](../adrs/007-payout-empty-output-guard.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -69,6 +69,7 @@ src/payout/
 ### Known Limitations
 
 - **Maturation check implemented:** Blocks transition `immature → matured → paid`. See the [maturation check spec](./specs/maturation-check.md).
+- **Startup payout reconciliation implemented:** See `AccountingService::reconcile_submitted_payouts`. Checks `submitted` batches against on-chain tx state via `getrawtransaction` JSON-RPC at startup. Confirmed tx → batch → `confirmed`, found_block → `paid`.
 - External signer is a scaffold — no retry/poll logic for async signing workflows.
 - `pool.signing.webhook_url` config accepted but not yet exposed in all environments.
 - Signing uses `process_pending_payouts` which can be called from the scheduler loop or any trigger point.
