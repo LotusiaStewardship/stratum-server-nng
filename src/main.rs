@@ -421,7 +421,7 @@ async fn main() -> Result<()> {
     });
     shutdown.register_task(stratum_handle);
 
-    // Stats updater - syncs connected miners count from Stratum server
+    // Stats updater - syncs connected miners count and N_diff from Stratum server
     let stats_clone = stats.clone();
     let mut stats_shutdown_signal = shutdown.signal();
     let stats_handle = tokio::spawn(async move {
@@ -431,9 +431,11 @@ async fn main() -> Result<()> {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                     uptime += 1;
                     let connected = stratum_for_stats.connected_miners().await;
+                    let latest_target = stratum_for_stats.latest_target_hex().await;
                     let mut s = stats_clone.write().await;
                     s.uptime_secs = uptime;
                     s.connected_miners = connected;
+                    s.network_difficulty = latest_target;
                 }
                 _ = stats_shutdown_signal.recv() => {
                     main_info!("stats updater shutting down");

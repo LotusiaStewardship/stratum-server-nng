@@ -98,6 +98,11 @@ impl StratumServer {
         *self.connected_miners.read().await
     }
 
+    /// Get the network target hex from the latest cached job, if any.
+    pub async fn latest_target_hex(&self) -> Option<String> {
+        self.job_cache.get_latest_target_hex().await
+    }
+
     /// Run the TCP server, accepting connections until shutdown.
     pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.bind_address).await?;
