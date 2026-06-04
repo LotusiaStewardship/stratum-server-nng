@@ -1034,7 +1034,8 @@ impl AccountingService {
                 Ok(Some(confirmations)) => {
                     if confirmations > 0 {
                         // Tx is confirmed on-chain
-                        if let Err(e) = self.payout_repo.update_batch_status(batch.id, "confirmed") {
+                        if let Err(e) = self.payout_repo.update_batch_status(batch.id, "confirmed")
+                        {
                             accounting_error!(
                                 batch_id = batch.id,
                                 error = %e,
@@ -1044,7 +1045,8 @@ impl AccountingService {
                         }
 
                         // Also mark the found_block as paid
-                        if let Ok(Some(fb)) = self.found_block_repo.get_by_round_id(batch.round_id) {
+                        if let Ok(Some(fb)) = self.found_block_repo.get_by_round_id(batch.round_id)
+                        {
                             if let Err(e) = self.found_block_repo.update_status(fb.id, "paid") {
                                 accounting_error!(
                                     batch_id = batch.id,
@@ -2447,17 +2449,12 @@ mod tests {
         // Create a submitted batch
         let batch = svc
             .payout_repo
-            .create_payout_batch(
-                round.id,
-                4900,
-                100,
-                Some("fee_address"),
-                1,
-                "hash:1",
-            )
+            .create_payout_batch(round.id, 4900, 100, Some("fee_address"), 1, "hash:1")
             .unwrap();
         let txid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
-        svc.payout_repo.mark_batch_submitted(batch.id, txid).unwrap();
+        svc.payout_repo
+            .mark_batch_submitted(batch.id, txid)
+            .unwrap();
 
         // Mock: tx confirmed with 6 confirmations
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -2466,15 +2463,15 @@ mod tests {
             let cc = cc.clone();
             async move {
                 cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                assert_eq!(txid, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2");
+                assert_eq!(
+                    txid,
+                    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+                );
                 Ok(Some(6))
             }
         };
 
-        let reconciled = svc
-            .reconcile_submitted_payouts(check_tx)
-            .await
-            .unwrap();
+        let reconciled = svc.reconcile_submitted_payouts(check_tx).await.unwrap();
 
         assert_eq!(
             call_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -2484,16 +2481,9 @@ mod tests {
         assert_eq!(reconciled.len(), 1, "one batch should be reconciled");
         assert_eq!(reconciled[0].0, batch.id, "batch id should match");
         assert_eq!(reconciled[0].1, txid, "txid should match");
-        assert_eq!(
-            reconciled[0].2, "confirmed",
-            "status should be confirmed"
-        );
+        assert_eq!(reconciled[0].2, "confirmed", "status should be confirmed");
 
-        let updated_batch = svc
-            .payout_repo
-            .get_batch_by_id(batch.id)
-            .unwrap()
-            .unwrap();
+        let updated_batch = svc.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
         assert_eq!(
             updated_batch.status, "confirmed",
             "batch should be confirmed"
@@ -2546,11 +2536,7 @@ mod tests {
             "unconfirmed tx should not be reconciled"
         );
 
-        let updated = svc
-            .payout_repo
-            .get_batch_by_id(batch.id)
-            .unwrap()
-            .unwrap();
+        let updated = svc.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
         assert_eq!(updated.status, "submitted", "should stay submitted");
     }
 
@@ -2581,11 +2567,7 @@ mod tests {
 
         assert!(reconciled.is_empty(), "not-found tx should stay submitted");
 
-        let updated = svc
-            .payout_repo
-            .get_batch_by_id(batch.id)
-            .unwrap()
-            .unwrap();
+        let updated = svc.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
         assert_eq!(updated.status, "submitted", "should stay submitted");
     }
 
@@ -2611,18 +2593,12 @@ mod tests {
             .mark_batch_submitted(batch.id, "error-tx")
             .unwrap();
 
-        let check_tx = |_txid: String| async {
-            Err(anyhow::anyhow!("connection refused"))
-        };
+        let check_tx = |_txid: String| async { Err(anyhow::anyhow!("connection refused")) };
         let reconciled = svc.reconcile_submitted_payouts(check_tx).await.unwrap();
 
         assert!(reconciled.is_empty(), "RPC error should leave batch as-is");
 
-        let updated = svc
-            .payout_repo
-            .get_batch_by_id(batch.id)
-            .unwrap()
-            .unwrap();
+        let updated = svc.payout_repo.get_batch_by_id(batch.id).unwrap().unwrap();
         assert_eq!(updated.status, "submitted", "should stay submitted");
     }
 
