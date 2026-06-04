@@ -111,17 +111,17 @@ pub fn create_router(state: AppState) -> Router {
             get(crate::http_api::routes::list_workers),
         )
         .route(
-            "/api/v1/workers/{id}",
+            "/api/v1/workers/:id",
             get(crate::http_api::routes::get_worker),
         )
         .route("/api/v1/rounds", get(crate::http_api::routes::list_rounds))
         .route(
-            "/api/v1/rounds/{id}",
+            "/api/v1/rounds/:id",
             get(crate::http_api::routes::get_round),
         )
         .route("/api/v1/blocks", get(crate::http_api::routes::list_blocks))
         .route(
-            "/api/v1/blocks/{hash}",
+            "/api/v1/blocks/:hash",
             get(crate::http_api::routes::get_block),
         )
         .route(
@@ -129,11 +129,11 @@ pub fn create_router(state: AppState) -> Router {
             get(crate::http_api::routes::list_payouts),
         )
         .route(
-            "/api/v1/payouts/{id}",
+            "/api/v1/payouts/:id",
             get(crate::http_api::routes::get_payout),
         )
         .route(
-            "/api/v1/admin/payouts/trigger/{block_hash}",
+            "/api/v1/admin/payouts/trigger/:block_hash",
             post(crate::http_api::routes::trigger_payout),
         )
         .route("/api/v1/shares", get(crate::http_api::routes::list_shares))
