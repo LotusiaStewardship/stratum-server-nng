@@ -1,318 +1,172 @@
-# -----------------------------------------------------------------------------
-# stratum-server-nng example configuration
-# -----------------------------------------------------------------------------
+# Stratum Server NNG — Configuration Reference
 #
-# This file is meant to be copied to `config.toml` and adjusted for your site.
+# Copy this file to config.toml and adjust values for your deployment.
+# All fields have sensible defaults where noted; only a few are required.
 #
-# Safety notes:
-# - The pool payout script must be explicit.
-# - Do not leave it as OP_RETURN / nulldata.
-# - `pool.signing.private_key` is only for the in-process signer path.
-# - Prefer keeping private keys out of the stratum process when you can.
-# -----------------------------------------------------------------------------
+# Environment variable overrides:
+#   NNG_RPC_URL        → nng_rpc_url
+#   NNG_PUB_URL        → nng_pub_url
+#   STRATUM_API_TOKEN  → api_token
+#   DATABASE_PATH      → sqlite_path
+#   DATABASE_NETWORK   → network (auto-detected from bitcoind_rpc.url port)
+#   BITCOIND_RPC_URL   → bitcoind_rpc.url
+#   BITCOIND_RPC_USER  → bitcoind_rpc.rpc_user
+#   BITCOIND_RPC_PASS  → bitcoind_rpc.rpc_pass
+#   POOL_PAYOUT_ADDRESS      → pool.mining_identity.payout_address
+#   POOL_COINBASE_IDENTITY   → pool.mining_identity.coinbase_identity
+#   POOL_FEE_ENABLED         → pool.fee.enabled
+#   POOL_FEE_BPS             → pool.fee.fee_bps
+#   POOL_FEE_ADDRESS         → pool.fee.fee_address
+#   POOL_PPLNS_N_MULTIPLIER  → pool.pplns.n_multiplier
+#   POOL_PPLNS_MIN_PAYOUT_SAT → pool.pplns.min_payout_sat
+#   POOL_SIGNING_MODE         → pool.signing.mode
+#   POOL_SIGNING_PRIVATE_KEY  → pool.signing.private_key
+#   DEBUG                     → debug ("true"/"1"/"yes")
 
-debug = false
+# === Server ===
 
-# -----------------------------------------------------------------------------
-# Network Configuration
-# -----------------------------------------------------------------------------
-#
-# The network is AUTO-DETECTED from the bitcoind_rpc.url port:
-# - Port 10604 → mainnet → ./dbs/mainnet/stratum-accounting.sqlite3
-# - Port 11604 → testnet → ./dbs/testnet/stratum-accounting.sqlite3
-# - Port 12604 → regtest → ./dbs/regtest/stratum-accounting.sqlite3
-#
-# You can override the network explicitly (not recommended):
-# network = "mainnet"
-#
-# You can override the database path explicitly:
-# sqlite_path = "./custom-path.sqlite3"
-# -----------------------------------------------------------------------------
-
-# Stratum TCP listen address for miners.
-# IMPORTANT: Use different ports for different networks:
-# - mainnet:  0.0.0.0:3334 (or your production port)
-# - testnet:  0.0.0.0:13334
-# - regtest:  0.0.0.0:23334
+# TCP bind address for Stratum V1 miner connections.
 stratum_bind = "0.0.0.0:3334"
 
-# Operator API listen address.
-# IMPORTANT: Use different ports for different networks:
-# - mainnet:  127.0.0.1:18080
-# - testnet:  127.0.0.1:18081
-# - regtest:  127.0.0.1:18082
+# HTTP bind address for API (health, stats, workers, etc.).
 api_bind = "127.0.0.1:18080"
 
-# Bearer token for authenticated operator endpoints.
-# Can also be overridden by STRATUM_API_TOKEN in the environment.
-api_token = "devtoken"
+# Bearer token for API authentication. Required. All endpoints except /health
+# require `Authorization: Bearer <token>`. Default: "devtoken".
+# api_token = "devtoken"
 
-# -----------------------------------------------------------------------------
-# Public HTTP Dashboard Configuration
-# -----------------------------------------------------------------------------
+# === lotusd Connection ===
 
-# Enable/disable the public HTTP dashboard
-http_enabled = true
+# NNG RPC URL for template fetching and coinbase identity registration.
+# Format: ipc:///path/to/lotusd.rpc (Unix socket) or tcp://host:port
+nng_rpc_url = "ipc:///tmp/lotusd.rpc"
 
-# HTTP server bind address (public-facing)
-# IMPORTANT: Use different ports for different networks:
-# - mainnet:  0.0.0.0:8080
-# - testnet:  0.0.0.0:18080
-# - regtest:  0.0.0.0:28080
-http_bind = "0.0.0.0:8080"
+# NNG Pub/Sub URL for real-time events (template changes, block connects/disconnects).
+# Default: same as nng_rpc_url with ".pub" suffix.
+# nng_pub_url = "ipc:///tmp/lotusd.pub"
 
-# SQLite accounting database path.
-# Auto-derived from RPC port (see Network Configuration above).
-# Set explicitly to override auto-detection.
+# === Database ===
 
-# lotusd NNG RPC endpoint used for mining template requests and block submission.
-# Use ipc:// on the same host or tcp:// when intentionally exposed.
-nng_rpc_url = "ipc://datadir/nngrpc.pipe"
+# SQLite path. If empty or contains "stratum-accounting", auto-derived from network.
+# Convention: ./dbs/{network}/stratum-accounting.sqlite3
+# Explicit path is NOT suffixed — set it directly for custom locations.
+# sqlite_path = ""
 
-# lotusd NNG Pub/Sub endpoint used for updateblktip / mempool / reorg events.
-nng_pub_url = "ipc://datadir/nngpub.pipe"
+# Network: "mainnet", "testnet", or "regtest". Auto-detected from RPC port
+# (10604=mainnet, 11604=testnet, 12604=regtest) if not set. Required.
+# network = "mainnet"
 
-# -----------------------------------------------------------------------------
-# Variable Difficulty Configuration
-# -----------------------------------------------------------------------------
-# 
-# The stratum server uses DYNAMIC difficulty adjustment by default.
-# Pool difficulty automatically tracks network difficulty from lotusd.
-# Legacy static difficulty configuration is NOT supported.
-#
-# How it works (Network-Aware Scaling):
-# 1. lotusd publishes new mining templates via NNG pub/sub when blocks are found
-# 2. Stratum server fetches the new template (contains new network difficulty)
-# 3. Pool difficulty = Network difficulty (tracks chain automatically)
-# 4. All connected miners receive updated difficulty via mining.set_difficulty
-# 5. Per-miner VarDiff fine-tunes from this baseline based on share rate
-#
-# Network-Aware Scaling Benefits:
-# - No stale config: Pool difficulty tracks network difficulty automatically
-# - Simpler mental model: Network diff = ground truth
-# - Fewer config params: Only vardiff_min_floor + vardiff_initial_pct needed
-# - Automatic scaling: No need to retune when network diff changes 10x
-#
+# === lotusd JSON-RPC ===
+
+[bitcoind_rpc]
+# HTTP JSON-RPC URL for submitblock, getblockcount, getblockhash, getrawtransaction.
+# Default: "http://127.0.0.1:10604"
+# url = "http://127.0.0.1:10604"
+# RPC username (lotusd -rpcuser).
+rpc_user = "lotus"
+# RPC password (lotusd -rpcpassword).
+rpc_pass = "lotus"
+
+# === Variable Difficulty ===
 
 [vardiff]
+# Absolute minimum pool difficulty floor. Default: 0.001
+# min_floor = 0.001
 
-# Absolute minimum difficulty floor for VarDiff (safety only).
-#
-# This is the absolute lowest difficulty any miner can have.
-# Default: 0.001 (very low, allows tiny miners to participate)
-#
-# Rationale:
-# - This is a SAFETY FLOOR ONLY - rarely hit in normal operation
-# - VarDiff scales per-miner difficulty within [vardiff_min_floor, network_difficulty]
-# - Prevents difficulty from crashing to near-zero on edge cases
-# - 0.001 is intentionally tiny:
-#   - Allows CPU/mobile miners to participate during testing
-#   - Network difficulty is the real ceiling, not this floor
-#   - VarDiff quickly adjusts from network_diff based on share rate
-#
-# DO NOT set this above 1.0 unless you have a specific reason.
-# Extremely high vardiff_min_floor defeats the purpose of dynamic adjustment.
-vardiff_min_floor = 0.001
+# Initial pool difficulty as fraction of network difficulty. Default: 0.01 (1%)
+# initial_pct = 0.01
 
-# Initial difficulty for new miners as a fraction of network difficulty.
-#
-# New miners start at `network_diff * vardiff_initial_pct` and VarDiff ramps
-# up based on observed share rate. This lets the pool quickly calibrate the
-# correct difficulty for each miner's hashrate.
-# Default: 0.01 (1% of network difficulty)
-#
-# Rationale:
-# - Starting at full network difficulty may be too hard for small miners
-# - A low initial difficulty lets them submit shares immediately
-# - VarDiff then ramps up to match their actual hashrate
-# - Typical values: 0.01 (1%) to 0.1 (10%)
-#
-# Trade-offs:
-# - 0.01 (1%): Very easy initial shares, fast ramp-up [RECOMMENDED]
-# - 0.05 (5%): Moderate initial difficulty
-# - 0.10 (10%): Higher initial bar, slower ramp for small miners
-# - 1.0 (100%): Start at full network diff (previous behavior)
-vardiff_initial_pct = 0.01
+# Target seconds between accepted shares. Default: 20.0
+# target_secs = 20.0
 
-# Target time between accepted shares for vardiff tuning.
-#
-# Rationale:
-# - This is the TARGET, not a hard limit
-# - VarDiff adjusts each miner's difficulty to achieve this average
-# - Lower values = more shares, more precise hashrate estimation
-# - Higher values = fewer shares, less server load
-# - 15.0 seconds is a good balance for most deployments
-#
-# Trade-offs:
-# - 5s: Very responsive, high server load, may cause network congestion
-# - 15s: Balanced [RECOMMENDED]
-# - 30s: Lower load, slower hashrate detection
-# - 60s+: Only for very high-hashrate pools with many miners
-#
-# Monitor your server's share acceptance rate and adjust accordingly.
-# Ideal: 2-10 shares per minute per miner
-vardiff_target_secs = 15.0
+# How often to retarget (seconds). Default: 60.0
+# retarget_secs = 60.0
 
-# How often vardiff is allowed to retarget per miner.
-#
-# Rationale:
-# - Must be significantly longer than vardiff_target_secs
-# - Allows enough share samples for meaningful statistics
-# - Shorter intervals = faster adaptation, more volatility
-# - Longer intervals = more stability, slower adaptation
-# - 90.0 seconds provides good stability with reasonable adaptation
-#
-# Rule of thumb: vardiff_retarget_secs >= 6 * vardiff_target_secs
-# With target=15s and retarget=90s, you get ~6 samples per adjustment
-vardiff_retarget_secs = 90.0
+# Deadband: skip retarget when share rate is within ±N% of target.
+# Prevents oscillation from Poisson variance. Default: 0.30 (±30%)
+# variance_percent = 0.30
 
-# -----------------------------------------------------------------------------
-# Example Scenarios
-# -----------------------------------------------------------------------------
-#
-# Testnet with low hashrate:
-#   vardiff_min_floor     = 0.001    # Tiny floor (weak miners can participate)
-#   vardiff_initial_pct   = 0.01     # Start at 1% of network diff for quick calibration
-#   vardiff_target_secs   = 10.0     # More frequent shares for better tracking
-#
-# Mainnet production pool:
-#   vardiff_min_floor     = 0.001    # Floor stays tiny; network diff is the ceiling
-#   vardiff_initial_pct   = 0.01     # Default: start at 1% of network diff
-#   vardiff_target_secs   = 15.0     # Standard target
-#
-# High-hashrate pool (many ASIC miners):
-#   vardiff_min_floor     = 0.001    # Floor stays tiny
-#   vardiff_initial_pct   = 0.05     # Start at 5% — ASICs handle higher initial diff
-#   vardiff_target_secs   = 20.0     # Fewer shares needed for stats
-# -----------------------------------------------------------------------------
-#
-# Testnet with low hashrate:
-#   vardiff_min_floor = 0.001    # Tiny floor (weak miners can participate)
-#   vardiff_target_secs = 10.0   # More frequent shares for better tracking
-#
-# Mainnet production pool:
-#   vardiff_min_floor = 0.001    # Floor stays tiny; network diff is the ceiling
-#   vardiff_target_secs = 15.0   # Standard target
-#
-# High-hashrate pool (many ASIC miners):
-#   vardiff_min_floor = 0.001    # Floor stays tiny
-#   vardiff_target_secs = 20.0   # Fewer shares needed for stats
-# -----------------------------------------------------------------------------
-
-# Protocol hardening limits.
-max_request_line_bytes = 8192
-per_conn_req_per_sec = 128
-conn_idle_timeout_secs = 180
-
-# Bound how many jobs are kept in memory for stale-job / duplicate-request handling.
-max_jobs_cache = 512
+# === Pool ===
 
 [pool]
-name = "Lotusia Pool"
+# Optional display name.
+# name = "My Lotus Pool"
+
+# === Pool → Mining Identity ===
+# REQUIRED for production. Without this, block rewards are burned (OP_RETURN).
+# Set exactly one of payout_address or payout_script_hex.
 
 [pool.mining_identity]
-# The payout destination for block subsidies and mining rewards.
-# One of these must be set:
-# - payout_address (recommended for operator ergonomics)
-# - payout_script_hex (raw scriptPubKey)
-#
-# The resolved script must not be OP_RETURN / nulldata.
-# IMPORTANT: Use network-specific addresses:
-# - mainnet:  lotus_...
-# - testnet:  lotusT...
-# - regtest:  lotusR... (or testnet-style)
-payout_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
-# payout_script_hex = "76a914...88ac"
+# Lotus address where block rewards are sent.
+# payout_address = "lotus_16PSJNRge55cpi1srcnK6A3YXuTZKpzrUir3ZBwTD"
 
-# Optional UTF-8 pool/operator identity tag embedded in coinbase scriptSig.
-# This is metadata, not a payout destination.
-# coinbase_identity = "Lotusia Pool"
+# Raw hex-encoded output script (alternative to payout_address).
+# payout_script_hex = "76a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac"
+
+# Optional UTF-8 tag embedded in coinbase input scriptSig (visible in block explorers).
+# coinbase_identity = "Mined by MyPool"
+
+# === Pool → Fee ===
 
 [pool.fee]
-# Enable or disable pool fee collection.
-# When enabled, the fee is deducted from gross block reward before miner payouts.
-enabled = true
+# Enable pool fee collection. Default: true
+# enabled = true
 
-# Fee rate in basis points.
-# Example: 100 = 1.00%, 50 = 0.50%, 0 = disabled behavior without turning off the section.
-fee_bps = 100
+# Fee rate in basis points (100 = 1.00%). Default: 100 (1%)
+# fee_bps = 100
 
-# Fee destination.
-# One of these must be set when fee collection is enabled:
-# - fee_address
-# - fee_script_hex
-# IMPORTANT: Use network-specific addresses:
-# - mainnet:  lotus_...
-# - testnet:  lotusT...
-# - regtest:  lotusR... (or testnet-style)
-fee_address = "lotus_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
-# fee_script_hex = "76a914...88ac"
+# Lotus address for fee collection.
+# fee_address = "lotus_..."
+
+# Raw hex-encoded output script (alternative to fee_address).
+# fee_script_hex = "76a914..."
+
+# === Pool → PPLNS ===
 
 [pool.pplns]
-# Difficulty-weighted PPLNS window multiplier.
-#
-# The PPLNS window size N = n_multiplier × network_difficulty (in raw difficulty
-# units). This determines how many expected rounds of work are covered by the
-# sliding window.
-#
-# Industry standard: 2.0 (spans ~2 expected rounds).
-# - 1.0: Low variance smoothing; approaches PROP behaviour
-# - 2.0: Balanced; recommended for most pools [DEFAULT]
-# - 3.0: Higher smoothing; good for high-hashrate pools
-# - 5.0+: Very sticky payouts; not recommended
-n_multiplier = 2.0
+# PPLNS window multiplier × network difficulty. Default: 5.0
+# n_multiplier = 5.0
 
-# Minimum miner payout threshold, in satoshis.
-# Outputs below this are filtered out rather than producing dust.
-min_payout_sat = 546
+# Minimum miner payout in satoshis (smaller amounts carried as dust). Default: 546
+# min_payout_sat = 546
 
-# Scheduler interval, in seconds.
-# The scheduler checks for matured found blocks and produces payout batches on this cadence.
-payout_interval_secs = 3600
+# Auto-create and sign payout batches when blocks mature. Default: true.
+# Set to false for manual processing via POST /api/v1/admin/payouts/trigger/{hash}.
+# payout_enabled = true
 
-# Minimum confirmations required before a found block becomes payout-eligible.
-# The code also enforces a hard coinbase maturity baseline of 100 blocks.
-min_confirmations = 100
+# Confirmations required before block is payout-eligible. Default: 100 (mainnet).
+# Use 1 for regtest.
+# min_confirmations = 100
 
-# Invalid share banning configuration.
-# Miners with high rejection ratios are automatically disconnected.
+# === Pool → PPLNS → Banning ===
+
 [pool.pplns.banning]
-enabled = true
-# Number of shares to collect before checking rejection ratio.
-check_threshold = 50
-# Maximum allowed rejection percentage. Miners exceeding this are banned.
-invalid_percent = 50.0
+# Enable per-session banning for excessive invalid shares. Default: false.
+# enabled = false
+
+# Shares to collect before checking rejection ratio. Default: 50.
+# check_threshold = 50
+
+# Maximum allowed rejection percentage (sessions above this are disconnected). Default: 50.0.
+# invalid_percent = 50.0
+
+# === Pool → Signing ===
 
 [pool.signing]
-# Signing mode for payout batches.
-# Currently supported first-draft mode:
-# - internal: sign inside the pool process using `private_key`
-#
-# Other modes are reserved for future transport integrations.
-mode = "internal"
+# "internal" (in-process secp256k1) or "external" (HTTP webhook). Default: "internal".
+# mode = "internal"
 
-# Private key material for internal signing.
-# Accepted formats for scheduler signing path:
-# - 32-byte hex
-# - WIF / base58check-encoded secret key
-#
-# Never log this value. Prefer loading from a secure file or secret store.
-# IMPORTANT: Use network-specific keys:
-# - mainnet:  Mainnet WIF (5/K/L prefix)
-# - testnet:  Testnet WIF (9/c prefix)
-# - regtest:  Regtest WIF (9/c prefix)
-private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# Required for mode="internal": 32-byte hex or WIF private key.
+# private_key = "cVjF..."
 
+# Required for mode="external": webhook URL that accepts POST with payout plan JSON.
+# webhook_url = "https://signer.example.com/api/v1/payout"
 
-# lotusd JSON-RPC endpoint used for raw transaction broadcast.
-# This matches Chronik's broadcast mechanics: raw tx -> JSON-RPC sendrawtransaction.
-# IMPORTANT: The port determines the network (see Network Configuration above):
-[bitcoind_rpc]
-rpc_user = "lotus"
-rpc_pass = "supersecurepassword"
-# Mainnet (port 10604)
-url = "http://127.0.0.1:10604"
-# Testnet (port 11604) - uncomment for testnet
-#url = "http://127.0.0.1:11604"
-# Regtest (port 12604) - uncomment for regtest
-#url = "http://127.0.0.1:12604"
+# Transaction fee rate in sat/kB for payout transactions. Default: 1000 (1 sat/vByte).
+# tx_fee_per_kb = 1000
+
+# === Debug ===
+
+# Enable verbose logging (template data, share submissions, validation, block submission).
+# Default: false.
+# debug = false

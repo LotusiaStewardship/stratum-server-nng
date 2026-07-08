@@ -1,7 +1,10 @@
 pub mod accounting;
-pub mod api;
 pub mod config;
-pub mod http;
-pub mod nng;
+pub mod constants;
+pub mod http_api;
+pub mod logging;
+pub mod node_integration;
 pub mod payout;
-pub mod stratum;
+pub mod share_processing;
+pub mod shutdown;
+pub mod stratum_protocol;

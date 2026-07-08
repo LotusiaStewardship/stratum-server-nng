@@ -1,0 +1,166 @@
+# Stratum Core Context
+
+**Last updated:** 2026-05-22  
+**Related spec:** [Modular Architecture Refactor](./specs/modular-architecture-refactor-slices.md)  
+**Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
+
+---
+
+## Bounded Context
+
+The **Stratum Core** context owns the Stratum V1 mining protocol implementation, share validation pipeline, session management with per-session VarDiff, and HTTP API for pool operators.
+
+### Boundary
+
+- **Inside:** TCP server, protocol parsing, session state machine, share validation, VarDiff
+- **Outside:** Accounting (persistence), Payout (PPLNS calculation), HTTP API (operator interface), Node integration (NNG RPC/pub-sub), transaction signing
+
+### Dependencies
+
+| Module | Depends On | Purpose |
+|--------|-----------|---------|
+| `stratum_protocol` | `share_processing`, `accounting`, `node_integration` | TCP server, session management, protocol parsing |
+| `share_processing` | None (standalone) | VarDiff, share validation |
+| `accounting` | None (standalone) | DB schema, repositories, accounting facade |
+| `http_api` | `accounting` | REST API for pool operators |
+| `node_integration` | `stratum_protocol::job` | NNG RPC client, template conversion |
+| `shutdown` | None (standalone) | Graceful shutdown coordinator |
+
+---
+
+## Module Responsibilities
+
+### `stratum_protocol`
+- TCP listener accepts miner connections
+- Protocol parsing (JSON-RPC, Stratum methods)
+- Session state machine (subscribe → authorize → submit)
+- Job assignment and tracking (`assigned_jobs` map per session)
+- `mining.set_difficulty` sent on session start and after VarDiff retarget
+- `mining.notify` sent after authorization
+
+### `share_processing`
+- `VarDiff` — per-session variable difficulty controller
+- `validator` — share validation pipeline (format, authorization, ntime, difficulty)
+- `network_target_hex_to_difficulty` — shared helper for N_diff computation
+
+### `accounting`
+- `WorkerRepository` — upsert/query workers by `(payout_address, worker_suffix)`
+- `ShareRepository` — insert shares and outcomes atomically, dedupe key enforcement, queries
+- `RoundRepository` — round lifecycle (open → found → closed → paid → orphaned)
+- `AccountingEventRepository` — append-only audit log
+- `AccountingService` — facade orchestrating multi-repo operations
+
+### `http_api`
+- Axum-based REST API
+- Bearer token authentication (except `/health`)
+- Endpoints: health, stats, workers, rounds, blocks, payouts
+
+### `node_integration`
+- NNG RPC client for lotusd communication
+- Template → MiningJob conversion
+- Job cache (LRU eviction)
+
+---
+
+## Key Invariants
+
+### Session
+- A session must subscribe before it can authorize
+- A session must authorize before receiving `mining.notify`
+- Extranonce1 is unique per session and never reused
+- `assigned_jobs` is capped at `MAX_ASSIGNED_JOBS_PER_SESSION` (128)
+- `clean_jobs=true` clears all assigned jobs immediately
+
+### VarDiff
+- P_diff ∈ [vardiff_min_floor, N_diff] at all times
+- P_diff is clamped down when N_diff decreases (via `update_max`)
+- Share difficulty = P_diff at assignment time (immutable)
+- VarDiff is per-session, not per-worker
+- `mining.set_difficulty` is sent on session start and after each retarget
+- Retarget algorithm includes a configurable deadband (`variance_percent`,
+  default ±30%): skips retarget when the observed share rate is within
+  tolerance of the target rate, preventing Poisson noise from causing
+  unnecessary oscillation. Expected share count uses actual window duration
+  so extended windows (from deadband skips) do not produce false retargets.
+
+### Share Validation
+- Worker must be in session's authorized set
+- Job must be in session's assigned_jobs (not stale)
+- Submitted ntime must match frozen ntime from assigned job
+- Header hash must meet P_diff target
+- N_diff check is recorded as `network_target_ok` flag (not a rejection)
+- All shares (accepted and rejected) are persisted
+- Share + outcome insertion is atomic (transaction)
+
+### Accounting
+- Shares are immutable once persisted (never deleted)
+- Dedupe key prevents duplicate insertions: `worker_id:template_id:template_epoch:extranonce2:ntime:nonce`
+- Round membership is resolved at insert time via `resolve_round_for_template`
+- Accounting events are append-only (never updated or deleted)
+- Workers persist across sessions
+
+### HTTP API
+- Health endpoint is public (no auth)
+- All other endpoints require `Authorization: Bearer <token>`
+- Token is configured via `api_token` in config or `STRATUM_API_TOKEN` env var
+
+---
+
+## Cross-Cutting Concerns
+
+### Graceful Shutdown
+- All long-running tasks register with `ShutdownCoordinator`
+- Shutdown signal is a broadcast channel
+- Tasks stop accepting work, flush, then exit
+- WAL checkpoint on shutdown if database connection is available
+- Total shutdown timeout: 30s; flush timeout: 5s
+
+### Template Lifecycle
+- Template fetched once on startup via NNG RPC
+- Converted to MiningJob and cached in JobCache (LRU, max 512)
+- N_diff broadcast to all sessions via `StratumServer::notify_new_job()`
+- Event-driven refresh via NNG pub/sub `NngEventConsumer`:
+  - Subscribes to `miningwrkchg` with 100ms coalescing
+  - Fetches new template, inserts in cache, broadcasts to all sessions
+  - `clean_jobs=true` clears all session assigned_jobs immediately
+
+---
+
+## Implementation Status
+
+| Slice | Status |
+|-------|--------|
+| 1–5 | ✅ Complete |
+| 6 | ✅ Complete — JSON-RPC client, block builder, found block repo, NNG pub/sub event consumer, block reconciliation |
+| 7 | ✅ Complete — PPLNS window calculation, payout plan, repositories, HTTP API, manual trigger endpoint |
+| 8 | ✅ Complete — shares, share-outcomes, hashrate, pagination on workers/shares/share-outcomes. blocks/rounds/payouts list all (unpaginated). |
+| 9 | ✅ Complete — Signer trait, internal (secp256k1) + external (webhook) signers, event-driven payout automation with ChainTip and PayoutHandler.
+
+## Cross-Cutting Concerns (Extranonce)
+
+### mining.set_extranonce
+- Sent immediately after `mining.subscribe` response per Stratum V1 standard
+- Contains `[extranonce1, extranonce2_size]`
+- Implemented in `server.rs` subscribe handler
+
+### mining.extranonce.subscribe
+- Accepted with success response (no-op — extranonce1 never changes per session)
+- Method defined in `protocol.rs`, handled in `server.rs`
+
+### Extranonce1 Uniqueness
+- Derived from session counter (monotonically increasing u64)
+- Lower 32 bits formatted as 8-hex-char string
+- Guarantees uniqueness without collision-checking overhead
+- Implemented in `server.rs` accept loop
+
+### Extranonce1 Persistence
+- Stored in `shares.extranonce1` (TEXT NOT NULL) for every share
+- Stored in `found_blocks.extranonce1` (TEXT, nullable) for found blocks
+- Enables coinbase reconstruction for any historical share from DB alone
+
+## Future Considerations
+
+- Pagination on blocks/rounds/payouts endpoints (currently return full lists)
+- FIFO dust ledger for stronger auditability
+- Alternative payout schemes (PPS, PROP) via PayoutScheme trait extraction
+- JSON log format option for log aggregator compatibility
