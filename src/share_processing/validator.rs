@@ -249,7 +249,7 @@ mod tests {
         MiningJob {
             job_id: "job-890-100".to_string(),
             template_id: 890,
-            prevhash: "4f7bcee63a20eff92f69a7f0e74af36a9f1e60ee7ecc5b0506e1ae3600000000".to_string(),
+            prevhash: "e6ce7b4ff9ef203af0a7692f6af34ae7ee601e9f055bcc7e36aee10600000000".to_string(),
             coinbase1: "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff1900000e2f4c6f747573696120506f6f6c2f".to_string(),
             coinbase2: "ffffffff0300000000000000000b6a056c6f676f7303f1b8137ecf360d000000001976a914ad8b796954a46f0f32a867d3fd8855043cc506ba88ac7ecf360d000000001976a914053d4d0c28d299dc5c2be1ce5d29bf00cdb61b4088ac00000000".to_string(),
             merkle_branches: vec![
@@ -518,6 +518,9 @@ mod tests {
         );
     }
 
+    /// Deterministic test using the actual block-finding share data from height 1292529.
+    /// Verifies the full validation pipeline: stratum header construction, LotusHeader hash,
+    /// difficulty checks, and block hash match.
     #[test]
     fn test_known_valid_share_accepted() {
         // Deterministic test using the actual block-finding share data.
