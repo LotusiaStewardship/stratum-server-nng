@@ -12,8 +12,8 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 
 ### Boundary
 
-- **Inside:** TCP server, protocol parsing, session state machine, share validation, VarDiff, share persistence, round accounting, PPLNS payout calculation, HTTP API
-- **Outside:** Node integration (NNG RPC/pub-sub), transaction signing (Slice 9), external monitoring
+- **Inside:** TCP server, protocol parsing, session state machine, share validation, VarDiff
+- **Outside:** Accounting (persistence), Payout (PPLNS calculation), HTTP API (operator interface), Node integration (NNG RPC/pub-sub), transaction signing
 
 ### Dependencies
 
@@ -132,9 +132,9 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 |-------|--------|
 | 1–5 | ✅ Complete |
 | 6 | ✅ Complete — JSON-RPC client, block builder, found block repo, NNG pub/sub event consumer, block reconciliation |
-| 7 | ✅ Complete — PPLNS window calculation, payout plan, repositories, HTTP API, payout scheduler shell, manual trigger endpoint |
-| 8 | ⬜ Pending — Complete HTTP API (shares, blocks, payouts, pagination) |
-| 9 | ⬜ Pending — Payout signer abstraction |
+| 7 | ✅ Complete — PPLNS window calculation, payout plan, repositories, HTTP API, manual trigger endpoint |
+| 8 | ✅ Complete — shares, share-outcomes, hashrate, pagination on workers/shares/share-outcomes. blocks/rounds/payouts list all (unpaginated). |
+| 9 | ✅ Complete — Signer trait, internal (secp256k1) + external (webhook) signers, event-driven payout automation with ChainTip and PayoutHandler.
 
 ## Cross-Cutting Concerns (Extranonce)
 
@@ -160,6 +160,7 @@ The **Stratum Core** context owns the Stratum V1 mining protocol implementation,
 
 ## Future Considerations
 
-- Slice 8: Complete HTTP API (shares, share-outcomes, pagination, hashrate)
-- Slice 9: Payout signer abstraction (Signer trait, internal/external signer, batch submission)
-- Slice 7 follow-ups: FIFO dust ledger for stronger auditability, maturation check for scheduler, found_block → paid status transition
+- Pagination on blocks/rounds/payouts endpoints (currently return full lists)
+- FIFO dust ledger for stronger auditability
+- Alternative payout schemes (PPS, PROP) via PayoutScheme trait extraction
+- JSON log format option for log aggregator compatibility

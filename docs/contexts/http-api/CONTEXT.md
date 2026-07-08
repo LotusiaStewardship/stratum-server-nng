@@ -83,8 +83,9 @@ pub struct AppState {
 
 All repository fields are `Option` — individual route handlers return `AppError::DbNotConfigured` if a required repository is missing. In normal operation (started via `main.rs`), all repositories are populated.
 
-### Known Limitations (Slice 8 scope)
+### Known Limitations
 
-- Pagination (`limit`/`offset`) implemented on `GET /api/v1/workers`, `GET /api/v1/shares`, and `GET /api/v1/share-outcomes`; remaining list endpoints return full results
+- Pagination (`limit`/`offset`) implemented on `GET /api/v1/workers`, `GET /api/v1/shares`, and `GET /api/v1/share-outcomes`; blocks, rounds, and payouts return full lists (unpaginated) — add pagination when these datasets grow large.
+- `pool_hashrate` field is available in `GET /api/v1/stats` (5-min rolling window of accepted shares × 2³² / 300s).
 - No `GET /api/v1/rounds/{id}/shares` endpoint
 - No error correlation IDs on 4xx/5xx responses
