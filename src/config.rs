@@ -15,8 +15,14 @@ pub struct Config {
     /// lotusd NNG Pub/Sub URL (e.g., "ipc:///tmp/lotusd.pub")
     #[serde(default = "default_nng_pub_url")]
     pub nng_pub_url: String,
-    /// SQLite database path
+    /// SQLite database path. If empty, auto-derived from network.
+    #[serde(default)]
     pub sqlite_path: String,
+    /// Network: "mainnet", "testnet", or "regtest".
+    /// Auto-detected from bitcoind_rpc.url port (10604=mainnet, 11604=testnet, 12604=regtest)
+    /// if not explicitly set. Required for database separation.
+    #[serde(default)]
+    pub network: String,
     /// API bearer token for authentication
     #[serde(default = "default_api_token")]
     pub api_token: String,
@@ -476,8 +482,76 @@ impl Config {
             }
         }
 
+        // Auto-detect network from RPC port if not explicitly set
+        if cfg.network.is_empty() {
+            cfg.network = detect_network_from_rpc_port(&cfg.bitcoind_rpc.url)?
+                .to_string();
+        }
+
+        // Auto-set database path if using default or not explicitly set
+        let should_override_db_path = cfg.sqlite_path.contains("stratum-accounting")
+            || cfg.sqlite_path.is_empty();
+        if should_override_db_path {
+            cfg.sqlite_path = default_db_path_for_network(&cfg.network);
+        }
+
+        // Ensure parent directory exists for database path
+        if let Some(parent) = std::path::Path::new(&cfg.sqlite_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Validate network is known
+        if !["mainnet", "testnet", "regtest"].contains(&cfg.network.as_str()) {
+            bail!(
+                "network must be one of: mainnet, testnet, regtest (got: {}). \
+                 Set explicitly in config.toml or ensure bitcoind_rpc.url port is \
+                 10604 (mainnet), 11604 (testnet), or 12604 (regtest).",
+                cfg.network
+            );
+        }
+
         Ok(cfg)
     }
+}
+
+/// Extracts the network name from an RPC URL by parsing the port.
+///
+/// Returns:
+/// - "mainnet" for port 10604
+/// - "testnet" for port 11604
+/// - "regtest" for port 12604
+/// - Err for unknown ports or parse failures
+fn detect_network_from_rpc_port(rpc_url: &str) -> Result<&'static str> {
+    let port = url::Url::parse(rpc_url)
+        .ok()
+        .and_then(|u| u.port())
+        .or_else(|| {
+            rpc_url
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+        });
+
+    match port {
+        Some(10604) => Ok("mainnet"),
+        Some(11604) => Ok("testnet"),
+        Some(12604) => Ok("regtest"),
+        _ => Err(anyhow!(
+            "unknown network for RPC port {:?}: expected 10604 (mainnet), \
+             11604 (testnet), or 12604 (regtest). Set `network` explicitly \
+             in config.toml to override.",
+            port
+        )),
+    }
+}
+
+/// Returns the default database path for a given network.
+///
+/// Convention: ./dbs/{network}/stratum-accounting.sqlite3
+fn default_db_path_for_network(network: &str) -> String {
+    format!("./dbs/{}/stratum-accounting.sqlite3", network)
 }
 
 #[cfg(test)]
