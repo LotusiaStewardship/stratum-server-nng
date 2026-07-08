@@ -1,13 +1,23 @@
 // Domain-tagged tracing macros.
 //
 // Each macro wraps the corresponding tracing:: macro with a `target:` field
-// matching the bounded context (see docs/CONTEXT_MAP.md). This enables
-// per-domain filtering via RUST_LOG, e.g.:
-//   RUST_LOG=stratum=debug,accounting=info
+// matching a module area. These targets are finer-grained than the bounded
+// contexts in docs/CONTEXT_MAP.md — some (validator, shutdown, main) don't
+// map 1:1 to a context. This enables precise filtering via RUST_LOG.
 //
-// Adding a new domain: add a block of four macros (info, warn, error, debug)
-// with the domain name as the target string. Keep domain names short and
-// grep-friendly.
+// Domain → context mapping:
+//   stratum     → Stratum Core (stratum_protocol)
+//   validator   → Stratum Core sub-domain (share_processing/validator)
+//   node_int    → Node Integration
+//   accounting  → Accounting
+//   payout      → Payout
+//   http_api    → HTTP API
+//   shutdown    → Infrastructure / cross-cutting
+//   main        → Application entry point (main.rs)
+//
+// Filtering examples:
+//   RUST_LOG=stratum=debug,accounting=info,node_int=warn
+//   RUST_LOG=stratum=debug,validator=trace  # per-session validation logging
 
 // --- stratum (stratum_protocol module) ---
 #[macro_export]
