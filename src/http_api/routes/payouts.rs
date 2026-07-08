@@ -1,3 +1,4 @@
+use crate::http_api::pagination::{PaginatedResponse, PaginationParams};
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -37,16 +38,27 @@ pub struct PayoutBatchDetailResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct ListPayoutsParams {
     pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+impl ListPayoutsParams {
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
 }
 
 /// GET /api/v1/payouts — list payout batches with optional ?status= filter.
 pub async fn list_payouts(
     State(state): State<AppState>,
     Query(params): Query<ListPayoutsParams>,
-) -> Result<Json<Vec<PayoutBatchResponse>>, AppError> {
+) -> Result<Json<PaginatedResponse<PayoutBatchResponse>>, AppError> {
     let repo = state.payout_repo.ok_or(AppError::DbNotConfigured)?;
     let batches = repo.list_batches(params.status.as_deref())?;
-    let response: Vec<PayoutBatchResponse> = batches
+    let all: Vec<PayoutBatchResponse> = batches
         .into_iter()
         .map(|b| PayoutBatchResponse {
             id: b.id,
@@ -60,7 +72,8 @@ pub async fn list_payouts(
             submitted_txid: b.submitted_txid,
         })
         .collect();
-    Ok(Json(response))
+    let total = all.len() as i64;
+    Ok(Json(PaginatedResponse::new(all, total, &params.pagination())))
 }
 
 /// POST /api/v1/admin/payouts/trigger/{block_hash}
@@ -179,9 +192,16 @@ mod tests {
             payout_config: None,
             api_token: "test".to_string(),
         };
-        let result = list_payouts(State(state), Query(ListPayoutsParams { status: None }))
-            .await
-            .unwrap();
-        assert!(result.0.is_empty());
+        let result = list_payouts(
+            State(state),
+            Query(ListPayoutsParams {
+                status: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.0.data.is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use crate::http_api::pagination::{PaginatedResponse, PaginationParams};
 use crate::http_api::server::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -17,6 +18,17 @@ pub struct RoundSummary {
 #[derive(Deserialize)]
 pub struct ListRoundsParams {
     pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+impl ListRoundsParams {
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
 }
 
 /// Share breakdown within a round, grouped by worker.
@@ -93,8 +105,8 @@ pub async fn get_round(
 pub async fn list_rounds(
     State(state): State<AppState>,
     Query(params): Query<ListRoundsParams>,
-) -> Json<Vec<RoundSummary>> {
-    let rounds = if let Some(ref round_repo) = state.round_repo {
+) -> Json<PaginatedResponse<RoundSummary>> {
+    let all = if let Some(ref round_repo) = state.round_repo {
         round_repo
             .list(params.status.as_deref())
             .unwrap_or_default()
@@ -110,8 +122,8 @@ pub async fn list_rounds(
     } else {
         Vec::new()
     };
-
-    Json(rounds)
+    let total = all.len() as i64;
+    Json(PaginatedResponse::new(all, total, &params.pagination()))
 }
 
 #[cfg(test)]
@@ -243,7 +255,11 @@ mod tests {
     #[tokio::test]
     async fn test_list_rounds_empty() {
         let stats = ServerStats::default();
-        let params = ListRoundsParams { status: None };
+        let params = ListRoundsParams {
+            status: None,
+            limit: None,
+            offset: None,
+        };
         let response = list_rounds(
             State(AppState {
                 stats: Arc::new(RwLock::new(stats)),
@@ -260,7 +276,7 @@ mod tests {
         )
         .await;
 
-        assert!(response.is_empty());
+        assert!(response.data.is_empty());
     }
 
     #[tokio::test]
@@ -274,7 +290,11 @@ mod tests {
         let _ = round_repo.get_or_create_current_round(10).unwrap(); // no-op, same round
 
         let stats = ServerStats::default();
-        let params = ListRoundsParams { status: None };
+        let params = ListRoundsParams {
+            status: None,
+            limit: None,
+            offset: None,
+        };
         let response = list_rounds(
             State(AppState {
                 stats: Arc::new(RwLock::new(stats)),
@@ -291,8 +311,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.len(), 1);
-        assert_eq!(response[0].status, "open");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.total, 1);
+        assert_eq!(response.data[0].status, "open");
     }
 
     #[tokio::test]
@@ -311,6 +332,8 @@ mod tests {
         // Filter by 'open'
         let params = ListRoundsParams {
             status: Some("open".to_string()),
+            limit: None,
+            offset: None,
         };
         let open_rounds = list_rounds(
             State(AppState {
@@ -327,12 +350,14 @@ mod tests {
             Query(params),
         )
         .await;
-        assert_eq!(open_rounds.len(), 1);
-        assert_eq!(open_rounds[0].start_template_id, "6");
+        assert_eq!(open_rounds.data.len(), 1);
+        assert_eq!(open_rounds.data[0].start_template_id, "6");
 
         // Filter by 'found'
         let params = ListRoundsParams {
             status: Some("found".to_string()),
+            limit: None,
+            offset: None,
         };
         let found_rounds = list_rounds(
             State(AppState {
@@ -349,7 +374,7 @@ mod tests {
             Query(params),
         )
         .await;
-        assert_eq!(found_rounds.len(), 1);
-        assert_eq!(found_rounds[0].start_template_id, "1");
+        assert_eq!(found_rounds.data.len(), 1);
+        assert_eq!(found_rounds.data[0].start_template_id, "1");
     }
 }

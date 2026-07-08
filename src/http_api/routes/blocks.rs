@@ -1,3 +1,4 @@
+use crate::http_api::pagination::{PaginatedResponse, PaginationParams};
 use crate::http_api::server::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -19,6 +20,17 @@ pub struct BlockSummary {
 #[derive(Deserialize)]
 pub struct ListBlocksParams {
     pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+impl ListBlocksParams {
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -39,8 +51,8 @@ pub struct BlockDetail {
 pub async fn list_blocks(
     State(state): State<AppState>,
     Query(params): Query<ListBlocksParams>,
-) -> Json<Vec<BlockSummary>> {
-    let blocks = if let Some(ref repo) = state.found_block_repo {
+) -> Json<PaginatedResponse<BlockSummary>> {
+    let all = if let Some(ref repo) = state.found_block_repo {
         repo.list(params.status.as_deref())
             .unwrap_or_default()
             .into_iter()
@@ -57,8 +69,8 @@ pub async fn list_blocks(
     } else {
         Vec::new()
     };
-
-    Json(blocks)
+    let total = all.len() as i64;
+    Json(PaginatedResponse::new(all, total, &params.pagination()))
 }
 
 pub async fn get_block(
@@ -136,9 +148,13 @@ mod tests {
     #[tokio::test]
     async fn test_list_blocks_empty() {
         let state = test_state(None);
-        let params = ListBlocksParams { status: None };
+        let params = ListBlocksParams {
+            status: None,
+            limit: None,
+            offset: None,
+        };
         let response = list_blocks(State(state), Query(params)).await;
-        assert!(response.is_empty());
+        assert!(response.data.is_empty());
     }
 
     #[tokio::test]
@@ -150,11 +166,16 @@ mod tests {
             .unwrap();
 
         let state = test_state(Some(repo));
-        let params = ListBlocksParams { status: None };
+        let params = ListBlocksParams {
+            status: None,
+            limit: None,
+            offset: None,
+        };
         let response = list_blocks(State(state), Query(params)).await;
-        assert_eq!(response.len(), 2);
-        assert_eq!(response[0].block_hash, "block2"); // DESC order
-        assert_eq!(response[1].block_hash, "block1");
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.total, 2);
+        assert_eq!(response.data[0].block_hash, "block2"); // DESC order
+        assert_eq!(response.data[1].block_hash, "block1");
     }
 
     #[tokio::test]
@@ -170,17 +191,21 @@ mod tests {
 
         let params = ListBlocksParams {
             status: Some("immature".to_string()),
+            limit: None,
+            offset: None,
         };
         let immature = list_blocks(State(state.clone()), Query(params)).await;
-        assert_eq!(immature.len(), 1);
-        assert_eq!(immature[0].block_hash, "block2");
+        assert_eq!(immature.data.len(), 1);
+        assert_eq!(immature.data[0].block_hash, "block2");
 
         let params = ListBlocksParams {
             status: Some("orphaned".to_string()),
+            limit: None,
+            offset: None,
         };
         let orphaned = list_blocks(State(state), Query(params)).await;
-        assert_eq!(orphaned.len(), 1);
-        assert_eq!(orphaned[0].block_hash, "block1");
+        assert_eq!(orphaned.data.len(), 1);
+        assert_eq!(orphaned.data[0].block_hash, "block1");
     }
 
     #[tokio::test]
