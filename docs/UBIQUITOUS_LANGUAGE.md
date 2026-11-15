@@ -40,7 +40,7 @@ Facade that orchestrates accounting operations across multiple repositories. The
 **Related terms:**
 - **Accepted Share:** Share whose header hash meets the session's P_diff target
 - **High-Hash Share:** Share whose header hash meets P_diff but does NOT meet N_diff (the network target). Lotusd returns "high-hash" on submission. These shares are credited to the miner with `network_target_ok=false` — they contributed work to the pool even though they didn't find a block.
-- **Rejected Share:** Share that failed validation (stale-job, low-difficulty, unauthorized-worker, invalid format, ntime-mismatch)
+- **Rejected Share:** Share that failed validation (stale-job, low-difficulty, unauthorized-worker, invalid format, ntime-mismatch). An extranonce2 whose size differs from the session's announced `extranonce2_size` is an invalid format (`invalid-submit-shape`).
 - **Stale Share:** Share submitted for a job that is no longer active (miner was working on outdated template)
 - **Low-Difficulty Share:** Share whose header hash does not meet the session's P_diff target
 
@@ -121,7 +121,7 @@ The global canonical difficulty of the Lotus blockchain, derived from the mining
 
 **Key invariant:** N_diff is the authoritative difficulty target for valid network-proof-of-work. A share whose hash meets N_diff is a valid network block candidate.
 
-**Key invariant:** All per-session pool difficulties (P_diff) are bounded by N_diff as an absolute ceiling. P_diff ∈ [vardiff_min_floor, N_diff].
+**Key invariant:** All per-session pool difficulties (P_diff) are bounded by N_diff as an absolute ceiling. P_diff ∈ [vardiff_min_floor, N_diff]; when N_diff is below vardiff_min_floor (e.g. regtest), P_diff = N_diff — the ceiling wins, so that every network block candidate is still a share.
 
 ### Pool Difficulty (P_diff)
 The per-session difficulty assigned to a miner via `mining.set_difficulty`. P_diff is:

@@ -7,11 +7,25 @@ use std::time::{Duration, Instant};
 /// This is used to convert a job's `network_target_hex` into N_diff for VarDiff ceiling
 /// calculation and for initial difficulty computation at session creation.
 ///
-/// Returns `None` if the hex string is invalid or not exactly 32 bytes.
+/// Returns `None` if the hex string is invalid or not exactly 32 bytes, or if
+/// the conversion does not give a positive finite difficulty.
 pub fn network_target_hex_to_difficulty(hex: &str) -> Option<f64> {
     let bytes = hex::decode(hex).ok()?;
     let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    target_to_difficulty(&arr).ok()
+    target_to_difficulty(&arr)
+        .ok()
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// Limit a P_diff value to `[floor, ceiling]` without panicking.
+///
+/// `f64::clamp` panics when `floor > ceiling`, which happens whenever the
+/// network difficulty (the ceiling) is below `min_floor`, e.g. on regtest
+/// (N_diff ~ 4.7e-10) or a young testnet. The ceiling wins in that case:
+/// a P_diff above N_diff would make miners withhold valid blocks.
+fn clamp_p_diff(value: f64, floor: f64, ceiling: f64) -> f64 {
+    let value = if value.is_nan() { floor } else { value };
+    value.max(floor).min(ceiling)
 }
 
 /// Configuration for per-session variable difficulty (VarDiff).
@@ -63,10 +77,11 @@ pub struct VarDiff {
 impl VarDiff {
     /// Create a new VarDiff instance.
     ///
-    /// Initial P_diff = N_diff × initial_pct, clamped to [min_floor, N_diff].
+    /// Initial P_diff = N_diff × initial_pct, clamped to [min_floor, N_diff]
+    /// (N_diff wins when it is below min_floor).
     /// `now` is the current time, used as the base for the first retarget window.
     pub fn new(config: VarDiffConfig, n_diff: f64, now: Instant) -> Self {
-        let initial = (config.initial_pct * n_diff).clamp(config.min_floor, n_diff);
+        let initial = clamp_p_diff(config.initial_pct * n_diff, config.min_floor, n_diff);
         Self {
             config,
             current: initial,
@@ -92,7 +107,11 @@ impl VarDiff {
     ///
     /// Returns `Some(new_p_diff)` if P_diff was clamped down, `None` otherwise.
     /// The caller should send `mining.set_difficulty` to the miner when P_diff changes.
+    /// A non-finite or non-positive N_diff is ignored.
     pub fn update_max(&mut self, new_n_diff: f64) -> Option<f64> {
+        if !new_n_diff.is_finite() || new_n_diff <= 0.0 {
+            return None;
+        }
         let old_current = self.current;
         self.max = new_n_diff;
         if self.current > self.max {
@@ -116,7 +135,7 @@ impl VarDiff {
     /// - If |ratio − 1| ≤ variance_percent: skip (inside deadband)
     /// - If ratio > 1.0 (too fast): new = current × min(ratio, 1.5)
     /// - If ratio < 1.0 (too slow): new = current × max(ratio, 0.67)
-    /// - Clamp result to [min_floor, max]
+    /// - Clamp result to [min_floor, max] (max wins when it is below min_floor)
     pub fn maybe_retarget(&mut self, now: Instant) -> Option<f64> {
         let window_duration = now.duration_since(self.last_retarget);
         if window_duration < Duration::from_secs_f64(self.config.retarget_secs) {
@@ -144,9 +163,17 @@ impl VarDiff {
         }
 
         let new_diff = if ratio > 1.0 {
-            (self.current * ratio.min(1.5)).clamp(self.config.min_floor, self.max)
+            clamp_p_diff(
+                self.current * ratio.min(1.5),
+                self.config.min_floor,
+                self.max,
+            )
         } else {
-            (self.current * ratio.max(0.67)).clamp(self.config.min_floor, self.max)
+            clamp_p_diff(
+                self.current * ratio.max(0.67),
+                self.config.min_floor,
+                self.max,
+            )
         };
 
         if (new_diff - self.current).abs() < f64::EPSILON {
@@ -167,6 +194,62 @@ mod tests {
 
     fn default_config() -> VarDiffConfig {
         VarDiffConfig::default()
+    }
+
+    /// N_diff of the regtest powLimit (nBits 0x207fffff).
+    const REGTEST_N_DIFF: f64 = 4.656_613_428_188_971e-10;
+
+    #[test]
+    fn test_n_diff_below_min_floor_does_not_panic() {
+        let now = Instant::now();
+        // Default min_floor (0.001) is far above the regtest N_diff: this
+        // used to panic in f64::clamp(min > max). N_diff wins.
+        let vardiff = VarDiff::new(default_config(), REGTEST_N_DIFF, now);
+        assert_eq!(vardiff.current(), REGTEST_N_DIFF);
+    }
+
+    #[test]
+    fn test_retarget_with_n_diff_below_min_floor_stays_at_n_diff() {
+        let now = Instant::now();
+        let mut config = default_config();
+        config.variance_percent = 0.0;
+        // Shares too fast: retarget up, capped at N_diff.
+        let mut vardiff = VarDiff::new(config.clone(), REGTEST_N_DIFF, now);
+        for i in 0..10 {
+            vardiff.record_share(now + Duration::from_secs(i));
+        }
+        let _ = vardiff.maybe_retarget(now + Duration::from_secs(61));
+        assert_eq!(vardiff.current(), REGTEST_N_DIFF);
+        // Shares too slow: retarget down, still never above N_diff.
+        let mut vardiff = VarDiff::new(config, REGTEST_N_DIFF, now);
+        vardiff.record_share(now + Duration::from_secs(1));
+        let _ = vardiff.maybe_retarget(now + Duration::from_secs(600));
+        assert_eq!(vardiff.current(), REGTEST_N_DIFF);
+    }
+
+    #[test]
+    fn test_update_max_below_min_floor_lowers_p_diff() {
+        let now = Instant::now();
+        let mut vardiff = VarDiff::new(default_config(), 100.0, now);
+        assert_eq!(vardiff.update_max(REGTEST_N_DIFF), Some(REGTEST_N_DIFF));
+        assert_eq!(vardiff.current(), REGTEST_N_DIFF);
+    }
+
+    #[test]
+    fn test_update_max_ignores_invalid_n_diff() {
+        let now = Instant::now();
+        let mut vardiff = VarDiff::new(default_config(), 100.0, now);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(vardiff.update_max(bad), None, "{bad}");
+            assert!((vardiff.current() - 2.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_network_target_hex_to_difficulty_rejects_zero_target() {
+        assert_eq!(network_target_hex_to_difficulty(&"00".repeat(32)), None);
+        let diff1 = format!("00000000{}", "ff".repeat(28));
+        assert_eq!(network_target_hex_to_difficulty(&diff1), Some(1.0));
     }
 
     #[test]

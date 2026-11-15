@@ -2725,6 +2725,7 @@ dependencies = [
  "governor",
  "hex",
  "moka",
+ "nng",
  "parking_lot",
  "primitive-types",
  "reqwest",

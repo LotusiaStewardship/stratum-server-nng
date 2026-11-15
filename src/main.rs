@@ -165,9 +165,20 @@ async fn main() -> Result<()> {
     // Start HTTP API server
     let http_state = app_state.clone();
     let http_shutdown_signal = shutdown.signal();
+    // Bind before spawning: a port already in use must stop startup, not
+    // just end the background task while the server reports "ready".
+    let api_listener = tokio::net::TcpListener::bind(config.api_bind)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot listen for the HTTP API on {}: {}",
+                config.api_bind,
+                e
+            )
+        })?;
     let http_handle = tokio::spawn(async move {
         let router = http_api::create_router(http_state);
-        let listener = tokio::net::TcpListener::bind(config.api_bind).await?;
+        let listener = api_listener;
         main_info!(bind = %config.api_bind, "HTTP API listening");
 
         let mut shutdown_signal = http_shutdown_signal;
@@ -278,6 +289,8 @@ async fn main() -> Result<()> {
         Some(json_rpc_client.clone()),
         config.vardiff.into(),
     ));
+    // Bind now (see the HTTP API listener above): fail startup on error.
+    let stratum_listener = stratum_server.bind().await?;
     // Notify server of the new job, broadcasting N_diff to all sessions.
     // Validates the integration path for future template refreshes (Slice 6).
     stratum_server.notify_new_job(&job).await;
@@ -409,7 +422,7 @@ async fn main() -> Result<()> {
         let mut shutdown_signal = stratum_shutdown_signal;
 
         tokio::select! {
-            result = stratum_server.run() => {
+            result = stratum_server.run_with_listener(stratum_listener) => {
                 result?;
             }
             _ = shutdown_signal.recv() => {

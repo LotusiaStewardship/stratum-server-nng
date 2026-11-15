@@ -75,7 +75,8 @@ pub fn validate_share_format(extranonce2: &str, ntime: &str, nonce: &str) -> Res
 /// This is the authoritative validation function per the Slice 3 spec.
 /// It checks:
 /// 1. Worker is authorized for this session
-/// 2. Submit params format (extranonce2, ntime, nonce)
+/// 2. Submit params format (extranonce2, ntime, nonce); extranonce2 has the
+///    session's announced `extranonce2_size`
 /// 3. Job exists and is active in session's assigned_jobs
 /// 4. Submitted ntime matches frozen ntime from assigned job
 /// 5. Header hash meets P_diff target
@@ -113,6 +114,21 @@ pub fn validate_share(
             "validation step 2 FAILED — invalid submit shape",
         );
         return ValidationResult::rejected(&reason);
+    }
+
+    // 2b. extranonce2 must have exactly the size announced to the miner
+    // (mining.subscribe / mining.set_extranonce). coinbase1 already commits
+    // to the scriptSig length and the Lotus header to the block size, so any
+    // other length yields a malformed coinbase: the share would be credited
+    // although no block can ever be built from it.
+    if extranonce2.len() != 2 * session.extranonce2_size as usize {
+        validator_debug!(
+            session = %session.session_id,
+            extranonce2 = %extranonce2,
+            expected_bytes = session.extranonce2_size,
+            "validation step 2 FAILED — extranonce2 size differs from the announced size",
+        );
+        return ValidationResult::rejected("invalid-submit-shape");
     }
 
     // 3. Look up assigned job in session
@@ -494,6 +510,33 @@ mod tests {
 
         assert!(!result.accepted);
         assert_eq!(result.reject_reason.as_deref(), Some("unauthorized-worker"));
+    }
+
+    #[test]
+    fn test_validate_share_rejects_extranonce2_of_wrong_size() {
+        let session = create_authorized_session();
+        assert_eq!(session.extranonce2_size, 4);
+        let job = create_test_job();
+
+        // Well-formed hex accepted by validate_share_format, but not the
+        // announced 4 bytes.
+        for extranonce2 in ["aabb", "000003", "0000000003", "0011223344556677"] {
+            let result = validate_share(
+                "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi.rig",
+                "job-890-100",
+                extranonce2,
+                "6adc0c6a0000",
+                "B02B4ABB3DD6E835",
+                &session,
+                &job,
+            );
+            assert!(!result.accepted, "{extranonce2} must be rejected");
+            assert_eq!(
+                result.reject_reason.as_deref(),
+                Some("invalid-submit-shape"),
+                "{extranonce2}"
+            );
+        }
     }
 
     #[test]
