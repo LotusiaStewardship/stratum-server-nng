@@ -129,7 +129,7 @@ Key configuration groups (see [`config.example.toml`](config.example.toml) for t
 | `[pool.mining_identity]` | `payout_address` or `payout_script_hex` |
 | `[pool.fee]` | `enabled`, `fee_bps`, `fee_address` |
 | `[pool.pplns]` | `n_multiplier`, `min_payout_sat`, `min_confirmations` |
-| `[pool.signing]` | `mode` (internal/external), `private_key` or `webhook_url` |
+| `[pool.signing]` | `mode` (internal/external), `private_key` or `webhook_url`, `replay_protection_activation_time` (testing override) |
 | `[bitcoind_rpc]` | `rpc_user`, `rpc_pass`, `url` |
 
 ## HTTP API

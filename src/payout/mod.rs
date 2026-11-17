@@ -1,6 +1,7 @@
 pub mod handler;
 pub mod plan;
 pub mod pplns;
+pub mod replay_protection;
 pub mod signer;
 
 /// Events delivered from the Node Integration context to the Payout context

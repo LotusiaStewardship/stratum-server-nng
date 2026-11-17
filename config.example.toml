@@ -21,6 +21,7 @@
 #   POOL_PPLNS_MIN_PAYOUT_SAT → pool.pplns.min_payout_sat
 #   POOL_SIGNING_MODE         → pool.signing.mode
 #   POOL_SIGNING_PRIVATE_KEY  → pool.signing.private_key
+#   POOL_SIGNING_REPLAY_PROTECTION_ACTIVATION_TIME → pool.signing.replay_protection_activation_time
 #   DEBUG                     → debug ("true"/"1"/"yes")
 
 # === Server ===
@@ -164,6 +165,18 @@ rpc_pass = "lotus"
 
 # Transaction fee rate in sat/kB for payout transactions. Default: 1000 (1 sat/vByte).
 # tx_fee_per_kb = 1000
+
+# Replay-protection activation time (median time past, Unix seconds). From the
+# block whose parent's median time past reaches it (First Chronicles), payout
+# signatures must commit to sighash fork value 0xffdead instead of 0. The signer
+# reads the tip's median time from getblockchaininfo before every payout, holds
+# payouts while it is within 3600 s of this time, and re-signs once with the
+# other fork value if the node refuses the transaction with a script-verify error.
+# The external signer receives the value as `sighash_fork_value` in the payload.
+# Default: per network — mainnet and regtest 1813587000 (2027-06-21 14:10:00 UTC),
+# testnet 1811772600 (2027-05-31 14:10:00 UTC). Override for testing, e.g. to
+# match a regtest node started with -replayprotectionactivationtime.
+# replay_protection_activation_time = 1813587000
 
 # === Debug ===
 

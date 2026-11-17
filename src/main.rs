@@ -351,6 +351,11 @@ async fn main() -> Result<()> {
 
     // Construct signer and spawn payout handler (if enabled)
     if config.pool.pplns.payout_enabled {
+        let replay_protection = config.pool.signing.replay_protection(&config.network);
+        main_info!(
+            "payout signing: replay-protection activation time {} (median time past)",
+            replay_protection.activation_time
+        );
         let signer: Arc<dyn Signer> = match config.pool.signing.mode.as_str() {
             "internal" => {
                 let key = config.pool.signing.private_key.as_deref().ok_or_else(|| {
@@ -360,13 +365,18 @@ async fn main() -> Result<()> {
                     key,
                     json_rpc_client.clone(),
                     config.pool.signing.tx_fee_per_kb,
+                    replay_protection,
                 )?)
             }
             "external" => {
                 let url = config.pool.signing.webhook_url.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("pool.signing.webhook_url required for external signing mode")
                 })?;
-                Arc::new(ExternalSigner::new(url.to_string()))
+                Arc::new(ExternalSigner::new(
+                    url.to_string(),
+                    json_rpc_client.clone(),
+                    replay_protection,
+                ))
             }
             other => anyhow::bail!(
                 "unknown signing mode '{}' — expected 'internal' or 'external'",

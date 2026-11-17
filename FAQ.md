@@ -132,6 +132,14 @@ Two modes, configured under `[pool.signing]`:
 
 **External signing** (`mode = "external"`) — the pool sends the payout plan as JSON to a remote webhook service. The external service is responsible for building, signing, and broadcasting the transaction. The webhook must return `{"txid": "..."}` on success.
 
+### How are payouts signed around the replay-protection activation?
+
+Lotus replay protection activates at the First Chronicles upgrade: from the block whose parent has a median time past (MTP) of 1813587000 or more on mainnet (2027-06-21 14:10:00 UTC; testnet 21 days earlier), every signature must commit to sighash fork value `0xffdead`, and signatures made with fork value 0 are refused (and the other way round before the activation).
+
+Before each payout the signer reads the chain tip's MTP from `getblockchaininfo` and signs with the value the node will require in the next block. While the tip's MTP is within one hour of the activation time, payouts are held (the batch stays pending and is retried on a later block), because a reorg or a late block could flip the rule between signing and mining. If the node still refuses a payout with a `script-verify-flag` error, the internal signer re-signs it once with the other fork value. The external signer receives the value as `sighash_fork_value` in the webhook payload (0 or 16768685).
+
+`pool.signing.replay_protection_activation_time` overrides the activation time, for example to match a regtest node started with `-replayprotectionactivationtime`.
+
 ### Which signing mode should I use?
 
 External signing is recommended for production deployments because it keeps private keys out of the stratum process entirely. The signing service can run in a separate, locked-down environment with hardware security module (HSM) support, dedicated audit logging, and independent access controls.

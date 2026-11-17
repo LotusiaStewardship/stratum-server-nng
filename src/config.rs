@@ -1,3 +1,4 @@
+use crate::payout::replay_protection::ReplayProtection;
 use anyhow::{anyhow, bail, Result};
 use bitcoinsuite_core::LotusAddress;
 use serde::Deserialize;
@@ -194,6 +195,23 @@ pub struct SigningSettings {
     /// Default: 1000 (1 sat/vByte, standard relay minimum).
     #[serde(default = "default_tx_fee_per_kb")]
     pub tx_fee_per_kb: i64,
+    /// Override of the replay-protection activation time (median time past,
+    /// Unix seconds) used to pick the sighash fork value of payout
+    /// signatures. Default: per network (mainnet and regtest 1813587000,
+    /// testnet 1811772600). Set it to match a node started with
+    /// `-replayprotectionactivationtime`, e.g. on regtest.
+    #[serde(default)]
+    pub replay_protection_activation_time: Option<i64>,
+}
+
+impl SigningSettings {
+    /// Replay-protection settings for payout signing on `network`.
+    pub fn replay_protection(&self, network: &str) -> ReplayProtection {
+        match self.replay_protection_activation_time {
+            Some(activation_time) => ReplayProtection::new(activation_time),
+            None => ReplayProtection::for_network(network),
+        }
+    }
 }
 
 impl Default for SigningSettings {
@@ -203,6 +221,7 @@ impl Default for SigningSettings {
             private_key: None,
             webhook_url: None,
             tx_fee_per_kb: default_tx_fee_per_kb(),
+            replay_protection_activation_time: None,
         }
     }
 }
@@ -474,6 +493,16 @@ impl Config {
         }
         if let Ok(key) = std::env::var("POOL_SIGNING_PRIVATE_KEY") {
             cfg.pool.signing.private_key = Some(key);
+        }
+        if let Ok(val) = std::env::var("POOL_SIGNING_REPLAY_PROTECTION_ACTIVATION_TIME") {
+            let activation_time = val.parse::<i64>().map_err(|e| {
+                anyhow!(
+                    "invalid POOL_SIGNING_REPLAY_PROTECTION_ACTIVATION_TIME '{}': {}",
+                    val,
+                    e
+                )
+            })?;
+            cfg.pool.signing.replay_protection_activation_time = Some(activation_time);
         }
 
         if let Ok(val) = std::env::var("DEBUG") {
@@ -867,5 +896,46 @@ mod tests {
             err.to_string().contains("invalid payout_address"),
             "error should mention invalid payout_address"
         );
+    }
+
+    #[test]
+    fn test_replay_protection_activation_time_defaults_per_network() {
+        let cfg: Config = toml::from_str(
+            r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.pool.signing.replay_protection_activation_time, None);
+        let activation = |network| cfg.pool.signing.replay_protection(network).activation_time;
+        assert_eq!(activation("mainnet"), 1_813_587_000);
+        assert_eq!(activation("testnet"), 1_811_772_600);
+        assert_eq!(activation("regtest"), 1_813_587_000);
+    }
+
+    #[test]
+    fn test_replay_protection_activation_time_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+            stratum_bind = "0.0.0.0:3334"
+            api_bind = "127.0.0.1:18080"
+            nng_rpc_url = "ipc:///tmp/lotusd.rpc"
+
+            [pool.signing]
+            replay_protection_activation_time = 1700000000
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.pool.signing.replay_protection_activation_time,
+            Some(1_700_000_000)
+        );
+        let activation = |network| cfg.pool.signing.replay_protection(network).activation_time;
+        assert_eq!(activation("mainnet"), 1_700_000_000);
+        assert_eq!(activation("testnet"), 1_700_000_000);
     }
 }

@@ -1,6 +1,9 @@
 use super::{SignedBatchData, Signer};
+use crate::node_integration::JsonRpcClient;
+use crate::payout::replay_protection::ReplayProtection;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Signer that delegates payout transaction signing to an external webhook.
 ///
@@ -8,20 +11,35 @@ use async_trait::async_trait;
 /// from the response. The external service is responsible for building,
 /// signing, and broadcasting the transaction.
 ///
+/// The payload carries `sighash_fork_value`, the fork value the node will
+/// require in the next block (0, or `0xffdead` = 16768685 once replay
+/// protection is active), decided from the chain tip's median time past right
+/// before the request. Near the activation the payout is held instead.
+///
 /// This is a scaffold — full retry/poll logic will be added later.
 pub struct ExternalSigner {
     /// Webhook URL to POST payout plans to.
     webhook_url: String,
     /// Shared HTTP client.
     client: reqwest::Client,
+    /// JSON-RPC client used to read the chain tip median time.
+    rpc_client: Arc<JsonRpcClient>,
+    /// Activation time used to pick the sighash fork value.
+    replay_protection: ReplayProtection,
 }
 
 impl ExternalSigner {
     /// Create a new external signer pointing at the given webhook URL.
-    pub fn new(webhook_url: String) -> Self {
+    pub fn new(
+        webhook_url: String,
+        rpc_client: Arc<JsonRpcClient>,
+        replay_protection: ReplayProtection,
+    ) -> Self {
         Self {
             webhook_url,
             client: reqwest::Client::new(),
+            rpc_client,
+            replay_protection,
         }
     }
 }
@@ -29,6 +47,12 @@ impl ExternalSigner {
 #[async_trait]
 impl Signer for ExternalSigner {
     async fn sign_and_submit(&self, data: &SignedBatchData) -> Result<String> {
+        // Sighash fork value for the next block, fetched fresh (or hold).
+        let tip_median_time = self.rpc_client.get_tip_median_time().await?;
+        let sighash_fork_value = self
+            .replay_protection
+            .fork_value_for_signing(tip_median_time)?;
+
         // Build the JSON payload — everything the external service needs
         // to construct, sign, and broadcast the payout transaction.
         let outputs: Vec<serde_json::Value> = data
@@ -57,6 +81,7 @@ impl Signer for ExternalSigner {
             "coinbase_amount": data.coinbase_amount,
             "coinbase_script_pubkey_hex": data.coinbase_script_pubkey_hex,
             "outputs": outputs,
+            "sighash_fork_value": sighash_fork_value,
         });
 
         let response = self
@@ -90,9 +115,34 @@ impl Signer for ExternalSigner {
 mod tests {
     use super::*;
     use crate::payout::plan::{PayoutOutput, PayoutPlan};
-    use std::sync::Arc;
+    use crate::payout::replay_protection::{PayoutHeld, MAINNET_ACTIVATION_TIME};
+    use crate::payout::signer::test_rpc::spawn_rpc_server;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Helper: mock node whose chain tip has the given median time past.
+    async fn spawn_mock_node(mediantime: i64) -> Arc<JsonRpcClient> {
+        let (url, _requests) = spawn_rpc_server(move |method, _params, _raw| {
+            assert_eq!(method, "getblockchaininfo");
+            serde_json::json!({ "result": { "mediantime": mediantime }, "error": null, "id": 1 })
+        })
+        .await;
+        Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"))
+    }
+
+    /// Helper: external signer whose node reports a tip before activation.
+    async fn test_signer(webhook_url: String) -> ExternalSigner {
+        ExternalSigner::new(
+            webhook_url,
+            spawn_mock_node(MAINNET_ACTIVATION_TIME - 7200).await,
+            ReplayProtection::default(),
+        )
+    }
+
+    /// Helper: the JSON body of a captured HTTP request.
+    fn json_body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap()
+    }
 
     /// Helper: spawn a mock webhook server that returns a canned response.
     /// Returns the URL and a shared buffer capturing the POST body.
@@ -186,7 +236,7 @@ mod tests {
         }))
         .await;
 
-        let signer = ExternalSigner::new(url);
+        let signer = test_signer(url).await;
         let data = test_signed_batch_data();
         let txid = signer
             .sign_and_submit(&data)
@@ -237,7 +287,7 @@ mod tests {
             stream.flush().await.unwrap();
         });
 
-        let signer = ExternalSigner::new(url);
+        let signer = test_signer(url).await;
         let data = test_signed_batch_data();
         let err = signer.sign_and_submit(&data).await.unwrap_err();
         assert!(
@@ -255,13 +305,70 @@ mod tests {
         }))
         .await;
 
-        let signer = ExternalSigner::new(url);
+        let signer = test_signer(url).await;
         let data = test_signed_batch_data();
         let err = signer.sign_and_submit(&data).await.unwrap_err();
         assert!(
             err.to_string().contains("txid"),
             "error should mention missing txid, got: {}",
             err
+        );
+    }
+
+    /// The webhook payload carries the sighash fork value for the next block:
+    /// 0 before the replay-protection activation.
+    #[tokio::test]
+    async fn test_external_signer_sends_fork_value_zero_before_activation() {
+        let (url, captured) = spawn_mock_webhook(serde_json::json!({ "txid": "t" })).await;
+        let signer = test_signer(url).await;
+
+        signer
+            .sign_and_submit(&test_signed_batch_data())
+            .await
+            .unwrap();
+
+        let body = json_body(&captured.lock().unwrap().take().unwrap());
+        assert_eq!(body["sighash_fork_value"], 0);
+    }
+
+    /// After the activation the payload asks for fork value 0xffdead.
+    #[tokio::test]
+    async fn test_external_signer_sends_replay_protection_fork_value_after_activation() {
+        let (url, captured) = spawn_mock_webhook(serde_json::json!({ "txid": "t" })).await;
+        let signer = ExternalSigner::new(
+            url,
+            spawn_mock_node(MAINNET_ACTIVATION_TIME + 7200).await,
+            ReplayProtection::default(),
+        );
+
+        signer
+            .sign_and_submit(&test_signed_batch_data())
+            .await
+            .unwrap();
+
+        let body = json_body(&captured.lock().unwrap().take().unwrap());
+        assert_eq!(body["sighash_fork_value"], 0xffdead);
+    }
+
+    /// Near the activation the webhook is not called and the payout is held.
+    #[tokio::test]
+    async fn test_external_signer_holds_near_activation() {
+        let (url, captured) = spawn_mock_webhook(serde_json::json!({ "txid": "t" })).await;
+        let signer = ExternalSigner::new(
+            url,
+            spawn_mock_node(MAINNET_ACTIVATION_TIME).await,
+            ReplayProtection::default(),
+        );
+
+        let err = signer
+            .sign_and_submit(&test_signed_batch_data())
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<PayoutHeld>().is_some(), "got: {}", err);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "webhook must not be called"
         );
     }
 }

@@ -1,6 +1,6 @@
 # Payout Context
 
-**Last updated:** 2026-05-31  
+**Last updated:** 2026-11-17  
 **Related specs:** [Modular Architecture Refactor](../stratum-core/specs/modular-architecture-refactor-slices.md), [Block Maturation Check](./specs/maturation-check.md), [ADR 007: Payout Empty-Output Guard](../adrs/007-payout-empty-output-guard.md)  
 **Ubiquitous Language:** [UBIQUITOUS_LANGUAGE.md](../../UBIQUITOUS_LANGUAGE.md)
 
@@ -29,10 +29,11 @@ src/payout/
 ├── mod.rs            # Re-exports
 ├── pplns.rs          # calculate_pplns_window() — cumulative difficulty threshold
 ├── plan.rs           # build_payout_plan() — PayoutPlan, PayoutOutput, distribution
+├── replay_protection.rs # sighash fork value for the next block, boundary hold, script-verify detection
 └── signer/
     ├── mod.rs        # Signer trait (async), SignedBatchData
-    ├── internal.rs   # InternalSigner — builds tx with TxBuilder, signs with P2PKHSignatory, broadcasts via sendrawtransaction
-    └── external.rs   # ExternalSigner — POSTs payout plan to webhook URL, returns txid from response
+    ├── internal.rs   # InternalSigner — builds tx with TxBuilder, signs with a fork-value-aware P2PKH signatory, broadcasts via sendrawtransaction
+    └── external.rs   # ExternalSigner — POSTs payout plan (with sighash_fork_value) to webhook URL, returns txid from response
 ```
 
 ### PPLNS Window Algorithm
@@ -63,6 +64,9 @@ src/payout/
 - `retry_key = "{block_hash}:{num_outputs}"` with UNIQUE constraint prevents duplicate batches.
 - Dust is additive-only per address (balance never decreases except on payout).
 - Payout share snapshots capture which shares were in the window at payout time for post-hoc audit.
+- **Replay-protection fork value:** every payout signature commits to the sighash fork value the node will require in the next block: 0 while the chain tip's median time past (MTP) is below the activation time, `0xffdead` from then on. The tip MTP is read from `getblockchaininfo` right before each payout, never from the wall clock. Activation time: `pool.signing.replay_protection_activation_time`, default per network (mainnet and regtest 1813587000, testnet 1811772600).
+- **Payout hold:** while `|tip MTP − activation time| ≤ 3600 s`, signers return `PayoutHeld` without signing or broadcasting; the batch stays `pending` and is retried on a later `BlockConnected` event.
+- **Single re-sign:** if `sendrawtransaction` refuses a payout with a `script-verify-flag` error, `InternalSigner` re-signs the same transaction once with the other fork value and broadcasts it again. A second refusal is returned as an error; there is no loop.
 - **Empty-output guard:** `build_payout_tx` refuses to sign a transaction with zero miner outputs. See [ADR 007](../adrs/007-payout-empty-output-guard.md).
 - **Auto-rebuild:** If `process_pending_payouts` loads a pending batch with an empty `payouts` table, it automatically recalculates the PPLNS window via `rebuild_payout_plan_for_batch` and re-inserts payouts + snapshots before signing. This recovers from accidentally deleted payout records.
 
@@ -100,7 +104,7 @@ Payout automation is event-driven, replacing the old timer-based scheduler:
 11. Calls the configured `Signer` impl.
 12. The `InternalSigner::build_payout_tx` guards against empty `plan.outputs` — if zero miner outputs somehow reach this point, signing fails with a descriptive error.
 13. On success: marks batch `submitted` with txid.
-14. On failure: batch stays `pending` for retry (errors logged per-batch).
+14. On failure: batch stays `pending` for retry (errors logged per-batch). A `PayoutHeld` result (tip MTP near the replay-protection activation) is logged at info level and retried the same way.
 
 ### On-chain confirmation (Phase 3)
 

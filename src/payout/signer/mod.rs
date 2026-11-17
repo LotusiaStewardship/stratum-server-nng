@@ -1,5 +1,7 @@
 pub mod external;
 pub mod internal;
+#[cfg(test)]
+mod test_rpc;
 
 use crate::payout::plan::PayoutPlan;
 use async_trait::async_trait;

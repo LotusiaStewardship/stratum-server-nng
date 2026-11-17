@@ -906,6 +906,9 @@ impl AccountingService {
                     let _ = self.payout_repo.mark_batch_submitted(batch.id, &txid);
                     accounting_info!(batch_id = batch.id, txid = %txid, "payout submitted");
                 }
+                Err(e) if e.is::<crate::payout::replay_protection::PayoutHeld>() => {
+                    accounting_info!(batch_id = batch.id, reason = %e, "payout held near replay-protection activation (will retry)");
+                }
                 Err(e) => {
                     accounting_warn!(batch_id = batch.id, error = %e, "sign/submit failed (will retry)");
                 }

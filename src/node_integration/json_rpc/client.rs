@@ -78,6 +78,21 @@ impl JsonRpcClient {
         Ok(count as i32)
     }
 
+    /// Get the median time past of the current chain tip via
+    /// `getblockchaininfo` (`mediantime` field).
+    ///
+    /// The node applies consensus rules that depend on time (such as replay
+    /// protection) to the next block based on this value.
+    pub async fn get_tip_median_time(&self) -> Result<i64> {
+        let response = self.call("getblockchaininfo", vec![]).await?;
+        response["mediantime"].as_i64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "getblockchaininfo: missing or invalid 'mediantime': {}",
+                response
+            )
+        })
+    }
+
     /// Get the block hash at a given height via `getblockhash`.
     /// Returns `Ok(None)` if the height is above the chain tip (error code -8).
     pub async fn getblockhash(&self, height: i32) -> Result<Option<String>> {
@@ -282,6 +297,37 @@ mod tests {
         let count = client.getblockcount().await.unwrap();
 
         assert_eq!(count, 1292529);
+    }
+
+    #[tokio::test]
+    async fn test_get_tip_median_time_reads_mediantime() {
+        let url = spawn_mock_server(json!({
+            "result": {
+                "chain": "main",
+                "blocks": 1292529,
+                "mediantime": 1813587000_i64,
+            },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        assert_eq!(client.get_tip_median_time().await.unwrap(), 1813587000);
+    }
+
+    #[tokio::test]
+    async fn test_get_tip_median_time_missing_field_is_an_error() {
+        let url = spawn_mock_server(json!({
+            "result": { "chain": "main", "blocks": 1292529 },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let err = client.get_tip_median_time().await.unwrap_err();
+        assert!(err.to_string().contains("mediantime"), "got: {}", err);
     }
 
     #[tokio::test]

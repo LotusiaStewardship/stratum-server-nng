@@ -265,6 +265,20 @@ A safety check in `InternalSigner::build_payout_tx` that refuses to sign a payou
 
 **Coverage:** The auto-rebuild path in `process_pending_payouts` should intercept empty-output batches before they reach the signer. The guard in `build_payout_tx` is a defense-in-depth layer.
 
+### Sighash Fork Value
+The 24-bit value committed in the upper bits of the 32-bit sighash type of a signature's BIP143 preimage (the signature itself carries only the low sighash byte). Lotus replay protection activates at the First Chronicles upgrade: for a block whose parent has a median time past (MTP) at or above the activation time, the node requires fork value `0xffdead`; before, it requires 0.
+
+**Activation time:** mainnet and regtest 1813587000 (2027-06-21 14:10:00 UTC), testnet 1811772600. Overridable with `pool.signing.replay_protection_activation_time`.
+
+**Key invariant:** Payout signers pick the fork value from the chain tip's MTP (`getblockchaininfo.mediantime`) fetched right before signing, never from the wall clock or a cached value.
+
+**Re-sign:** a payout refused with a `script-verify-flag` error is re-signed once with the other fork value (same inputs and outputs) and broadcast again. Never more than once.
+
+### Payout Hold
+A payout that is not signed because the chain tip's MTP is within 3600 s (`BOUNDARY_HOLD_SECS`) of the replay-protection activation time. Near the boundary a reorg or a late block can flip the required fork value between signing and mining.
+
+**Effect:** the signer returns `PayoutHeld`; the batch stays `pending` and is retried on the next `BlockConnected` event, once the tip has moved out of the window.
+
 ### Payout Rebuild
 A recovery mechanism in `AccountingService::rebuild_payout_plan_for_batch` that recalculates a payout plan from scratch when the `payouts` table is empty for a pending batch.
 
