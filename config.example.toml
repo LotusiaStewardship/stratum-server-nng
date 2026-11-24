@@ -165,6 +165,17 @@ rpc_pass = "lotus"
 # Transaction fee rate in sat/kB for payout transactions. Default: 1000 (1 sat/vByte).
 # tx_fee_per_kb = 1000
 
+# Replay-protection activation time (Unix seconds). Once the node's
+# getblockchaininfo.mediantime reaches this timestamp, payout signatures commit
+# to the chain fork id (0x4c4f54); before it they sign at fork value 0.
+# Default: derived from the network (mainnet: 1797886200, the second Kings
+# upgrade 2026-12-21T20:50:00Z; testnet: 1796071800, 21 days earlier; regtest:
+# the mainnet time). Set this ONLY when the node runs with a custom
+# -replayprotectionactivationtime override — it must match that value exactly,
+# or payouts are either rejected (signed fork 0 too late) or skipped by the
+# pool's stale-node guard (signed fork id too early).
+# replay_protection_activation_time = 1797886200
+
 # === Debug ===
 
 # Enable verbose logging (template data, share submissions, validation, block submission).

@@ -194,6 +194,16 @@ pub struct SigningSettings {
     /// Default: 1000 (1 sat/vByte, standard relay minimum).
     #[serde(default = "default_tx_fee_per_kb")]
     pub tx_fee_per_kb: i64,
+    /// Replay-protection activation time override (Unix seconds). Payout
+    /// signatures commit to the chain fork id once the node's
+    /// `getblockchaininfo.mediantime` reaches this timestamp.
+    ///
+    /// Default: None — resolved from the pool's network via
+    /// [`crate::constants::default_replay_protection_activation_time`].
+    /// Must match the node's `-replayprotectionactivationtime` when that
+    /// override is used.
+    #[serde(default)]
+    pub replay_protection_activation_time: Option<i64>,
 }
 
 impl Default for SigningSettings {
@@ -203,6 +213,7 @@ impl Default for SigningSettings {
             private_key: None,
             webhook_url: None,
             tx_fee_per_kb: default_tx_fee_per_kb(),
+            replay_protection_activation_time: None,
         }
     }
 }

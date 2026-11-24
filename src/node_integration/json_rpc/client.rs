@@ -78,6 +78,43 @@ impl JsonRpcClient {
         Ok(count as i32)
     }
 
+    /// Get chain state via `getblockchaininfo`.
+    ///
+    /// Returns the full chain info JSON. The payout path reads
+    /// `mediantime` (median time past of the last 11 blocks) to decide
+    /// whether replay protection is active.
+    pub async fn get_blockchain_info(&self) -> Result<Value> {
+        self.call("getblockchaininfo", vec![]).await
+    }
+
+    /// Resolve the chain fork id the pool must commit to in payout
+    /// signatures for the current chain state.
+    ///
+    /// Compares the node's `getblockchaininfo.mediantime` against the
+    /// replay-protection `activation_time`: at or past it, signatures must
+    /// commit to [`crate::constants::CHAIN_FORK_ID`]; before it, fork 0.
+    ///
+    /// Fails closed with a clear error when the node omits `mediantime` or
+    /// returns a non-number — never guess the fork value.
+    pub async fn get_chain_fork_id(&self, activation_time: i64) -> Result<u32> {
+        let info = self.get_blockchain_info().await?;
+        let mediantime = info
+            .get("mediantime")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "getblockchaininfo: missing or non-numeric 'mediantime' — \
+                     cannot resolve replay-protection chain fork id: {}",
+                    info
+                )
+            })?;
+        if mediantime >= activation_time {
+            Ok(crate::constants::CHAIN_FORK_ID)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get the block hash at a given height via `getblockhash`.
     /// Returns `Ok(None)` if the height is above the chain tip (error code -8).
     pub async fn getblockhash(&self, height: i32) -> Result<Option<String>> {
@@ -282,6 +319,115 @@ mod tests {
         let count = client.getblockcount().await.unwrap();
 
         assert_eq!(count, 1292529);
+    }
+
+    #[tokio::test]
+    async fn test_get_blockchain_info_returns_result() {
+        let url = spawn_mock_server(json!({
+            "result": {
+                "chain": "mainnet",
+                "blocks": 1292529,
+                "mediantime": 1797886200
+            },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let info = client.get_blockchain_info().await.unwrap();
+
+        assert_eq!(info["chain"], "mainnet");
+        assert_eq!(info["mediantime"], 1797886200);
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_fork_id_below_activation_is_zero() {
+        let url = spawn_mock_server(json!({
+            "result": { "mediantime": 1_797_886_199 },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let fork_id = client.get_chain_fork_id(1_797_886_200).await.unwrap();
+
+        assert_eq!(fork_id, 0, "below activation the fork value must be 0");
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_fork_id_at_activation_is_chain_fork_id() {
+        let url = spawn_mock_server(json!({
+            "result": { "mediantime": 1_797_886_200 },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let fork_id = client.get_chain_fork_id(1_797_886_200).await.unwrap();
+
+        assert_eq!(
+            fork_id,
+            crate::constants::CHAIN_FORK_ID,
+            "at the activation boundary the chain fork id must be committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_fork_id_above_activation_is_chain_fork_id() {
+        let url = spawn_mock_server(json!({
+            "result": { "mediantime": 1_800_000_000 },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let fork_id = client.get_chain_fork_id(1_797_886_200).await.unwrap();
+
+        assert_eq!(fork_id, crate::constants::CHAIN_FORK_ID);
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_fork_id_missing_mediantime_errors() {
+        let url = spawn_mock_server(json!({
+            "result": { "chain": "mainnet", "blocks": 100 },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let err = client.get_chain_fork_id(1_797_886_200).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mediantime"),
+            "error should mention 'mediantime', got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_fork_id_non_numeric_mediantime_errors() {
+        let url = spawn_mock_server(json!({
+            "result": { "mediantime": "soon" },
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let client = JsonRpcClient::new(&url, "lotus", "lotus");
+        let err = client.get_chain_fork_id(1_797_886_200).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mediantime"),
+            "error should mention 'mediantime', got: {}",
+            msg
+        );
     }
 
     #[tokio::test]
