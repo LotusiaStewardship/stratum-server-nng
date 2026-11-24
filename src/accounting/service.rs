@@ -735,6 +735,14 @@ impl AccountingService {
     }
 
     /// Process pending payout batches through the configured signer.
+    ///
+    /// `replay_protection_activation_time` is the Unix-seconds boundary at
+    /// which the network activates replay protection (mirroring the node's
+    /// `-replayprotectionactivationtime`). For each batch the chain fork id
+    /// is resolved from the node's `getblockchaininfo.mediantime` immediately
+    /// before signing; on resolution failure the batch is skipped (fail
+    /// closed) and retried on the next event.
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_pending_payouts(
         &self,
         signer: &dyn crate::payout::signer::Signer,
@@ -744,7 +752,9 @@ impl AccountingService {
         fee_address: Option<String>,
         min_payout_sat: i64,
         n_multiplier: f64,
+        replay_protection_activation_time: i64,
     ) -> Result<()> {
+        use crate::constants::REPLAY_PROTECTION_SAFETY_MARGIN;
         use crate::payout::plan::PayoutOutput;
         use crate::payout::signer::SignedBatchData;
 
@@ -893,12 +903,66 @@ impl AccountingService {
                 retry_key: batch.retry_key.clone().unwrap_or_default(),
             };
 
+            // Resolve the replay-protection chain fork id from the node's
+            // chain state, immediately before constructing SignedBatchData.
+            // Fail closed: an unreachable or misreporting node skips the
+            // batch (it is retried on the next event); never sign fork 0
+            // on a guess.
+            let chain_fork_id = match rpc_client
+                .get_chain_fork_id(replay_protection_activation_time)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    accounting_warn!(
+                        batch_id = batch.id,
+                        error = %e,
+                        "failed to resolve chain fork id — skipping batch (will retry)",
+                    );
+                    continue;
+                }
+            };
+
+            // Stale/misconfigured-node guard: if the node still reports
+            // fork 0 long after the activation time has passed, its
+            // -replayprotectionactivationtime disagrees with the wall clock
+            // (or it is stale). Signing fork 0 after activation produces
+            // rejected payouts, so skip the batch instead.
+            if chain_fork_id == 0 {
+                let now_secs =
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(d) => d.as_secs() as i64,
+                        Err(e) => {
+                            accounting_warn!(
+                                batch_id = batch.id,
+                                error = %e,
+                                "system clock before Unix epoch — skipping batch",
+                            );
+                            continue;
+                        }
+                    };
+                if now_secs >= replay_protection_activation_time + REPLAY_PROTECTION_SAFETY_MARGIN {
+                    accounting_error!(
+                        batch_id = batch.id,
+                        chain_fork_id = chain_fork_id,
+                        mediantime_needed = replay_protection_activation_time,
+                        now = now_secs,
+                        "node reports fork 0 more than {}s past the replay-protection \
+                         activation time — node is stale or misconfigured; skipping batch \
+                         (check -replayprotectionactivationtime)",
+                        REPLAY_PROTECTION_SAFETY_MARGIN,
+                    );
+                    continue;
+                }
+            }
+
             let signed_data = SignedBatchData {
                 plan,
                 coinbase_txid: coinbase_txid.clone(),
                 coinbase_vout,
                 coinbase_amount,
                 coinbase_script_pubkey_hex: coinbase_script,
+                chain_fork_id,
             };
 
             match signer.sign_and_submit(&signed_data).await {
@@ -2740,5 +2804,336 @@ mod tests {
             rebuilt_payouts.iter().any(|p| p.worker_id == 2),
             "bob payout"
         );
+    }
+
+    /// Tests for the replay-protection chain fork id resolution in
+    /// `process_pending_payouts`: population on SignedBatchData, fail-closed
+    /// on RPC error, and the stale-node guard.
+    mod chain_fork_id_tests {
+        use super::*;
+        use crate::payout::signer::{SignedBatchData, Signer};
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        /// Signer that captures the SignedBatchData it receives instead of
+        /// talking to a node.
+        struct CapturingSigner {
+            captured: Arc<std::sync::Mutex<Option<SignedBatchData>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Signer for CapturingSigner {
+            async fn sign_and_submit(&self, data: &SignedBatchData) -> anyhow::Result<String> {
+                *self.captured.lock().unwrap() = Some(data.clone());
+                Ok("mock-payout-txid".to_string())
+            }
+        }
+
+        /// Spawn a mock JSON-RPC server that dispatches by method name to
+        /// canned responses. Handles multiple sequential requests (each on
+        /// its own connection, `Connection: close`).
+        async fn spawn_dispatch_rpc(responses: serde_json::Value) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let url = format!("http://{}", addr);
+
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let responses = responses.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        let mut n_total = 0usize;
+                        let body = loop {
+                            let n = match stream.read(&mut buf[n_total..]).await {
+                                Ok(n) => n,
+                                Err(_) => return,
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            n_total += n;
+                            let text = String::from_utf8_lossy(&buf[..n_total]).to_string();
+                            if let Some(header_end) = text.find("\r\n\r\n") {
+                                let content_length = text
+                                    .lines()
+                                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| l.split(':').nth(1))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                let body_start = header_end + 4;
+                                if n_total >= body_start + content_length {
+                                    break text[body_start..body_start + content_length]
+                                        .to_string();
+                                }
+                            }
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        let method = request["method"].as_str().unwrap_or("");
+                        let response = responses.get(method).cloned().unwrap_or_else(|| {
+                            json!({
+                                "result": null,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("mock: no canned response for {}", method)
+                                },
+                                "id": 1
+                            })
+                        });
+                        let response_body = serde_json::to_string(&response).unwrap();
+                        let http_response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body,
+                        );
+                        stream.write_all(http_response.as_bytes()).await.unwrap();
+                        stream.flush().await.unwrap();
+                    });
+                }
+            });
+
+            url
+        }
+
+        fn now_unix() -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        }
+
+        /// Seed: one round, one matured found_block with a coinbase txid,
+        /// one pending batch with a single payout. Returns the service.
+        fn seed_pending_batch(conn: Connection) -> AccountingService {
+            conn.execute(
+                "INSERT INTO rounds (id, start_template_id, status) VALUES (1, 42, 'found')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO found_blocks (id, round_id, block_hash, height, status, coinbase_value,
+                                           network_target_hex, coinbase_txid)
+                 VALUES (1, 1, 'blockhash1', 100, 'matured', 50000, '',
+                         'coinbase-txid-0000000000000000000000000000000000000000')",
+                [],
+            )
+            .unwrap();
+            let svc = AccountingService::new(Arc::new(Mutex::new(conn)));
+            let worker = svc
+                .worker_repo
+                .upsert("lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi", None)
+                .unwrap();
+            svc.payout_repo
+                .create_payout_batch(1, 50_000, 0, None, 1, "blockhash1:batch")
+                .unwrap();
+            svc.payout_repo
+                .record_payout(
+                    1,
+                    worker.id,
+                    "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi",
+                    49_500,
+                    0,
+                )
+                .unwrap();
+            svc
+        }
+
+        fn coinbase_raw_tx_response() -> serde_json::Value {
+            // Lotus coinbase: vout[0] = OP_RETURN metadata (skipped),
+            // vout[1] = spendable P2PKH output. `value` is in LOTUS units
+            // (6 decimals): 50.0 LOTUS = 50_000_000 sats.
+            json!({
+                "txid": "coinbase-txid-0000000000000000000000000000000000000000",
+                "vout": [
+                    {
+                        "n": 0,
+                        "value": 0.0,
+                        "scriptPubKey": { "type": "nulldata", "hex": "6a26..." }
+                    },
+                    {
+                        "n": 1,
+                        "value": 50.0,
+                        "scriptPubKey": {
+                            "type": "pubkeyhash",
+                            "hex": "76a914751e76e8199196d454941c45d1b3a323f1433bd688ac"
+                        }
+                    }
+                ]
+            })
+        }
+
+        #[tokio::test]
+        async fn test_process_pending_payouts_populates_chain_fork_id() {
+            let f = NamedTempFile::new().unwrap();
+            let conn = Connection::open(f.path()).unwrap();
+            init_schema(&conn).unwrap();
+            let svc = seed_pending_batch(conn);
+
+            let url = spawn_dispatch_rpc(json!({
+                "getrawtransaction": { "result": coinbase_raw_tx_response(), "error": null, "id": 1 },
+                "getblockchaininfo": {
+                    "result": { "chain": "mainnet", "mediantime": 1_797_886_200 },
+                    "error": null,
+                    "id": 1
+                }
+            }))
+            .await;
+            let rpc = crate::node_integration::JsonRpcClient::new(&url, "u", "p");
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let signer = CapturingSigner {
+                captured: captured.clone(),
+            };
+
+            svc.process_pending_payouts(&signer, &rpc, 100, None, 546, 2.0, 1_797_886_200)
+                .await
+                .unwrap();
+
+            let captured = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("signer should have been called");
+            assert_eq!(
+                captured.chain_fork_id,
+                crate::constants::CHAIN_FORK_ID,
+                "SignedBatchData.chain_fork_id must carry the resolved chain fork id"
+            );
+            assert_eq!(
+                captured.coinbase_txid,
+                "coinbase-txid-0000000000000000000000000000000000000000"
+            );
+            assert_eq!(captured.coinbase_vout, 1);
+            assert_eq!(captured.coinbase_amount, 50_000_000);
+            assert_eq!(
+                captured.coinbase_script_pubkey_hex,
+                "76a914751e76e8199196d454941c45d1b3a323f1433bd688ac"
+            );
+
+            // Batch was marked submitted by the mock signer's txid
+            let batch = svc.payout_repo.get_batch_by_id(1).unwrap().unwrap();
+            assert_eq!(batch.status, "submitted");
+        }
+
+        #[tokio::test]
+        async fn test_process_pending_payouts_fails_closed_on_fork_resolution_error() {
+            let f = NamedTempFile::new().unwrap();
+            let conn = Connection::open(f.path()).unwrap();
+            init_schema(&conn).unwrap();
+            let svc = seed_pending_batch(conn);
+
+            let url = spawn_dispatch_rpc(json!({
+                "getrawtransaction": { "result": coinbase_raw_tx_response(), "error": null, "id": 1 },
+                "getblockchaininfo": {
+                    "result": null,
+                    "error": { "code": -5, "message": "chain state unavailable" },
+                    "id": 1
+                }
+            }))
+            .await;
+            let rpc = crate::node_integration::JsonRpcClient::new(&url, "u", "p");
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let signer = CapturingSigner {
+                captured: captured.clone(),
+            };
+
+            svc.process_pending_payouts(&signer, &rpc, 100, None, 546, 2.0, 1_797_886_200)
+                .await
+                .unwrap();
+
+            assert!(
+                captured.lock().unwrap().is_none(),
+                "fail closed: signer must NOT be called when the fork id cannot be resolved"
+            );
+            let batch = svc.payout_repo.get_batch_by_id(1).unwrap().unwrap();
+            assert_eq!(batch.status, "pending", "batch stays pending for retry");
+        }
+
+        #[tokio::test]
+        async fn test_process_pending_payouts_stale_node_guard_skips_batch() {
+            let f = NamedTempFile::new().unwrap();
+            let conn = Connection::open(f.path()).unwrap();
+            init_schema(&conn).unwrap();
+            let svc = seed_pending_batch(conn);
+
+            // Activation well past the safety margin: fork-0 reports must
+            // be treated as a stale/misconfigured node.
+            let activation = now_unix() - 7_200;
+            let url = spawn_dispatch_rpc(json!({
+                "getrawtransaction": { "result": coinbase_raw_tx_response(), "error": null, "id": 1 },
+                "getblockchaininfo": {
+                    "result": { "chain": "mainnet", "mediantime": activation - 1 },
+                    "error": null,
+                    "id": 1
+                }
+            }))
+            .await;
+            let rpc = crate::node_integration::JsonRpcClient::new(&url, "u", "p");
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let signer = CapturingSigner {
+                captured: captured.clone(),
+            };
+
+            svc.process_pending_payouts(&signer, &rpc, 100, None, 546, 2.0, activation)
+                .await
+                .unwrap();
+
+            assert!(
+                captured.lock().unwrap().is_none(),
+                "stale-node guard: signer must NOT be called with fork 0 past activation + margin"
+            );
+            let batch = svc.payout_repo.get_batch_by_id(1).unwrap().unwrap();
+            assert_eq!(batch.status, "pending");
+        }
+
+        #[tokio::test]
+        async fn test_process_pending_payouts_signs_fork_zero_within_safety_margin() {
+            let f = NamedTempFile::new().unwrap();
+            let conn = Connection::open(f.path()).unwrap();
+            init_schema(&conn).unwrap();
+            let svc = seed_pending_batch(conn);
+
+            // Activation within the safety margin of now: fork-0 is still
+            // legitimate (pre-activation chain) and must go through.
+            let activation = now_unix() - 1_800;
+            let url = spawn_dispatch_rpc(json!({
+                "getrawtransaction": { "result": coinbase_raw_tx_response(), "error": null, "id": 1 },
+                "getblockchaininfo": {
+                    "result": { "chain": "mainnet", "mediantime": activation - 1 },
+                    "error": null,
+                    "id": 1
+                }
+            }))
+            .await;
+            let rpc = crate::node_integration::JsonRpcClient::new(&url, "u", "p");
+
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let signer = CapturingSigner {
+                captured: captured.clone(),
+            };
+
+            svc.process_pending_payouts(&signer, &rpc, 100, None, 546, 2.0, activation)
+                .await
+                .unwrap();
+
+            let captured = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("signer should be called while inside the safety margin");
+            assert_eq!(
+                captured.chain_fork_id, 0,
+                "pre-activation chain state signs at fork 0"
+            );
+        }
     }
 }

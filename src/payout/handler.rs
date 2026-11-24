@@ -36,6 +36,10 @@ pub struct PayoutHandler {
     fee_address: Option<String>,
     min_payout_sat: i64,
     n_multiplier: f64,
+    /// Unix-seconds replay-protection activation time. Passed to
+    /// `process_pending_payouts`, which resolves the per-batch chain fork id
+    /// from the node's mediantime against this boundary.
+    replay_protection_activation_time: i64,
     /// Guards process_pending_payouts against concurrent execution.
     /// Prevents race conditions when multiple events (e.g., BlockConnected
     /// queued after BlockMatured) could trigger overlapping submissions.
@@ -53,6 +57,7 @@ impl PayoutHandler {
         fee_address: Option<String>,
         min_payout_sat: i64,
         n_multiplier: f64,
+        replay_protection_activation_time: i64,
     ) -> Self {
         Self {
             rx,
@@ -63,6 +68,7 @@ impl PayoutHandler {
             fee_address,
             min_payout_sat,
             n_multiplier,
+            replay_protection_activation_time,
             pending_payouts_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -188,6 +194,7 @@ impl PayoutHandler {
                 self.fee_address.clone(),
                 self.min_payout_sat,
                 self.n_multiplier,
+                self.replay_protection_activation_time,
             )
             .await
         {

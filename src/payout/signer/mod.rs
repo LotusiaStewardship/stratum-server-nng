@@ -20,6 +20,13 @@ pub struct SignedBatchData {
     pub coinbase_amount: i64,
     /// Hex-encoded scriptPubKey of the coinbase output.
     pub coinbase_script_pubkey_hex: String,
+    /// Chain fork id the payout signature must commit to, resolved from the
+    /// node's chain state (see `JsonRpcClient::get_chain_fork_id`): 0 before
+    /// the replay-protection activation time, `CHAIN_FORK_ID` (0x4c4f54)
+    /// at or past it. The signer passes this to
+    /// `SigHashType::with_fork_value` — signatures committing to the wrong
+    /// fork value are rejected once replay protection is active.
+    pub chain_fork_id: u32,
 }
 
 /// Abstraction for signing and submitting payout transactions.

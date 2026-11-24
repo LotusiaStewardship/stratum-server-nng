@@ -12,6 +12,7 @@ use bitcoinsuite_ecc_secp256k1::EccSecp256k1;
 
 use super::{SignedBatchData, Signer};
 use crate::node_integration::JsonRpcClient;
+use crate::payout_info;
 
 /// Signer that builds, signs, and broadcasts payout transactions using an
 /// in-process private key.
@@ -76,6 +77,13 @@ impl Signer for InternalSigner {
 
         // Broadcast via JSON-RPC and return txid
         let txid = self.rpc_client.send_raw_transaction(&tx_hex).await?;
+        payout_info!(
+            retry_key = %data.plan.retry_key,
+            round_id = data.plan.round_id,
+            chain_fork_id = data.chain_fork_id,
+            txid = %txid,
+            "payout transaction signed and broadcast",
+        );
         Ok(txid)
     }
 }
@@ -105,7 +113,10 @@ impl InternalSigner {
         let signatory = P2PKHSignatory {
             seckey: self.seckey.clone(),
             pubkey: self.pubkey.clone(),
-            sig_hash_type: SigHashType::ALL_BIP143,
+            // Commit to the replay-protection chain fork id resolved for this
+            // batch: fork value 0 before activation, CHAIN_FORK_ID at/after.
+            // lotusd rejects payouts whose sighash carries the wrong fork value.
+            sig_hash_type: SigHashType::ALL_BIP143.with_fork_value(data.chain_fork_id),
         };
 
         let tx_input = TxInput {
@@ -248,6 +259,7 @@ mod tests {
             coinbase_amount: 50000,
             coinbase_script_pubkey_hex: "76a914000000000000000000000000000000000000000088ac"
                 .to_string(),
+            chain_fork_id: crate::constants::CHAIN_FORK_ID,
         }
     }
 
@@ -430,5 +442,149 @@ mod tests {
     fn extract_json_body(http_request: &str) -> Option<&str> {
         let parts: Vec<&str> = http_request.split("\r\n\r\n").collect();
         parts.get(1).copied()
+    }
+
+    /// The emitted payout transaction must commit to the batch's chain fork
+    /// id: parse the tx hex sent to the mock RPC, recompute the BIP143
+    /// sighash preimage with bitcoinsuite-core, and verify the schnorr
+    /// signature over the fork-value sighash with the real secp256k1.
+    /// Additionally asserts the sighash-type byte stays 0x41 and the
+    /// preimage tail is the little-endian (fork_value << 8 | 0x41) encoding.
+    #[tokio::test]
+    async fn test_internal_signer_commits_to_chain_fork_id() {
+        use bitcoinsuite_core::{Sha256d, UnhashedTx, UnsignedTx};
+
+        let expected_txid = "c1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2";
+        let (url, captured) = spawn_mock_rpc(json!({
+            "result": expected_txid,
+            "error": null,
+            "id": 1
+        }))
+        .await;
+
+        let rpc_client = Arc::new(JsonRpcClient::new(&url, "lotus", "lotus"));
+        let signer = InternalSigner::new(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            rpc_client,
+            1000,
+        )
+        .expect("InternalSigner construction should succeed");
+
+        let data = test_signed_batch_data();
+        signer
+            .sign_and_submit(&data)
+            .await
+            .expect("sign_and_submit should succeed");
+
+        // Extract the raw tx hex the signer sent to sendrawtransaction
+        let captured_body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("mock RPC should have received a request");
+        let captured_json: serde_json::Value =
+            serde_json::from_str(extract_json_body(&captured_body).unwrap_or("{}"))
+                .unwrap_or_default();
+        let tx_hex = captured_json["params"][0]
+            .as_str()
+            .expect("first param should be tx hex");
+
+        // Parse the broadcast transaction back into an UnhashedTx
+        let tx_bytes = hex::decode(tx_hex).expect("tx hex should decode");
+        let mut raw = bitcoinsuite_core::Bytes::from(tx_bytes);
+        let mut parsed_tx =
+            UnhashedTx::deser(&mut raw).expect("broadcast hex should parse as a tx");
+
+        // Reattach the ephemeral sign_data (not serialized in raw txs) the
+        // signer used: coinbase value + coinbase output script.
+        let coinbase_script = Script::from_slice(
+            &hex::decode(&data.coinbase_script_pubkey_hex).expect("coinbase script hex"),
+        );
+        assert_eq!(
+            parsed_tx.inputs.len(),
+            1,
+            "payout tx spends exactly one coinbase input"
+        );
+        parsed_tx.inputs[0].sign_data = Some(SignData::new(vec![
+            SignField::Value(data.coinbase_amount),
+            SignField::OutputScript(coinbase_script),
+        ]));
+
+        // Recompute the sighash the way the node would, at the batch's fork value
+        let sig_hash_type = SigHashType::ALL_BIP143.with_fork_value(data.chain_fork_id);
+        let mut verify_tx = UnsignedTx::new(parsed_tx.clone());
+        let preimage = verify_tx
+            .input_at(0)
+            .sighash_preimage(sig_hash_type, None)
+            .expect("BIP143 preimage should build");
+        let sighash_fork_id = Sha256d::digest(preimage.bytes.clone());
+
+        // Extract (pubkey, signature) from the broadcast scriptSig
+        let (pubkey_bytes, sig) = parsed_tx.inputs[0]
+            .script
+            .parse_p2pkh_spend()
+            .expect("input script should be a P2PKH spend");
+
+        // Sighash type byte: low byte 0x41 (ALL | BIP143), fork value carried
+        // in the upper 24 bits is NOT part of the appended byte.
+        assert_eq!(sig.len(), 65, "signature should be 64 bytes + type byte");
+        assert_eq!(
+            sig[64], 0x41,
+            "appended sighash byte must be 0x41 (lotusd applies CHAIN_FORK_ID internally)"
+        );
+
+        // Preimage tail: 4-byte little-endian (fork_value << 8 | 0x41)
+        let expected_tail_bytes = sig_hash_type.to_u32(); // 0x414c4f54 for CHAIN_FORK_ID
+        let mut tail = bitcoinsuite_core::BytesMut::new();
+        expected_tail_bytes.ser_to(&mut tail);
+        assert_eq!(
+            &preimage.bytes[preimage.bytes.len() - 4..],
+            tail.as_slice(),
+            "preimage tail must be the LE sighash type incl. fork value"
+        );
+        assert_eq!(
+            expected_tail_bytes, 0x4c4f_5441,
+            "sanity: (CHAIN_FORK_ID << 8) | 0x41"
+        );
+
+        // The signature verifies over the fork-value sighash (real secp256k1)
+        let ecc = EccSecp256k1::default();
+        let signer_seckey = ecc
+            .seckey_from_array([
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            ])
+            .expect("test seckey should be valid");
+        let signer_pubkey = ecc.derive_pubkey(&signer_seckey);
+        assert_eq!(
+            pubkey_bytes.as_ref(),
+            signer_pubkey.as_slice(),
+            "scriptSig pubkey must be the signer's pubkey"
+        );
+        let sig_core: bitcoinsuite_core::Bytes = sig[..64].to_vec().into();
+        ecc.schnorr_verify(
+            &signer_pubkey,
+            sighash_fork_id.byte_array().clone(),
+            &sig_core,
+        )
+        .expect("signature must verify over the fork-value sighash");
+
+        // Negative control: the same signature must NOT verify over the
+        // fork-0 sighash — proof the fork value is actually committed.
+        let mut verify_tx_fork0 = UnsignedTx::new(parsed_tx);
+        let preimage_fork0 = verify_tx_fork0
+            .input_at(0)
+            .sighash_preimage(SigHashType::ALL_BIP143, None)
+            .expect("BIP143 fork-0 preimage should build");
+        let sighash_fork0 = Sha256d::digest(preimage_fork0.bytes);
+        match ecc.schnorr_verify(
+            &signer_pubkey,
+            sighash_fork0.byte_array().clone(),
+            &sig_core,
+        ) {
+            Err(bitcoinsuite_core::ecc::VerifySignatureError::IncorrectSignature) => {}
+            result => panic!("fork-0 sighash unexpectedly verified: {result:?}"),
+        }
     }
 }

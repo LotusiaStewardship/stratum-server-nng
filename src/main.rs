@@ -351,6 +351,22 @@ async fn main() -> Result<()> {
 
     // Construct signer and spawn payout handler (if enabled)
     if config.pool.pplns.payout_enabled {
+        // Replay-protection activation: config override wins; otherwise the
+        // default for the pool's network (mirrors lotusd chainparams).
+        let replay_protection_activation_time = config
+            .pool
+            .signing
+            .replay_protection_activation_time
+            .unwrap_or_else(|| {
+                stratum_server_nng::constants::default_replay_protection_activation_time(
+                    &config.network,
+                )
+            });
+        main_info!(
+            replay_protection_activation_time = replay_protection_activation_time,
+            "replay-protection activation time resolved"
+        );
+
         let signer: Arc<dyn Signer> = match config.pool.signing.mode.as_str() {
             "internal" => {
                 let key = config.pool.signing.private_key.as_deref().ok_or_else(|| {
@@ -383,6 +399,7 @@ async fn main() -> Result<()> {
             config.pool.fee.fee_address.clone(),
             config.pool.pplns.min_payout_sat,
             config.pool.pplns.n_multiplier,
+            replay_protection_activation_time,
         );
         let mut payout_shutdown_signal = shutdown.signal();
         let payout_handle = tokio::spawn(async move {
