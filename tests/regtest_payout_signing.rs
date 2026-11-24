@@ -87,8 +87,9 @@ impl Drop for NodeGuard {
 /// This exists ONLY to fund the regtest node: lotusd v12.0.2's
 /// `XAddress::Parse` expects the full scriptPubKey as the P2PKH payload.
 /// The pool-side `LotusAddress` helper encodes the bare 20-byte hash160
-/// (xpi-ts format) and is used for the payout plan output below, where only
-/// the library parses the string and the node sees just the output script.
+/// (the library's legacy format; lotusd and xpi-ts use the full script) and
+/// is used for the payout plan output below, where only the library parses
+/// the string and the node sees just the output script.
 /// The encoding gap is tracked separately (DEV-355) and NOT fixed here.
 fn lotusd_native_p2pkh_address(script: &Script) -> String {
     let payload = script.bytecode();
