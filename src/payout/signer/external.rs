@@ -6,7 +6,10 @@ use async_trait::async_trait;
 ///
 /// Posts the payout plan as JSON to a configured URL and returns the txid
 /// from the response. The external service is responsible for building,
-/// signing, and broadcasting the transaction.
+/// signing, and broadcasting the transaction; the payload carries
+/// `chain_fork_id` so the external signer can commit its signature to the
+/// correct replay-protection fork value (`SigHashType::with_fork_value`)
+/// exactly like the internal signer does.
 ///
 /// This is a scaffold — full retry/poll logic will be added later.
 pub struct ExternalSigner {
@@ -56,6 +59,7 @@ impl Signer for ExternalSigner {
             "coinbase_vout": data.coinbase_vout,
             "coinbase_amount": data.coinbase_amount,
             "coinbase_script_pubkey_hex": data.coinbase_script_pubkey_hex,
+            "chain_fork_id": data.chain_fork_id,
             "outputs": outputs,
         });
 
@@ -174,6 +178,7 @@ mod tests {
             coinbase_amount: 50000,
             coinbase_script_pubkey_hex: "76a914000000000000000000000000000000000000000088ac"
                 .to_string(),
+            chain_fork_id: crate::constants::CHAIN_FORK_ID,
         }
     }
 
@@ -210,6 +215,11 @@ mod tests {
         assert!(
             body.contains("coinbase_txid"),
             "body should contain coinbase_txid"
+        );
+        assert!(
+            body.contains("\"chain_fork_id\":5001044"),
+            "body should carry the resolved chain fork id (0x4c4f54 = 5001044), got: {}",
+            body
         );
         assert!(
             body.contains("outputs"),
