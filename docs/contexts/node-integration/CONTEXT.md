@@ -34,6 +34,7 @@ src/node_integration/
 ├── nng/
 │   ├── mod.rs
 │   ├── rpc_client.rs             # NNG RPC: connect, disconnect, get_mining_template
+│   ├── pub_listener.rs           # NNG pub/sub SUB socket on a dedicated thread → cancel-safe mpsc channel
 │   └── consumer.rs               # NNG pub/sub: event loop, mining work changed, block disconnected
 ├── json_rpc/
 │   ├── mod.rs
@@ -48,10 +49,11 @@ src/node_integration/
 - **`template_to_job(template, clean_jobs) -> MiningJob`** — Converts a `MiningTemplate` from lotusd into a `MiningJob` ready for Stratum dispatch. Handles epoch assignment, coinbase extraction, merkle branch parsing, and block byte capture.
 - **`build_submit_block(job, extranonce1, extranonce2, ntime, nonce) -> Vec<u8>`** — Reconstructs the full serialized block for `submitblock` RPC. Replaces the template coinbase with the miner's reconstructed coinbase, builds the header via `build_stratum_header`, and updates the merkle root and size to match the validator's computation.
 - **`verify_coinbase_outputs(template)`** — Checks that the template coinbase has at least one non-OP_RETURN output. Warns at startup if all outputs are OP_RETURN (would burn block rewards).
-- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms), `blkconnected` (immediate), and `blkdisconctd` (immediate) events.
+- **`NngEventConsumer`** — Long-running task spawned in `main.rs`. Consumes `miningwrkchg` (debounced at 100ms), `blkconnected` (immediate), and `blkdisconctd` (immediate) events. Events are received by `PubListener` on its own thread and read from a tokio mpsc channel (cancel-safe inside `select!`; `PubInterface::recv_async()` is not).
   - `miningwrkchg` → template fetch, job conversion, broadcast via `broadcast::Sender` to all sessions. Injects the reason code into `MiningJob.reason` for miner-facing explanations. **No chain state or payout logic.**
   - `blkconnected` → decodes block height from Lotus header bytes via `LotusHeader::deser()`, updates `ChainTip`. Before maturation, checks if the arriving block hash belongs to an orphaned pool block and un-orphans it if safe (no submitted payout). Then calls `check_maturation()` and sends matured block hashes + transaction IDs through the payout maturation channel. **Sole driver of runtime chain-state tracking, reorg recovery, and payout triggers.**
   - `blkdisconctd` → records orphaned found_blocks via AccountingService on matched block hash.
+  - Reconnection of the pub socket to lotusd (nng pipe notification, not the first connection) → a synthetic work change (reason `manual`) refreshes the job, since events published during the gap are lost.
 
 ### Reorg Detection
 

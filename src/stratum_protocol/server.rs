@@ -103,9 +103,26 @@ impl StratumServer {
         self.job_cache.get_latest_target_hex().await
     }
 
+    /// Bind the Stratum listening socket.
+    ///
+    /// Call this before spawning the accept loop so that a bind failure
+    /// (port already in use, permission denied) reaches the caller at
+    /// startup instead of ending a background task.
+    pub async fn bind(&self) -> Result<TcpListener> {
+        TcpListener::bind(self.bind_address).await.map_err(|e| {
+            anyhow::anyhow!("cannot listen for Stratum on {}: {}", self.bind_address, e)
+        })
+    }
+
     /// Run the TCP server, accepting connections until shutdown.
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.bind_address).await?;
+        let listener = self.bind().await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// Accept connections on an already bound listener (see [`Self::bind`])
+    /// until shutdown.
+    pub async fn run_with_listener(&self, listener: TcpListener) -> Result<()> {
         info!(bind = %self.bind_address, "Stratum TCP server listening");
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -2152,5 +2169,65 @@ mod tests {
         // Cleanup
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+    }
+
+    /// A port already in use must be reported by `bind()` (and `run()`),
+    /// so that startup can fail instead of running without a listener.
+    #[tokio::test]
+    async fn test_bind_fails_when_port_in_use() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server = StratumServer::new(
+            addr,
+            Arc::new(JobCache::new(4)),
+            shutdown_tx,
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+        let err = server.bind().await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot listen for Stratum"),
+            "{err}"
+        );
+        assert!(server.run().await.is_err());
+    }
+
+    /// `run_with_listener` serves on a listener bound beforehand.
+    #[tokio::test]
+    async fn test_run_with_prebound_listener_accepts_connections() {
+        let job_cache = Arc::new(JobCache::new(10));
+        job_cache.insert(create_test_job()).await;
+        let (shutdown_tx, _) = broadcast::channel::<()>(10);
+        let server = StratumServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            job_cache,
+            shutdown_tx.clone(),
+            None,
+            None,
+            VarDiffConfig::default(),
+        );
+        let listener = server.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move { server.run_with_listener(listener).await });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        write_half
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response))
+            .await
+            .expect("subscribe response")
+            .unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(resp["error"].is_null(), "{response}");
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_handle).await;
     }
 }
